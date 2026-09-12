@@ -134,3 +134,4 @@ tools\package-windows.bat
 
 FFmpeg、ASR/LLM 权重不会被打包进源码树。Whisper ggml 模型按清单下载，不随程序分发；本地推理由固定版本的 whisper.cpp 运行时提供。
 "# SubCue" 
+"# SubCue"  
