@@ -1,0 +1,22 @@
+{
+  "subtitles": [
+    {
+      "id": "golden-1",
+      "text": "Hello 各位观众朋友们好",
+      "startUs": 120000,
+      "endUs": 1680000,
+      "wordIds": [0, 1],
+      "confidence": 0.96,
+      "status": "MATCHED"
+    },
+    {
+      "id": "golden-2",
+      "text": "未找到音频",
+      "startUs": 0,
+      "endUs": 0,
+      "wordIds": [null, null],
+      "confidence": 0.0,
+      "status": "SKIPPED_NO_AUDIO"
+    }
+  ]
+}

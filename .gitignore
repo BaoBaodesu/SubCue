@@ -1,0 +1,25 @@
+# 构建产物与便携包
+out/
+dist/
+build/
+
+# 编译中间文件与可执行文件
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# 本地 IDE 与工具缓存
+.idea/
+.vscode/
+compile_commands.json
+
+# golden 再生脚本的 Python 缓存
+__pycache__/
+*.py[cod]
+
+# 测试运行期临时目录
+.test_appdata/
+.test_tmp/

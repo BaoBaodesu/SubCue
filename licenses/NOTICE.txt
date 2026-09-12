@@ -1,0 +1,48 @@
+SubCue third-party notices
+==========================
+
+This directory is copied next to SubCue.exe in the Windows runtime package.
+The editor does not require Python, Visual Studio, or a development SDK.
+
+Qt
+--
+This program dynamically links Qt 6 (Core, Gui, Qml, Quick, QuickControls2,
+Network). Qt is used under the GNU Lesser General Public License version 3
+(LGPLv3). Corresponding Qt source is available from:
+
+  https://download.qt.io/official_releases/qt/
+
+The verified kit for this tree is Qt 6.10.3 MSVC 2022 x64. The project target
+remains Qt 6.11.2 when that SDK is obtainable.
+
+FFmpeg
+------
+This program dynamically links FFmpeg libraries under LGPLv2.1:
+
+  avcodec, avformat, avutil, swresample, swscale
+
+The DLLs keep their upstream names (for example avcodec-63.dll). This package
+does not include avdevice, FFmpeg command-line programs, GPL/nonfree codecs,
+x264, or x265. Corresponding source and the vcpkg port patches are described
+in licenses/FFmpeg/copyright. The locked vcpkg port is ffmpeg 9.0.1#1.
+
+Microsoft Visual C++ Runtime
+----------------------------
+The package includes the MSVC x64 redistributable DLLs next to SubCue.exe
+so a clean Windows 10/11 x64 machine does not need Visual Studio.
+
+whisper.cpp
+-----------
+This build statically links whisper.cpp v1.9.1 and ggml under the MIT License.
+The full license text is included in licenses/whisper.cpp/LICENSE. Whisper
+model files are downloaded by the user and are not program source.
+
+RapidFuzz
+---------
+Alignment uses an in-tree Indel fuzz.ratio implementation that matches
+RapidFuzz 3.x golden fixtures. The RapidFuzz C++ library is not linked and
+is not shipped.
+
+No Python runtime
+-----------------
+The package must not contain python*.dll, python.exe, PySide6, or Nuitka.

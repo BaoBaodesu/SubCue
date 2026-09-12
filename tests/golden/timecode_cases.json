@@ -1,0 +1,11 @@
+{
+  "srt": [
+    {"milliseconds": 0, "text": "00:00:00,000"},
+    {"milliseconds": 2080, "text": "00:00:02,080"},
+    {"milliseconds": 446399999, "text": "123:59:59,999"}
+  ],
+  "assTiesToEven": [
+    {"milliseconds": 3425, "text": "0:00:03.42"},
+    {"milliseconds": 3435, "text": "0:00:03.44"}
+  ]
+}

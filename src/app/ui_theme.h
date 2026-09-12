@@ -1,0 +1,42 @@
+#pragma once
+
+#include <QtGui/QColor>
+
+namespace subcue::UiTheme {
+inline const QColor kWarning{0xE7, 0xB3, 0x4E};
+
+// Keep in sync with src/app/qml/Theme.qml. Timeline Scene Graph and native title bar
+// cannot read the QML singleton, so these are the C++ counterparts.
+
+inline const QColor kTitleBar{0x1B, 0x1E, 0x24};
+inline const QColor kBackground{0x15, 0x17, 0x1C};
+inline const QColor kPrimaryText{0xE7, 0xEA, 0xF0};
+inline const QColor kBorder{0x34, 0x39, 0x44};
+inline const QColor kDivider{0x2A, 0x2E, 0x36};
+inline const QColor kInput{0x25, 0x29, 0x32};
+inline const QColor kButton{0x27, 0x2B, 0x33};
+inline const QColor kSelection{0x29, 0x4D, 0x7A};
+inline const QColor kPlaceholder{0x73, 0x7B, 0x89};
+inline const QColor kPanelSecondary{0x22, 0x25, 0x2D};
+inline const QColor kPanelRaised{0x25, 0x29, 0x32};
+
+inline const QColor kTimelineBackground{0x18, 0x1A, 0x20};
+inline const QColor kRuler{0x1C, 0x1F, 0x25};
+inline const QColor kTimeText{0x92, 0x9A, 0xA6};
+inline const QColor kSubtitleTrack{0x18, 0x1A, 0x20};
+inline const QColor kAudioTrack{0x1B, 0x1D, 0x23};
+inline const QColor kAudioClip{0x3B, 0x29, 0x45};
+inline const QColor kAudioClipHover{0x47, 0x31, 0x51};
+inline const QColor kAudioClipSelected{0x55, 0x37, 0x63};
+inline const QColor kTimelineGrid{0x29, 0x2D, 0x35};
+inline const QColor kTimelineMajorGrid{0x34, 0x39, 0x44};
+inline const QColor kTrackDivider{0x30, 0x34, 0x3D};
+inline const QColor kCue{0x29, 0x4F, 0x6D};
+inline const QColor kCueHover{0x31, 0x5E, 0x81};
+inline const QColor kCueSelected{0x37, 0x6F, 0x9B};
+inline const QColor kTrimHandle{0x68, 0xA1, 0xFF};
+inline const QColor kWaveform{0xB5, 0x65, 0xD9};
+inline const QColor kPlayhead{0xFF, 0x4D, 0x57};
+inline const QColor kRange{0x4C, 0x8D, 0xFF, 0x30};
+
+} // namespace subcue::UiTheme

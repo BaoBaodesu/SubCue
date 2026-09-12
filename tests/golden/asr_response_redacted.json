@@ -1,0 +1,13 @@
+{
+  "requestId": "REDACTED",
+  "model": "fun-asr-flash-2026-06-15",
+  "transcripts": [
+    {
+      "text": "Hello 各位观众朋友们好",
+      "words": [
+        {"id": 0, "text": "Hello", "beginTimeMs": 120, "endTimeMs": 520},
+        {"id": 1, "text": "各位观众朋友们好", "beginTimeMs": 560, "endTimeMs": 1680}
+      ]
+    }
+  ]
+}
