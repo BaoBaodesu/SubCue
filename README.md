@@ -52,21 +52,49 @@ AI 辅助支持通用 OpenAI-compatible Provider，也可在设置中直接“�
 
 ## 构建与运行
 
-在 **MSVC x64 开发者环境** 中（不要让 PATH 里的 MinGW `ld.exe`/`ar.exe` 抢先）：
+`CMakePresets.json` 通过 `$env{Qt6_ROOT}` 定位 Qt，建议一次性持久化：
 
 ```powershell
-$env:Qt6_ROOT = "C:\Qt\6.10.3\msvc2022_64"
-cmake --fresh --preset windows-debug
+setx Qt6_ROOT "C:\Qt\6.10.3\msvc2022_64"
+```
+
+日常迭代用 `tools\build-windows.bat`（默认 Debug）或 `tools\build-windows.bat release`。脚本会进入 MSVC x64 开发者环境、按需配置、增量构建并跑 CTest；**已有构建目录时不会重新配置**，只有加 `fresh` 参数才清空重建：
+
+```powershell
+tools\build-windows.bat            # 增量构建 Debug + 全量 CTest
+tools\build-windows.bat release    # 增量构建 Release + 全量 CTest
+tools\build-windows.bat release fresh   # 工具链变更或缓存损坏时才需要
+```
+
+手动等价命令（需自行设好 `Qt6_ROOT` 并进入 MSVC 环境）：
+
+```powershell
+cmake --preset windows-debug        # 仅首次或 CMakeLists 变更后
 cmake --build --preset windows-debug
 ctest --preset windows-debug --output-on-failure
 ```
 
-Release 把 `windows-debug` 换成 `windows-release`。本机可用 `tools\build-windows.bat`（默认 Debug）或 `tools\build-windows.bat release`。
+Debug 启动用根目录下的 `run-debug.bat`，Release 启动用 `tools\run-release.bat`；二者会补全 Qt、FFmpeg，以及 Debug 版额外需要的调试 CRT 与 SDK ucrt（这些都不在默认 `PATH` 上），可透传参数如 `tools\run-release.bat --smoke-test`。
 
-启动：
+要交互式调试（断点、调用栈、QML 调试）请用 Visual Studio 打开本文件夹并选择 `windows-debug` 预设，或用 Qt Creator，它们会自动配好上述运行环境。
+
+### CUDA 加速（可选）
+
+本地 Whisper 的默认推理设备是显卡。带 CUDA 的构建需要 NVIDIA 显卡 + CUDA Toolkit 13.x（`nvcc` 在 `PATH` 上）：
 
 ```powershell
-.\out\build\windows-debug\SubCue.exe
+tools\build-windows.bat cuda        # 配置并构建 out/build/windows-release-cuda
+tools\package-windows.bat cuda      # 便携包 → dist/windows-x64-cuda（随带 CUDA 运行时 DLL）
+tools\run-cuda.bat                  # 启动 CUDA 版 Release
+```
+
+设置 → 语音识别 → 推理设备 可选「CUDA 加速」或「纯 CPU」；只有包含 CUDA 的构建才会出现 CUDA 选项。打轴日志中的 `whisper_system_info=` 与 `using CUDA0 backend` 用于确认实际生效的后端。
+
+只跑部分测试（全量约 45 秒，其中 `SubCueEditorIntegrationTests` 占大部分）：
+
+```powershell
+ctest --preset windows-debug -R SubCueTimelineTests
+ctest --preset windows-debug -E SubCueEditorIntegrationTests
 ```
 
 1. 拖入或选择媒体文件（支持窗口任意位置拖放）。
@@ -97,8 +125,11 @@ SubCue/
 │   ├── golden/                 # 对齐与字幕格式 fixtures
 │   └── media/                  # 小型 CFR/VFR/音频/损坏样本
 ├── third_party/whisper.cpp/    # 固定版本的本地推理运行时
+├── run-debug.bat               # 补齐运行时依赖后启动 Debug 版
 └── tools/
-    ├── build-windows.bat       # MSVC 环境中的 CMake/CTest
+    ├── build-windows.bat       # MSVC 环境中的增量 CMake/CTest
+    ├── run-release.bat         # 补齐运行时依赖后启动 Release 版
+    ├── run-cuda.bat            # 补齐运行时依赖后启动 CUDA 版 Release
     ├── package-windows.bat     # Release 便携包 → dist/windows-x64
     ├── generate_alignment_golden.py
     ├── requirements-golden.txt # 仅 golden 再生需要 rapidfuzz
@@ -130,6 +161,13 @@ Release 便携目录由 `tools\package-windows.bat` 生成（默认 Release）�
 ```powershell
 tools\package-windows.bat
 .\dist\windows-x64\SubCue.exe
+```
+
+CUDA 版由 `tools\package-windows.bat cuda` 打包到 `dist/windows-x64-cuda`，额外随带 cuBLAS 与 CUDA Runtime DLL（整个目录约 630 MB）：
+
+```powershell
+tools\package-windows.bat cuda
+.\dist\windows-x64-cuda\SubCue.exe
 ```
 
 FFmpeg、ASR/LLM 权重不会被打包进源码树。Whisper ggml 模型按清单下载，不随程序分发；本地推理由固定版本的 whisper.cpp 运行时提供。

@@ -5,6 +5,8 @@
 #include "ui_theme.h"
 
 #include <QtCore/QTimer>
+#include <QtCore/QElapsedTimer>
+#include <QtCore/QFile>
 #include <QtGui/QFont>
 #include <QtGui/QFontInfo>
 #include <QtGui/QGuiApplication>
@@ -14,12 +16,24 @@
 #include <QtQml/QQmlContext>
 #include <QtQuickControls2/QQuickStyle>
 
+// TODO(temp): 临时启动阶段埋点，定位 Debug 版启动卡死，定位后删除。
+static void traceStartup(const char *stage)
+{
+    QFile file(QStringLiteral("D:/DSH/SubCue/startup-trace.log"));
+    if (file.open(QIODevice::Append)) {
+        file.write(stage);
+        file.write("\n");
+    }
+}
+
 int main(int argc, char *argv[])
 {
+    traceStartup("enter-main");
     QGuiApplication application(argc, argv);
+    traceStartup("gui-app-created");
     QCoreApplication::setOrganizationName(QStringLiteral("SubCue"));
     QCoreApplication::setApplicationName(QStringLiteral("SubCue"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.1"));
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
     QFont uiFont(QStringLiteral("Microsoft YaHei UI"));
@@ -50,7 +64,17 @@ int main(int argc, char *argv[])
     application.setPalette(palette);
 
     subcue::ApplicationContext context;
+    traceStartup("context-created");
     subcue::AppController controller(&context);
+    traceStartup("controller-created");
+    QElapsedTimer heartbeat;
+    heartbeat.start();
+    QTimer responsivenessTimer;
+    QObject::connect(&responsivenessTimer, &QTimer::timeout, &application, [&heartbeat] {
+        const qint64 elapsed = heartbeat.restart();
+        if (elapsed > 450) qCWarning(subcueLog) << "ui_event_delay_ms=" << elapsed - 250;
+    });
+    responsivenessTimer.start(250);
     subcue::NativeTheme nativeTheme;
 
     QQmlApplicationEngine engine;
@@ -72,11 +96,14 @@ int main(int argc, char *argv[])
             }
         });
     engine.loadFromModule(QStringLiteral("SubCue"), QStringLiteral("Main"));
+    traceStartup("qml-loaded");
 
     if (application.arguments().contains(QStringLiteral("--smoke-test"))) {
         QTimer::singleShot(0, &application, &QCoreApplication::quit);
     }
 
-    qCInfo(subcueLog) << "SubCue native application started";
+    qCInfo(subcueLog) << "SubCue native application started" << QCoreApplication::applicationVersion()
+        << QCoreApplication::applicationFilePath() << "built=" << __DATE__ << __TIME__;
+    traceStartup("entering-event-loop");
     return application.exec();
 }

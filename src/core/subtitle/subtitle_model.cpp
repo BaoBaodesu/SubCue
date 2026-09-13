@@ -54,6 +54,7 @@ QVariant SubtitleModel::data(const QModelIndex &index, int role) const
     case SkipReasonRole: return subtitle.skipReason;
     case StartWordIdRole: return subtitle.startWordId;
     case EndWordIdRole: return subtitle.endWordId;
+    case CandidateTextRole: return subtitle.candidateText;
     case MetadataRole: return subtitle.metadata.toVariantMap();
     default: return {};
     }
@@ -79,6 +80,7 @@ QHash<int, QByteArray> SubtitleModel::roleNames() const
         {StartWordIdRole, "startWordId"},
         {EndWordIdRole, "endWordId"},
         {MetadataRole, "metadata"},
+        {CandidateTextRole, "candidateText"},
     };
 }
 

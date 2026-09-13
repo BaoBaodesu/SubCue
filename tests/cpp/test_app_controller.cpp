@@ -31,6 +31,7 @@ private slots:
     void audioOutputTakeFramesAdvancesClockBuffer();
     void virtualAudioDeviceConsumesElapsedAudio();
     void createAudioDeviceVirtualKind();
+    void appControllerAcceptsSupportedPlaybackRates();
     void softwarePreviewStoresPresentedFrame();
     void previewFactoryCreatesIsolatedBackend();
     void d3d11AdapterFallsBackWithoutWindow();
@@ -88,14 +89,19 @@ void AppControllerTests::virtualAudioDeviceConsumesElapsedAudio()
     QVector<float> samples(48'000, 0.0f);
     QVERIFY(output.write(samples, MediaTime::fromMilliseconds(0), 0));
     QVERIFY(device.start(48'000, 2));
+    device.setSampleProvider([&](float *destination, qint64 maximumFrames) -> qint64 {
+        const QVector<float> taken = output.takeFrames(maximumFrames);
+        std::copy(taken.cbegin(), taken.cend(), destination);
+        return static_cast<qint64>(taken.size() / 2);
+    });
     QTest::qWait(20);
-    const qint64 consumed = device.render(output);
+    const qint64 consumed = device.renderFrame();
     QVERIFY(consumed > 0);
     QVERIFY(output.consumedSamples() > 0);
     device.pause();
     const qint64 afterPause = output.consumedSamples();
     QTest::qWait(20);
-    QCOMPARE(device.render(output), 0);
+    QCOMPARE(device.renderFrame(), 0);
     QCOMPARE(output.consumedSamples(), afterPause);
     device.stop();
 }
@@ -106,6 +112,21 @@ void AppControllerTests::createAudioDeviceVirtualKind()
     QVERIFY(device);
     QCOMPARE(device->backendId(), QStringLiteral("virtual"));
     QVERIFY(!device->isHardware());
+}
+
+void AppControllerTests::appControllerAcceptsSupportedPlaybackRates()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    const QList<double> rates{0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0};
+    for (double rate : rates) {
+        controller.setPlaybackRate(rate);
+        QCOMPARE(controller.playbackRate(), rate);
+    }
+    controller.setPlaybackRate(1.1);
+    QCOMPARE(controller.playbackRate(), 3.0);
 }
 
 void AppControllerTests::softwarePreviewStoresPresentedFrame()
@@ -185,8 +206,8 @@ void AppControllerTests::appControllerLoadsMediaAndScript()
     QVERIFY(controller.scriptText().contains(QStringLiteral("第一行")));
 
     controller.startAlignment();
+    QTRY_VERIFY(!controller.busy());
     QVERIFY(controller.statusText().contains(QStringLiteral("前检查")));
-    QVERIFY(!controller.busy());
 }
 
 void AppControllerTests::unicodeMediaOpensFromDialogAndDrop()
@@ -284,6 +305,13 @@ void AppControllerTests::appControllerSettingsRoundTrip()
     auto context = makeContext(dir);
     AppController controller(context.get());
     QCOMPARE(controller.credentialStatus(), QStringLiteral("尚未配置"));
+    QSignalSpy credentialSpy(&controller, &AppController::credentialStatusReady);
+    QElapsedTimer responseTimer;
+    responseTimer.start();
+    QCOMPARE(controller.requestCredentialStatus(), QStringLiteral("正在查询…"));
+    QVERIFY(responseTimer.elapsed() < 200);
+    QTRY_COMPARE(credentialSpy.size(), 1);
+    QCOMPARE(credentialSpy.first().at(1).toString(), QStringLiteral("尚未配置"));
     controller.saveSettings(
         {{QStringLiteral("fontFamily"), QStringLiteral("SimHei")},
          {QStringLiteral("fontSize1080p"), 64},

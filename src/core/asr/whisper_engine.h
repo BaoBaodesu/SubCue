@@ -4,6 +4,7 @@
 
 #include <QtCore/QString>
 
+#include <functional>
 #include <memory>
 
 namespace subcue {
@@ -23,7 +24,8 @@ public:
 
     [[nodiscard]] virtual AsrResult transcribePcm(
         const QVector<float> &pcm16kMono,
-        const std::atomic<bool> *cancel = nullptr) = 0;
+        const std::atomic<bool> *cancel = nullptr,
+        const std::function<void(int)> &progress = {}) = 0;
 };
 
 // 未链接 whisper.cpp 核心库时的占位实现。CTest 注入 FakeWhisperEngine，
@@ -33,7 +35,8 @@ public:
     [[nodiscard]] bool isAvailable() const noexcept override { return false; }
     AsrResult transcribePcm(
         const QVector<float> &pcm16kMono,
-        const std::atomic<bool> *cancel = nullptr) override;
+        const std::atomic<bool> *cancel = nullptr,
+        const std::function<void(int)> &progress = {}) override;
 };
 
 #ifdef SUBCUE_HAS_WHISPER
@@ -46,7 +49,8 @@ public:
     [[nodiscard]] bool setModelPath(const QString &path, QString *errorMessage = nullptr) override;
     AsrResult transcribePcm(
         const QVector<float> &pcm16kMono,
-        const std::atomic<bool> *cancel = nullptr) override;
+        const std::atomic<bool> *cancel = nullptr,
+        const std::function<void(int)> &progress = {}) override;
 
 private:
     struct Private;

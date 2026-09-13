@@ -73,6 +73,8 @@ public:
         if (asrCancelled(request.cancel)) {
             return asrCancelledError();
         }
+        if (transcript.words.isEmpty()) return AppError(ErrorDomain::Asr,
+            static_cast<int>(AsrErrorCode::EmptyTranscript), QStringLiteral("没有识别到词"));
         Transcript copy = transcript;
         copy.sortAndReindex();
         return copy;
@@ -195,6 +197,7 @@ class EditorIntegrationTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase();
     void qmlShortcutsMatchFeatureMatrix();
     void qmlImportDropAndLayout();
     void exportResultUsesIncrementingSubtitleFolder();
@@ -216,6 +219,14 @@ private:
     [[nodiscard]] QString sourcePath(const QString &relative) const;
     [[nodiscard]] std::unique_ptr<ApplicationContext> makeContext(const QTemporaryDir &dir) const;
 };
+
+void EditorIntegrationTests::initTestCase()
+{
+    // 截图用例写源码树下的 .test_tmp/，而 QImage::save 不会自建上层目录。
+    const QString screenshotDir = sourcePath(QStringLiteral(".test_tmp"));
+    QVERIFY2(QDir().mkpath(screenshotDir),
+             qPrintable(QStringLiteral("无法创建截图目录: %1").arg(screenshotDir)));
+}
 
 QString EditorIntegrationTests::mediaPath(const QString &name) const
 {
@@ -294,6 +305,23 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     QVERIFY(window);
     QTest::qWait(200);
+    QElapsedTimer settingsTimer;
+    settingsTimer.start();
+    QVERIFY(QMetaObject::invokeMethod(window, "openSettings"));
+    qInfo() << "settings_open_ms=" << settingsTimer.elapsed();
+    QVERIFY(settingsTimer.elapsed() < 200);
+    auto *settingsWindow = window->findChild<QQuickWindow *>(QStringLiteral("settingsWindow"));
+    QVERIFY(settingsWindow);
+    QTRY_VERIFY(settingsWindow->isVisible());
+    auto *settingsLoader = settingsWindow->findChild<QObject *>(QStringLiteral("settingsContentLoader"));
+    QVERIFY(settingsLoader);
+    QTRY_COMPARE(settingsLoader->property("status").toInt(), 1);
+    QTest::qWait(100);
+    QVERIFY(settingsWindow->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/settings-%1.png")
+        .arg(QGuiApplication::platformName()))));
+    settingsWindow->hide();
+    window->requestActivate();
+    QTest::qWait(30);
     auto *preview = window->findChild<VideoPreviewItem *>(QStringLiteral("videoPreview"));
     auto *list = window->findChild<QQuickItem *>(QStringLiteral("projectFileList"));
     auto *timeline = window->findChild<TimelineSceneItem *>(QStringLiteral("timelineScene"));
@@ -443,7 +471,11 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     QTest::mouseDClick(window, Qt::LeftButton, Qt::NoModifier,
         timeline->mapToScene(QPointF(450 * timeline->pixelsPerMs(), 48)).toPoint());
     QCOMPARE(editRequest.count(), 1);
+    auto *cuePopup = window->findChild<QObject *>(QStringLiteral("cueEditorPopup"));
+    QVERIFY(cuePopup);
+    QTRY_VERIFY(cuePopup->property("opened").toBool());
     QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_VERIFY(!cuePopup->property("visible").toBool());
     controller.setCueText(0, QStringLiteral("人工修正"));
     QCOMPARE(controller.document()->subtitles().first().text, QStringLiteral("人工修正"));
     controller.undo();
@@ -489,6 +521,32 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     QVERIFY(controller.playing());
     QCOMPARE(navigatorSeeks.count(), seeksBeforeNavigation);
     controller.stop();
+    Subtitle dropped;
+    dropped.text = QStringLiteral("拖放定位测试");
+    dropped.status = QStringLiteral("SKIPPED_NO_AUDIO");
+    controller.applySubtitles({dropped});
+    timeline->setVisibleRange(0, 0.02);
+    QTest::qWait(50);
+    auto *subtitleList = window->findChild<QQuickItem *>(QStringLiteral("subtitleList"));
+    QVERIFY(subtitleList);
+    QQuickItem *dropRow = nullptr;
+    QVERIFY(QMetaObject::invokeMethod(subtitleList, "itemAtIndex",
+        Q_RETURN_ARG(QQuickItem *, dropRow), Q_ARG(int, 0)));
+    QVERIFY(dropRow);
+    const QPoint dropFrom = dropRow->mapToScene(QPointF(70, 10)).toPoint();
+    const QPoint dropTo = timeline->mapToScene(QPointF(500 * timeline->pixelsPerMs(), 70)).toPoint();
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, dropFrom);
+    for (int step = 1; step <= 20; ++step)
+        QTest::mouseMove(window, dropFrom + (dropTo - dropFrom) * step / 20, 2);
+    auto *dropMouse = dropRow->findChild<QObject *>(QStringLiteral("subtitleRowMouse"));
+    QVERIFY(dropMouse);
+    QVERIFY(dropMouse->property("pressed").toBool());
+    QVERIFY(dropMouse->property("placing").toBool());
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, dropTo);
+    QVERIFY(controller.document()->subtitles().first().isTimed());
+    QVERIFY(qAbs(controller.document()->subtitles().first().start.milliseconds() - 500) < 10);
+    controller.undo();
+    QVERIFY(!controller.document()->subtitles().first().isTimed());
     controller.applySubtitles({editable});
     controller.confirmCue(0);
     QCOMPARE(controller.document()->subtitles().first().status, QStringLiteral("MANUAL"));
@@ -509,11 +567,14 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     QVERIFY(controller.busy());
     auto *progressArea = window->findChild<QQuickItem *>(QStringLiteral("alignmentProgressDialog"));
     auto *progressBar = window->findChild<QQuickItem *>(QStringLiteral("alignmentProgressBar"));
-    QVERIFY(progressArea && progressBar);
+    auto *progressFill = window->findChild<QQuickItem *>(QStringLiteral("alignmentProgressFill"));
+    QVERIFY(progressArea && progressBar && progressFill);
     QVERIFY(progressArea->isVisible());
     QVERIFY(progressBar->property("indeterminate").toBool());
     QTRY_COMPARE(controller.alignmentStage(), QStringLiteral("ASR"));
     QVERIFY(!progressBar->property("indeterminate").toBool());
+    progressBar->setProperty("value", 50);
+    QTRY_VERIFY(progressFill->width() >= progressBar->width() * 0.49);
     window->resize(1440, 900);
     QTest::qWait(50);
     QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/timeline-progress-%1.png")
@@ -604,8 +665,12 @@ void EditorIntegrationTests::pipelineAlignsWithInjectedAsrOnWorkerThread()
             QVERIFY(!controller.alignmentIndeterminate());
         }
     });
+    QElapsedTimer responseTimer;
+    responseTimer.start();
     controller.startAlignment();
+    QVERIFY(responseTimer.elapsed() < 200);
     QVERIFY(controller.busy());
+    controller.startAlignment();
     QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(asr.calls >= 1);
     QVERIFY(asr.workerThreadId != nullptr);
@@ -615,7 +680,20 @@ void EditorIntegrationTests::pipelineAlignsWithInjectedAsrOnWorkerThread()
     QVERIFY(controller.document()->subtitles().at(0).isTimed());
     QVERIFY(controller.statusText().contains(QStringLiteral("打轴完成")));
     QVERIFY(controller.canExport());
+    QVERIFY(!QFile::exists(dir.filePath(QStringLiteral("cfr_av_字幕文件/cfr_av.srt"))));
+    controller.exportSubtitles();
     QVERIFY(QFile::exists(dir.filePath(QStringLiteral("cfr_av_字幕文件/cfr_av.srt"))));
+    asr.transcript.words.clear();
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QCOMPARE(controller.document()->count(), 2);
+    QVERIFY(!controller.document()->subtitles().first().isTimed());
+    QCOMPARE(controller.document()->subtitles().first().metadata.value(QStringLiteral("diagnosticReason")).toString(),
+        QStringLiteral("ASR_NO_WORDS"));
+    controller.locateCueAt(controller.document()->subtitles().first().id, 100);
+    QVERIFY(controller.document()->subtitles().first().isTimed());
+    controller.undo();
+    QVERIFY(!controller.document()->subtitles().first().isTimed());
 }
 
 void EditorIntegrationTests::appControllerAlignmentCancelWaitsForWorker()
@@ -800,6 +878,17 @@ void EditorIntegrationTests::appControllerCreateNextScriptCue()
     controller.undo();
     QVERIFY(!controller.document()->subtitles().at(0).isTimed());
     QVERIFY(!controller.canExport());
+    controller.locateCueAt(unmatched.id, controller.durationMs() - 100);
+    QVERIFY(!controller.document()->subtitles().at(0).isTimed());
+    QVERIFY(controller.statusText().contains(QStringLiteral("250ms")));
+    controller.locateCueAt(unmatched.id, 300);
+    QCOMPARE(controller.document()->subtitles().at(0).start.milliseconds(), qint64(300));
+    QCOMPARE(controller.document()->subtitles().at(0).end.milliseconds(), std::min(qint64(2300), controller.durationMs()));
+    controller.undo();
+    QVERIFY(!controller.document()->subtitles().at(0).isTimed());
+    controller.redo();
+    QVERIFY(controller.document()->subtitles().at(0).isTimed());
+    controller.undo();
 
     QString edited;
     int editedRow = -1;

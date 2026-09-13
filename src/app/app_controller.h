@@ -153,6 +153,7 @@ public:
     Q_INVOKABLE void playForward();
     Q_INVOKABLE void playReverse();
     Q_INVOKABLE void stop();
+    Q_INVOKABLE void setPlaybackRate(double rate);
     Q_INVOKABLE void seek(qint64 positionMs);
     Q_INVOKABLE void seekUs(qint64 positionUs);
     Q_INVOKABLE void stepFrames(int frames);
@@ -161,6 +162,7 @@ public:
     Q_INVOKABLE void navigateCue(int delta);
     Q_INVOKABLE void setCueText(int row, const QString &text);
     Q_INVOKABLE void locateCue(int row);
+    Q_INVOKABLE void locateCueAt(const QString &id, qint64 startMs);
     Q_INVOKABLE void confirmCue(int row);
     Q_INVOKABLE void undo() { commands_.undo(); }
     Q_INVOKABLE void redo() { commands_.redo(); }
@@ -197,11 +199,15 @@ public:
     Q_INVOKABLE bool saveSettings(const QVariantMap &values, const QString &asrApiKey = {},
                                   const QString &aiApiKey = {});
     Q_INVOKABLE QString credentialStatus(const QString &credentialId = QStringLiteral("SubCue/ASR/dashscope")) const;
+    Q_INVOKABLE void requestAsrModels(const QString &providerId, const QString &directory, int requestId);
+    Q_INVOKABLE QString requestCredentialStatus(const QString &credentialId = QStringLiteral("SubCue/ASR/dashscope"), int requestId = 0);
     Q_INVOKABLE QString verificationStatus(const QString &section, const QString &providerId = {}) const;
     Q_INVOKABLE void shutdown();
     Q_INVOKABLE void applySubtitles(const QList<Subtitle> &subtitles);
 
 signals:
+    void asrModelsReady(int requestId, const QVariantList &models);
+    void credentialStatusReady(const QString &credentialId, const QString &status, int requestId);
     void projectFilesChanged();
     void mediaChanged();
     void positionChanged();

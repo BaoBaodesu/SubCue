@@ -9,6 +9,7 @@
 #include "alignment/alignment_preflight.h"
 #include "asr/asr_provider_factory.h"
 #include "asr/asr_types.h"
+#include "asr/local_python_asr_service.h"
 #include "asr/model_downloader.h"
 #include "asr/whisper_model_catalog.h"
 #include "common/logging.h"
@@ -18,6 +19,8 @@
 #include "waveform/waveform_generator.h"
 
 #include <QtCore/QDir>
+#include <QtCore/QCoreApplication>
+#include <QtCore/QThreadPool>
 #include <QtCore/QDateTime>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
@@ -32,11 +35,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <utility>
 #include <variant>
 
 namespace subcue {
 namespace {
+
+// 预览播放的水位线：解码数据先泵到约 300ms 再开始出声，避免音频线程频繁见底。
+constexpr int kAudioPreRollMs = 300;
 
 const QStringList kMediaExtensions = {
     QStringLiteral(".wav"), QStringLiteral(".mp3"), QStringLiteral(".m4a"),
@@ -350,10 +357,31 @@ void AppController::loadMediaPath(const QString &path)
     const MediaInfo info = std::get<MediaInfo>(probed);
 
     stop();
+    // 设备先起：它决定实际混音采样率，解码数据按这个采样率泵入环缓冲。
+    IAudioDevice *device = context_->audioDevice.get();
+    if (device) {
+        AppError audioError(ErrorDomain::Media, 0, QString());
+        if (!device->start(playback_.outputSampleRate(), playback_.outputChannels(), &audioError)) {
+            qCInfo(subcueAppLog) << "Audio device start failed, falling back to virtual:"
+                                 << audioError.userMessage();
+            context_->audioDevice = createAudioDevice(AudioDeviceKind::Virtual);
+            device = context_->audioDevice.get();
+            (void)device->start(playback_.outputSampleRate(), playback_.outputChannels(), nullptr);
+        }
+        device->setPlaybackRate(playbackRate_);
+    }
+
     AppError openError(ErrorDomain::Media, 0, QString());
     if (!playback_.open(path, &openError)) {
+        if (device) {
+            device->stop();
+        }
         setStatus(QStringLiteral("媒体打开失败：%1").arg(openError.userMessage()));
         return;
+    }
+    playback_.setAudioDevice(device, kAudioPreRollMs);
+    if (device) {
+        device->pause();
     }
 
     alignmentCancel_ = true;
@@ -385,25 +413,15 @@ void AppController::loadMediaPath(const QString &path)
         previewItem_->clearFrame();
     }
 
-    IAudioDevice *device = context_->audioDevice.get();
-    if (device) {
-        AppError audioError(ErrorDomain::Media, 0, QString());
-        if (!device->start(playback_.outputSampleRate(), playback_.outputChannels(), &audioError)) {
-            qCInfo(subcueAppLog) << "Audio device start failed, falling back to virtual:"
-                                 << audioError.userMessage();
-            context_->audioDevice = createAudioDevice(AudioDeviceKind::Virtual);
-            device = context_->audioDevice.get();
-            (void)device->start(playback_.outputSampleRate(), playback_.outputChannels(), nullptr);
-            setStatus(QStringLiteral("已加载：%1（音频回退到虚拟输出）").arg(mediaName()));
-        } else {
-            setStatus(QStringLiteral("已加载：%1（%2s，%3 fps）")
-                          .arg(mediaName())
-                          .arg(QString::number(durationMs() / 1000.0, 'f', 1))
-                          .arg(QString::number(fps_, 'f', 3)));
-        }
-        device->pause();
-    } else {
+    if (!device) {
         setStatus(QStringLiteral("已加载：%1").arg(mediaName()));
+    } else if (device->isHardware() && device->isStarted()) {
+        setStatus(QStringLiteral("已加载：%1（%2s，%3 fps）")
+                      .arg(mediaName())
+                      .arg(QString::number(durationMs() / 1000.0, 'f', 1))
+                      .arg(QString::number(fps_, 'f', 3)));
+    } else {
+        setStatus(QStringLiteral("已加载：%1（音频回退到虚拟输出）").arg(mediaName()));
     }
 
     startWaveformWorker(path);
@@ -558,106 +576,118 @@ void AppController::startAlignment()
     }
     const QStringList lines = TxtImporter::parse(QString(scriptText_).replace(QStringLiteral("\\n"), QStringLiteral("\n")));
     if (mediaPath_.isEmpty() || lines.isEmpty()) {
-        const QVector<PreflightIssue> issues = AlignmentPreflight::check(
-            mediaPath_, mediaInfo_, lines, context_->settings,
-            PreflightState{true, true, true, true, true, true, true});
         QVariantList values;
-        values.reserve(issues.size());
-        for (const PreflightIssue &issue : issues) {
-            values.append(QVariantMap{{QStringLiteral("code"), issue.code},
-                                      {QStringLiteral("title"), issue.title},
-                                      {QStringLiteral("detail"), issue.detail},
-                                      {QStringLiteral("settingsSection"), issue.settingsSection}});
-        }
-        setStatus(QStringLiteral("自动打轴前检查发现 %1 项问题。").arg(issues.size()));
+        if (mediaPath_.isEmpty()) values.append(QVariantMap{
+            {QStringLiteral("code"), QStringLiteral("media_missing")},
+            {QStringLiteral("title"), QStringLiteral("请先导入媒体")},
+            {QStringLiteral("detail"), QString()}, {QStringLiteral("settingsSection"), QString()}});
+        if (lines.isEmpty()) values.append(QVariantMap{
+            {QStringLiteral("code"), QStringLiteral("script_missing")},
+            {QStringLiteral("title"), QStringLiteral("请先输入字幕文稿")},
+            {QStringLiteral("detail"), QString()}, {QStringLiteral("settingsSection"), QString()}});
+        if (!context_->settings.value(QStringLiteral("outputSrt")).toBool()
+            && !context_->settings.value(QStringLiteral("outputAss")).toBool())
+            values.append(QVariantMap{{QStringLiteral("code"), QStringLiteral("output_format_missing")},
+                {QStringLiteral("title"), QStringLiteral("请至少启用一种输出格式")},
+                {QStringLiteral("detail"), QString()}, {QStringLiteral("settingsSection"), QStringLiteral("output")}});
+        setStatus(QStringLiteral("请先导入媒体并输入字幕文稿。"));
         emit alignmentPreflightFailed(values);
         return;
     }
-    const QString asrProvider = AsrProviderFactory::providerIdFromSettings(context_->settings);
-    const QJsonObject aiProvider = selectedAiProvider(context_->settings);
-    const QJsonObject asrVerification = context_->settings
-        .value(QStringLiteral("asrVerification")).toObject();
-    const QString whisperModel = context_->settings.value(QStringLiteral("whisperModel")).toString();
-    QString whisperDirectory = context_->settings
-        .value(QStringLiteral("whisperModelsDirectory")).toString();
-    if (whisperDirectory.isEmpty()) {
-        whisperDirectory = AsrProviderFactory::defaultWhisperModelsDirectory();
-    }
-    bool whisperReady = false;
-    if (const std::optional<WhisperModelSpec> spec = WhisperModelCatalog::find(whisperModel)) {
-        whisperReady = ModelDownloader::matchesSpec(QDir(whisperDirectory).filePath(spec->fileName), *spec);
-    }
-    const bool asrVerified = asrOverride_ != nullptr
-        || (asrVerification.value(QStringLiteral("providerId")).toString() == asrProvider
-            && asrVerification.value(QStringLiteral("selectedModel")).toString()
-                == context_->settings.value(asrProvider == QLatin1String(kAsrProviderWhisper)
-                    ? QStringLiteral("whisperModel") : QStringLiteral("asrModel")).toString()
-            && asrVerification.value(QStringLiteral("configRevision")).toInt()
-                == context_->settings.value(QStringLiteral("asrConfigRevision")).toInt()
-            && asrVerification.value(QStringLiteral("credentialRevision")).toInt()
-                == context_->settings.value(QStringLiteral("asrCredentialRevision")).toInt()
-            && !asrVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
-    const QJsonObject aiVerification = aiProvider.value(QStringLiteral("verification")).toObject();
-    const bool aiVerified = aiOverride_ != nullptr
-        || (!aiProvider.isEmpty()
-            && aiVerification.value(QStringLiteral("providerId")).toString()
-                == aiProvider.value(QStringLiteral("id")).toString()
-            && aiVerification.value(QStringLiteral("configRevision")).toInt()
-                == aiProvider.value(QStringLiteral("configRevision")).toInt()
-            && aiVerification.value(QStringLiteral("credentialRevision")).toInt()
-                == aiProvider.value(QStringLiteral("credentialRevision")).toInt()
-            && aiVerification.value(QStringLiteral("selectedModel")).toString()
-                == aiProvider.value(QStringLiteral("selectedModel")).toString()
-            && !aiVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
-    const PreflightState preflightState{
-        asrOverride_ != nullptr || context_->credentials.exists(QStringLiteral("SubCue/ASR/dashscope")),
-        aiOverride_ != nullptr || aiProvider.value(QStringLiteral("authMode")).toString() == QLatin1String("none")
-            || context_->credentials.exists(aiCredentialId(aiProvider.value(QStringLiteral("id")).toString())),
-        asrVerified,
-        aiVerified,
-        whisperRuntimeAvailable(),
-        whisperReady,
-        aiOverride_ != nullptr,
-    };
-    const QVector<PreflightIssue> issues = AlignmentPreflight::check(
-        mediaPath_, mediaInfo_, lines, context_->settings, preflightState);
-    if (!issues.isEmpty()) {
-        QVariantList values;
-        values.reserve(issues.size());
-        for (const PreflightIssue &issue : issues) {
-            values.append(QVariantMap{{QStringLiteral("code"), issue.code},
-                                      {QStringLiteral("title"), issue.title},
-                                      {QStringLiteral("detail"), issue.detail},
-                                      {QStringLiteral("settingsSection"), issue.settingsSection}});
-        }
-        setStatus(QStringLiteral("自动打轴前检查发现 %1 项问题。").arg(issues.size()));
-        emit alignmentPreflightFailed(values);
-        return;
-    }
-
     alignmentCancel_ = false;
     stopAlignmentWorker();
     const quint64 generation = ++alignmentGeneration_;
     const QString mediaPath = mediaPath_;
+    const MediaInfo mediaInfo = mediaInfo_;
     const QJsonObject settings = context_->settings;
-    const AlignmentCredentials credentials{
-        context_->credentials.load(QStringLiteral("SubCue/ASR/dashscope")),
-        aiProvider.value(QStringLiteral("authMode")).toString() == QLatin1String("none")
-            ? QString()
-            : context_->credentials.load(aiCredentialId(
-                aiProvider.value(QStringLiteral("id")).toString())),
-    };
     IAsrService *asr = asrOverride_;
     IAiProvider *ai = aiOverride_;
-
     setBusy(true);
     setCanExport(false);
     alignmentProgress_ = 0;
-    alignmentState_ = {QStringLiteral("Preflight"), QStringLiteral("正在准备自动打轴…")};
-    alignmentProgressText_ = QStringLiteral("正在准备自动打轴…");
+    alignmentState_ = {QStringLiteral("Preflight"), QStringLiteral("正在检查配置与模型…")};
+    alignmentProgressText_ = alignmentState_.message;
     emit alignmentProgressChanged();
 
-    alignmentThread_ = std::thread([this, generation, mediaPath, lines, settings, credentials, asr, ai] {
+    alignmentThread_ = std::thread([this, generation, mediaPath, mediaInfo, lines, settings, asr, ai] {
+        QElapsedTimer preflightTimer;
+        preflightTimer.start();
+        const QString asrProvider = AsrProviderFactory::providerIdFromSettings(settings);
+        const QJsonObject aiProvider = selectedAiProvider(settings);
+        const QJsonObject asrVerification = settings
+            .value(QStringLiteral("asrVerification")).toObject();
+        const QString whisperModel = settings.value(QStringLiteral("whisperModel")).toString();
+        QString whisperDirectory = settings
+            .value(QStringLiteral("whisperModelsDirectory")).toString();
+        if (whisperDirectory.isEmpty()) {
+            whisperDirectory = AsrProviderFactory::defaultWhisperModelsDirectory();
+        }
+        bool whisperReady = false;
+        if (const std::optional<WhisperModelSpec> spec = WhisperModelCatalog::find(whisperModel);
+            asrProvider == QLatin1String(kAsrProviderWhisper) && spec && !alignmentCancel_) {
+            whisperReady = ModelDownloader::matchesSpec(QDir(whisperDirectory).filePath(spec->fileName), *spec, &alignmentCancel_);
+        }
+        const bool asrVerified = asr != nullptr
+            || (asrVerification.value(QStringLiteral("providerId")).toString() == asrProvider
+                && asrVerification.value(QStringLiteral("selectedModel")).toString()
+                    == settings.value(asrProvider == QLatin1String(kAsrProviderWhisper)
+                        ? QStringLiteral("whisperModel") : QStringLiteral("asrModel")).toString()
+                && asrVerification.value(QStringLiteral("configRevision")).toInt()
+                    == settings.value(QStringLiteral("asrConfigRevision")).toInt()
+                && asrVerification.value(QStringLiteral("credentialRevision")).toInt()
+                    == settings.value(QStringLiteral("asrCredentialRevision")).toInt()
+                && !asrVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
+        const QJsonObject aiVerification = aiProvider.value(QStringLiteral("verification")).toObject();
+        const bool aiVerified = ai != nullptr
+            || (!aiProvider.isEmpty()
+                && aiVerification.value(QStringLiteral("providerId")).toString()
+                    == aiProvider.value(QStringLiteral("id")).toString()
+                && aiVerification.value(QStringLiteral("configRevision")).toInt()
+                    == aiProvider.value(QStringLiteral("configRevision")).toInt()
+                && aiVerification.value(QStringLiteral("credentialRevision")).toInt()
+                    == aiProvider.value(QStringLiteral("credentialRevision")).toInt()
+                && aiVerification.value(QStringLiteral("selectedModel")).toString()
+                    == aiProvider.value(QStringLiteral("selectedModel")).toString()
+                && !aiVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
+        const PreflightState preflightState{
+            asr != nullptr || context_->credentials.exists(QStringLiteral("SubCue/ASR/dashscope")),
+            ai != nullptr || aiProvider.value(QStringLiteral("authMode")).toString() == QLatin1String("none")
+                || context_->credentials.exists(aiCredentialId(aiProvider.value(QStringLiteral("id")).toString())),
+            asrVerified,
+            aiVerified,
+            whisperRuntimeAvailable(),
+            whisperReady,
+            ai != nullptr,
+        };
+        const QVector<PreflightIssue> issues = AlignmentPreflight::check(
+            mediaPath, mediaInfo, lines, settings, preflightState);
+        if (!issues.isEmpty()) {
+            QVariantList values;
+            values.reserve(issues.size());
+            for (const PreflightIssue &issue : issues) {
+                values.append(QVariantMap{{QStringLiteral("code"), issue.code},
+                                          {QStringLiteral("title"), issue.title},
+                                          {QStringLiteral("detail"), issue.detail},
+                                          {QStringLiteral("settingsSection"), issue.settingsSection}});
+            }
+            QMetaObject::invokeMethod(this, [this, generation, values] {
+                if (generation != alignmentGeneration_.load()) return;
+                finishAlignment(generation, AppError(ErrorDomain::Validation, 1,
+                    QStringLiteral("自动打轴前检查未通过")));
+                if (!alignmentCancel_) emit alignmentPreflightFailed(values);
+            }, Qt::QueuedConnection);
+            return;
+        }
+
+        const AlignmentCredentials credentials{
+            asrProvider == QLatin1String(kAsrProviderDashScope)
+                ? context_->credentials.load(QStringLiteral("SubCue/ASR/dashscope")) : QString(),
+            aiProvider.value(QStringLiteral("authMode")).toString() == QLatin1String("none")
+                ? QString()
+                : context_->credentials.load(aiCredentialId(
+                    aiProvider.value(QStringLiteral("id")).toString())),
+        };
+        qCInfo(subcueAppLog) << "preflight elapsed_ms=" << preflightTimer.elapsed();
         AlignmentPipeline pipeline(settings, credentials, asr, ai);
         const AlignmentRunResult result = pipeline.run(
             mediaPath,
@@ -692,7 +722,9 @@ void AppController::cancelAlignment()
         return;
     }
     alignmentCancel_ = true;
-    setStatus(QStringLiteral("正在取消…"));
+    alignmentProgressText_ = QStringLiteral("正在取消…");
+    emit alignmentProgressChanged();
+    setStatus(alignmentProgressText_);
 }
 
 void AppController::exportSubtitles()
@@ -737,6 +769,8 @@ void AppController::playForward()
     direction_ = 1;
     playing_ = true;
     playback_.play();
+    // 声卡恢复前先准备足够的连续样本，避免首个设备回调在空缓冲上产生爆音。
+    (void)playback_.primeAudio();
     if (context_->audioDevice) {
         context_->audioDevice->resume();
     }
@@ -777,6 +811,22 @@ void AppController::stop()
     if (wasPlaying) {
         emit playbackChanged();
     }
+}
+
+void AppController::setPlaybackRate(double rate)
+{
+    static constexpr double rates[] = {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0};
+    const auto found = std::find_if(std::begin(rates), std::end(rates), [rate](double supported) {
+        return qAbs(rate - supported) < 0.001;
+    });
+    if (found == std::end(rates) || qFuzzyCompare(playbackRate_, *found)) {
+        return;
+    }
+    playbackRate_ = *found;
+    if (context_->audioDevice) {
+        context_->audioDevice->setPlaybackRate(playbackRate_);
+    }
+    emit playbackChanged();
 }
 
 void AppController::seek(qint64 positionMs)
@@ -849,11 +899,23 @@ void AppController::setCueText(int row, const QString &text)
 
 void AppController::locateCue(int row)
 {
-    if (row < 0 || row >= document_.count() || document_.subtitles().at(row).isTimed()) return;
-    if (setTimingMs(row, positionMs(), std::min(positionMs() + 2'000,
-            editor_.neighborBounds(document_.subtitles().at(row).id).nextStart.milliseconds()))) {
+    if (row < 0 || row >= document_.count()) return;
+    locateCueAt(document_.subtitles().at(row).id, positionMs());
+}
+
+void AppController::locateCueAt(const QString &id, qint64 startMs)
+{
+    const int row = document_.indexOf(id);
+    if (busy_ || row < 0 || document_.subtitles().at(row).isTimed()) return;
+    const auto bounds = editor_.neighborBounds(id);
+    const qint64 endMs = std::min({startMs + 2'000, bounds.nextStart.milliseconds(), timelineDurationMs()});
+    if (startMs < bounds.previousEnd.milliseconds() || endMs - startMs < 250) {
+        setStatus(QStringLiteral("此处没有至少 250ms 的可用空间，请放到相邻字幕之间。"));
+        return;
+    }
+    if (setTimingMs(row, startMs, endMs)) {
         selectCue(row, false);
-        setStatus(QStringLiteral("已在播放头创建人工时间段，可拖动或修剪。"));
+        setStatus(QStringLiteral("已创建人工时间段，可拖动或修剪。"));
     }
 }
 
@@ -1074,6 +1136,10 @@ QVariantList AppController::asrProviders() const
                     {QStringLiteral("name"), QStringLiteral("云端语音识别")}},
         QVariantMap{{QStringLiteral("id"), QStringLiteral("whisper")},
                     {QStringLiteral("name"), QStringLiteral("本地 Whisper")}},
+        QVariantMap{{QStringLiteral("id"), QStringLiteral("qwen3")},
+                    {QStringLiteral("name"), QStringLiteral("本地 Qwen3-ASR 0.6B")}},
+        QVariantMap{{QStringLiteral("id"), QStringLiteral("funasr")},
+                    {QStringLiteral("name"), QStringLiteral("本地 Fun-ASR Nano")}},
     };
 }
 
@@ -1096,6 +1162,18 @@ QVariantList AppController::asrModels(const QString &providerId) const
         }
         return result;
     }
+    if (providerId == QLatin1String("qwen3") || providerId == QLatin1String("funasr")) {
+        const QString key = providerId == QLatin1String("qwen3")
+            ? QStringLiteral("qwen3AsrModelsDirectory") : QStringLiteral("funAsrModelsDirectory");
+        const QString fallback = QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(
+            providerId == QLatin1String("qwen3") ? QStringLiteral("qwen3-asr-0.6b")
+                                                   : QStringLiteral("fun-asr-nano-2512"));
+        const QString directory = context_->settings.value(key).toString(fallback);
+        result.append(QVariantMap{{QStringLiteral("id"), providerId == QLatin1String("qwen3") ? QStringLiteral("Qwen3-ASR-0.6B") : QStringLiteral("Fun-ASR-Nano-2512")},
+            {QStringLiteral("name"), providerId == QLatin1String("qwen3") ? QStringLiteral("Qwen3-ASR-0.6B") : QStringLiteral("Fun-ASR-Nano-2512")},
+            {QStringLiteral("ready"), LocalPythonAsrService::modelReady(directory)}});
+        return result;
+    }
     result.append(QVariantMap{
         {QStringLiteral("id"), QStringLiteral("fun-asr-flash-2026-06-15")},
         {QStringLiteral("name"), QStringLiteral("Fun-ASR Flash 2026-06-15")},
@@ -1107,6 +1185,28 @@ QVariantList AppController::asrModels(const QString &providerId) const
         {QStringLiteral("ready"), true},
     });
     return result;
+}
+
+void AppController::requestAsrModels(const QString &providerId, const QString &directory, int requestId)
+{
+    if (providerId != QLatin1String(kAsrProviderWhisper)) {
+        emit asrModelsReady(requestId, asrModels(providerId));
+        return;
+    }
+    const QPointer<AppController> self(this);
+    QThreadPool::globalInstance()->start([self, directory, requestId] {
+        QVariantList models;
+        const QDir folder(directory.isEmpty() ? AsrProviderFactory::defaultWhisperModelsDirectory() : directory);
+        for (const WhisperModelSpec &model : WhisperModelCatalog::all()) {
+            const QFileInfo file(folder.filePath(model.fileName));
+            models.append(QVariantMap{{QStringLiteral("id"), model.id},
+                {QStringLiteral("name"), QStringLiteral("%1 · %2 MB").arg(model.id).arg(model.size / 1'000'000)},
+                {QStringLiteral("ready"), file.isFile() && file.size() == model.size}});
+        }
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, requestId, models] {
+            if (self) emit self->asrModelsReady(requestId, models);
+        }, Qt::QueuedConnection);
+    });
 }
 
 bool AppController::whisperCudaAvailable() const
@@ -1328,8 +1428,24 @@ bool AppController::saveSettings(
 QString AppController::credentialStatus(const QString &credentialId) const
 {
     return context_->credentials.exists(credentialId)
-        ? QStringLiteral("已安全保存")
-        : QStringLiteral("尚未配置");
+        ? QStringLiteral("已安全保存") : QStringLiteral("尚未配置");
+}
+
+QString AppController::requestCredentialStatus(const QString &credentialId, int requestId)
+{
+    const QPointer<AppController> self(this);
+    const auto store = context_->credentials;
+    QThreadPool::globalInstance()->start([self, store, credentialId, requestId] {
+        QElapsedTimer timer;
+        timer.start();
+        const QString status = store.exists(credentialId)
+            ? QStringLiteral("已安全保存") : QStringLiteral("尚未配置");
+        qCInfo(subcueAppLog) << "credential_status elapsed_ms=" << timer.elapsed();
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, credentialId, status, requestId] {
+            if (self) emit self->credentialStatusReady(credentialId, status, requestId);
+        }, Qt::QueuedConnection);
+    });
+    return QStringLiteral("正在查询…");
 }
 
 QString AppController::verificationStatus(const QString &section, const QString &providerId) const
@@ -1414,7 +1530,8 @@ void AppController::onTick()
         return;
     }
     if (playing_ && direction_ < 0) {
-        const qint64 next = positionUs_ - elapsed_.nsecsElapsed() / 1'000;
+        const qint64 next = positionUs_ - static_cast<qint64>(
+            elapsed_.nsecsElapsed() / 1'000 * playbackRate_);
         elapsed_.start();
         if (next <= 0) {
             seekUs(0);
@@ -1424,19 +1541,14 @@ void AppController::onTick()
         }
         return;
     }
-    if (playing_ && direction_ > 0) {
-        IAudioDevice *device = context_->audioDevice.get();
-        if (device && device->isHardware() && device->isStarted() && playback_.hasAudio()) {
-            device->render(playback_.audioOutput());
-            playback_.pump();
-        } else {
-            const qint64 elapsedUs = elapsed_.isValid() ? elapsed_.nsecsElapsed() / 1'000 : 10'000;
-            elapsed_.start();
-            playback_.consumeAudio(MediaTime::fromMicroseconds(std::max<qint64>(1, elapsedUs)));
-        }
-    } else {
-        playback_.pump();
+    if (playing_ && direction_ > 0 && !playback_.hasAudio()) {
+        const qint64 elapsedUs = elapsed_.isValid() ? elapsed_.nsecsElapsed() / 1'000 : 10'000;
+        elapsed_.start();
+        playback_.consumeAudio(MediaTime::fromMicroseconds(static_cast<qint64>(
+            std::max<qint64>(1, elapsedUs) * playbackRate_)));
     }
+    // 音频渲染在设备自己的事件驱动线程里跑，主线程只负责泵入解码数据与画面调度。
+    playback_.pump();
     updatePositionFromClock();
     pushPreviewFrame();
 }
@@ -1538,7 +1650,8 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
         setBusy(false);
         if (isAiCancelError(error)
             || error.userMessage() == QStringLiteral("任务已取消")
-            || error.code() == static_cast<int>(AsrErrorCode::Cancelled)) {
+            || (error.domain() == ErrorDomain::Asr
+                && error.code() == static_cast<int>(AsrErrorCode::Cancelled))) {
             alignmentState_.stage = QStringLiteral("Canceled");
             emit alignmentProgressChanged();
             setStatus(QStringLiteral("任务已取消。"));
@@ -1559,7 +1672,7 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
     mediaInfo_ = output.mediaInfo;
     setBusy(false);
     setCanExport(!output.result.exportableSubtitles().isEmpty());
-    setStatus(QStringLiteral("打轴完成：输出 %1 条，低置信 %2 条，音频未检出 %3 条")
+    setStatus(QStringLiteral("打轴完成：已定位 %1 条，低置信 %2 条，音频未检出 %3 条")
                   .arg(output.result.exportableSubtitles().size())
                   .arg(output.result.lowCount())
                   .arg(output.result.skippedCount()));

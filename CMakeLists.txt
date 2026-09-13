@@ -14,6 +14,7 @@ option(SUBCUE_ENABLE_CUDA "Enable CUDA acceleration for local Whisper" OFF)
 set(SUBCUE_WHISPER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/whisper.cpp"
     CACHE PATH "Path to the pinned whisper.cpp source tree")
 
+set(CMAKE_PREFIX_PATH "C:/Qt/6.10.3/msvc2022_64")
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Test)
 
 set(SUBCUE_FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows")
@@ -56,6 +57,9 @@ if(EXISTS "${SUBCUE_WHISPER_ROOT}/CMakeLists.txt")
     set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    if(SUBCUE_ENABLE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures for local Whisper")
+    endif()
     set(GGML_CUDA ${SUBCUE_ENABLE_CUDA} CACHE BOOL "" FORCE)
     set(GGML_CUDA_FA OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_FORCE_CUBLAS ${SUBCUE_ENABLE_CUDA} CACHE BOOL "" FORCE)
@@ -107,6 +111,8 @@ qt_add_library(SubCueCore STATIC
     src/core/asr/dashscope_asr_service.h
     src/core/asr/http_client.cpp
     src/core/asr/http_client.h
+    src/core/asr/local_python_asr_service.cpp
+    src/core/asr/local_python_asr_service.h
     src/core/asr/model_downloader.cpp
     src/core/asr/model_downloader.h
     src/core/asr/whisper_cpp_service.cpp
@@ -215,6 +221,10 @@ target_include_directories(SubCueCore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
 )
 target_link_libraries(SubCueCore PUBLIC Qt6::Core Qt6::Gui Qt6::Network Qt6::Quick SubCue::FFmpeg)
+target_compile_definitions(SubCueCore PUBLIC
+    SUBCUE_PROJECT_WHISPER_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models/whisper"
+    SUBCUE_PROJECT_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models"
+)
 if(SUBCUE_HAS_WHISPER)
     target_link_libraries(SubCueCore PRIVATE whisper)
     target_compile_definitions(SubCueCore PUBLIC SUBCUE_HAS_WHISPER=1)
@@ -223,7 +233,7 @@ if(SUBCUE_HAS_WHISPER)
     endif()
 endif()
 if(WIN32)
-    target_link_libraries(SubCueCore PRIVATE Crypt32 Advapi32 ole32 uuid d3d11 dxgi)
+    target_link_libraries(SubCueCore PRIVATE Crypt32 Advapi32 ole32 uuid d3d11 dxgi avrt)
 endif()
 target_compile_definitions(SubCueCore PRIVATE QT_NO_CAST_FROM_ASCII QT_NO_CAST_TO_ASCII)
 add_library(SubCue::Core ALIAS SubCueCore)
@@ -276,6 +286,10 @@ if(SUBCUE_BUILD_APP)
     )
     target_link_libraries(SubCue PRIVATE
         SubCue::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
+    add_custom_command(TARGET SubCue POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/asr_python_worker.py"
+            "$<TARGET_FILE_DIR:SubCue>/asr_python_worker.py")
     if(WIN32)
         target_link_libraries(SubCue PRIVATE dwmapi)
     endif()
@@ -285,6 +299,14 @@ if(SUBCUE_BUILD_APP)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
     set_target_properties(SubCue PROPERTIES WIN32_EXECUTABLE TRUE OUTPUT_NAME "SubCue")
     if(WIN32)
+        # VS 调试（F5）时补齐运行时目录：Qt 的调试 DLL 与发行版同目录，FFmpeg 的
+        # 调试 DLL 单独位于 debug/bin，二者都不在默认 PATH 上。
+        set_target_properties(SubCue PROPERTIES
+            VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:Qt6::Core>;$<IF:$<CONFIG:Debug>,${SUBCUE_FFMPEG_ROOT}/debug/bin,${SUBCUE_FFMPEG_ROOT}/bin>;%PATH%")
+        if(SUBCUE_ENABLE_CUDA)
+            set_target_properties(SubCue PROPERTIES
+                VS_DEBUGGER_ENVIRONMENT "PATH=${CUDAToolkit_BIN_DIR}/x64;${CUDAToolkit_BIN_DIR};$<TARGET_FILE_DIR:Qt6::Core>;${SUBCUE_FFMPEG_ROOT}/bin;%PATH%")
+        endif()
         set(SUBCUE_PACKAGE_DIR "${CMAKE_BINARY_DIR}/package")
         add_custom_command(
             OUTPUT "${SUBCUE_PACKAGE_DIR}/package.stamp"
@@ -314,3 +336,6 @@ endif()
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
+
+# TODO(temp): 临时诊断目标，定位完成后删除。
+add_subdirectory(.test_tmp/prime_probe)

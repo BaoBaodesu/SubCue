@@ -66,6 +66,30 @@ ApplicationWindow {
         settingsWindow.show()
     }
 
+    function requestExport() {
+        let pending = 0
+        let unlocated = 0
+        for (let i = 0; i < editor.subtitleModel.count; ++i) {
+            const cue = editor.subtitleModel.get(i)
+            if (!cue.timed) ++unlocated
+            else if (cue.status === "LOW_CONFIDENCE") ++pending
+        }
+        if (pending || unlocated) {
+            exportNotice.text = "待确认 " + pending + " 条，将保留导出；未定位 " + unlocated + " 条，不导出。"
+            exportNotice.open()
+        } else editor.exportSubtitles()
+    }
+    Dialog {
+        id: exportNotice
+        property string text: ""
+        anchors.centerIn: parent
+        modal: true
+        title: qsTr("导出字幕")
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        Label { text: exportNotice.text; color: Theme.text }
+        onAccepted: editor.exportSubtitles()
+    }
+
     Connections {
         target: editor
         function onAlignmentPreflightFailed(issues) {
@@ -148,7 +172,7 @@ ApplicationWindow {
                     MenuItem { text: qsTr("导入素材…    Ctrl+I"); onTriggered: window.openMediaDialog() }
                     MenuItem { text: qsTr("导入字幕文稿…"); onTriggered: window.openScriptDialog() }
                     MenuSeparator { }
-                    MenuItem { text: qsTr("导出字幕"); enabled: editor.canExport && !editor.busy; onTriggered: editor.exportSubtitles() }
+                    MenuItem { text: qsTr("导出字幕"); enabled: editor.canExport && !editor.busy; onTriggered: window.requestExport() }
                     MenuSeparator { }
                     MenuItem { text: qsTr("退出"); onTriggered: window.close() }
                 }
@@ -157,7 +181,7 @@ ApplicationWindow {
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("自动打轴"); enabled: !editor.busy; onClicked: editor.startAlignment() }
             MenuButton { text: qsTr("取消"); enabled: editor.busy; onClicked: editor.cancelAlignment() }
-            MenuButton { text: qsTr("导出"); enabled: editor.canExport && !editor.busy; onClicked: editor.exportSubtitles() }
+            MenuButton { text: qsTr("导出"); enabled: editor.canExport && !editor.busy; onClicked: window.requestExport() }
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("设置"); onClicked: window.openSettings() }
             MenuButton { text: qsTr("关于"); onClicked: window.openAbout() }
@@ -474,6 +498,14 @@ ApplicationWindow {
                             SubToolButton { objectName: "stepBack"; text: qsTr("上一帧"); icon.source: "icons/step-back.svg"; enabled: editor.hasMedia; onClicked: editor.stepFrames(-1) }
                             SubToolButton { objectName: "playPause"; text: editor.playing ? qsTr("暂停") : qsTr("播放"); icon.source: editor.playing ? "icons/pause.svg" : "icons/play.svg"; enabled: editor.hasMedia; onClicked: editor.togglePlay() }
                             SubToolButton { objectName: "stepForward"; text: qsTr("下一帧"); icon.source: "icons/step-forward.svg"; enabled: editor.hasMedia; onClicked: editor.stepFrames(1) }
+                            SubComboBox {
+                                objectName: "playbackRateCombo"
+                                Layout.preferredWidth: 76
+                                enabled: editor.hasMedia && !editor.playing
+                                model: ["0.5×", "0.75×", "1.0×", "1.25×", "1.5×", "1.75×", "2.0×", "2.5×", "3.0×"]
+                                currentIndex: 2
+                                onActivated: editor.setPlaybackRate(parseFloat(currentText))
+                            }
                             Item { Layout.fillWidth: true }
                             SubToolButton { text: qsTr("缩小时间轴"); icon.source: "icons/minus.svg"; enabled: editor.hasMedia; onClicked: editor.adjustZoomPercent(-10, timelineScene.width) }
                             Label { objectName: "transportZoom"; text: editor.zoomPercent + "%"; color: Theme.secondaryText; font.pixelSize: 11; Layout.minimumWidth: 34; horizontalAlignment: Text.AlignHCenter }
@@ -531,6 +563,7 @@ ApplicationWindow {
 
                         delegate: Rectangle {
                             id: rowItem
+                            objectName: "subtitleRow_" + index
                             required property int index
                             required property int sourceIndex
                             required property string text
@@ -539,6 +572,7 @@ ApplicationWindow {
                             required property bool timed
                             required property real confidence
                             required property string status
+                            required property string candidateText
                             required property string skipReason
                             width: ListView.view.width
                             height: 48
@@ -548,6 +582,12 @@ ApplicationWindow {
                             border.color: editor.selectedCue === index ? Theme.focusBorder : "transparent"
                             border.width: editor.selectedCue === index ? 1 : 0
 
+                            SubToolTip {
+                                visible: rowMouse.containsMouse && (rowItem.status === "LOW_CONFIDENCE" || !rowItem.timed)
+                                text: "对齐置信度：" + Math.round(rowItem.confidence * 100) + "% · ASR置信度未知\n"
+                                    + (rowItem.candidateText ? "识别候选：" + rowItem.candidateText : "暂无识别候选")
+                                    + (rowItem.skipReason ? "\n" + rowItem.skipReason : "")
+                            }
                             RowLayout {
                                 anchors.fill: parent
                                 anchors.leftMargin: 8
@@ -569,13 +609,31 @@ ApplicationWindow {
                                         font.family: timed ? "Consolas" : Theme.fontFamily
                                         font.pixelSize: Theme.fontSizeTiny
                                     }
-                                    Label { visible: !timed || status === "LOW_CONFIDENCE"; text: timed ? qsTr("待确认") : "--:--.---"; color: Theme.warning; font.pixelSize: 9; elide: Text.ElideRight; Layout.fillWidth: true }
+                                    Label { visible: !timed || status === "LOW_CONFIDENCE"; text: timed ? qsTr("对齐待确认 · ASR分数未知") : qsTr("可拖到时间轴"); color: Theme.warning; font.pixelSize: 9; elide: Text.ElideRight; Layout.fillWidth: true }
                                 }
                             }
                             MouseArea {
                                 id: rowMouse
+                                objectName: "subtitleRowMouse"
                                 anchors.fill: parent
                                 hoverEnabled: true
+                                property string cueId: ""
+                                property point pressPoint
+                                property bool placing: false
+                                onPressed: function(event) { cueId = editor.subtitleModel.get(rowItem.index).id || ""; pressPoint = Qt.point(event.x, event.y); placing = false }
+                                onPositionChanged: function(event) {
+                                    if (pressed && !rowItem.timed && Math.abs(event.x - pressPoint.x) + Math.abs(event.y - pressPoint.y) > 8)
+                                        placing = true
+                                }
+                                onReleased: function(event) {
+                                    if (!placing) return
+                                    const point = mapToItem(timelineScene, event.x, event.y)
+                                    if (point.x >= 0 && point.x <= timelineScene.width && point.y >= 0 && point.y <= timelineScene.height)
+                                        editor.locateCueAt(cueId, Math.round((point.x + timelineScene.scrollOffset) / timelineScene.pixelsPerMs))
+                                    placing = false
+                                }
+                                preventStealing: !rowItem.timed
+                                cursorShape: placing ? Qt.ClosedHandCursor : Qt.ArrowCursor
                                 onClicked: editor.selectCue(index, mouseX > width - 140)
                                 onDoubleClicked: {
                                     editor.selectCue(index, false)
@@ -659,6 +717,7 @@ ApplicationWindow {
         modal: true
         focus: true
         closePolicy: Popup.CloseOnEscape
+        onClosed: timelineScene.forceActiveFocus()
         background: Rectangle {
             color: Theme.panelRaised
             border.color: Theme.border
@@ -685,7 +744,10 @@ ApplicationWindow {
                     radius: Theme.radiusInput
                 }
                 Keys.onPressed: function(event) {
-                    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    if (event.key === Qt.Key_Escape) {
+                        cueEditor.close()
+                        event.accepted = true
+                    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                         editor.setCueText(Number(cueEditorRow.text), text)
                         cueEditor.close()
                         event.accepted = true
@@ -709,6 +771,15 @@ ApplicationWindow {
     Rectangle {
         id: alignmentProgressDialog
         objectName: "alignmentProgressDialog"
+        property double startedAt: 0
+        property int elapsedSeconds: 0
+        onVisibleChanged: if (visible) { startedAt = Date.now(); elapsedSeconds = 0 }
+        Timer {
+            interval: 1000
+            repeat: true
+            running: editor.busy
+            onTriggered: parent.elapsedSeconds = Math.floor((Date.now() - parent.startedAt) / 1000)
+        }
         anchors.top: toolbar.bottom
         anchors.left: parent.left
         anchors.right: parent.right
@@ -719,23 +790,48 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.margins: 10
             spacing: 16
-            Label { text: qsTr("正在自动打轴"); color: Theme.text }
+            Label { text: qsTr("正在自动打轴") + " · " + parent.parent.elapsedSeconds + "s"; color: Theme.text }
             ColumnLayout {
                 Layout.fillWidth: true
                 Label { text: editor.alignmentProgressText; color: Theme.secondaryText }
                 ProgressBar {
                     objectName: "alignmentProgressBar"
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 10
+                    Layout.preferredHeight: 16
                     from: 0
                     to: 100
                     value: editor.alignmentProgress
                     indeterminate: editor.alignmentIndeterminate
-                    palette.highlight: Theme.accent
-                    palette.dark: Theme.scrollTrack
                     background: Rectangle {
                         color: Theme.scrollTrack
                         border.color: Theme.border
+                    }
+                    contentItem: Item {
+                        clip: true
+                        Rectangle {
+                            objectName: "alignmentProgressFill"
+                            width: alignmentProgressBar.visualPosition * parent.width
+                            height: parent.height
+                            visible: !alignmentProgressBar.indeterminate
+                            color: Theme.accent
+                        }
+                        Rectangle {
+                            id: progressIndeterminate
+                            width: Math.max(28, parent.width * 0.24)
+                            height: parent.height
+                            visible: alignmentProgressBar.indeterminate
+                            color: Theme.accent
+                            SequentialAnimation on x {
+                                running: alignmentProgressBar.indeterminate && alignmentProgressDialog.visible
+                                loops: Animation.Infinite
+                                NumberAnimation {
+                                    from: -progressIndeterminate.width
+                                    to: progressIndeterminate.parent.width
+                                    duration: 900
+                                    easing.type: Easing.InOutQuad
+                                }
+                            }
+                        }
                     }
                 }
             }

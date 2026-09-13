@@ -29,6 +29,7 @@ public:
         StartWordIdRole,
         EndWordIdRole,
         MetadataRole,
+        CandidateTextRole,
     };
     Q_ENUM(Role)
 

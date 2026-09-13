@@ -24,8 +24,8 @@ public:
         const std::atomic<bool> *cancel = nullptr,
         const std::function<void(qint64 received, qint64 total)> &progress = {}) const;
 
-    [[nodiscard]] static QByteArray sha256HexOfFile(const QString &path);
-    [[nodiscard]] static bool matchesSpec(const QString &path, const WhisperModelSpec &spec);
+    [[nodiscard]] static QByteArray sha256HexOfFile(const QString &path, const std::atomic<bool> *cancel = nullptr);
+    [[nodiscard]] static bool matchesSpec(const QString &path, const WhisperModelSpec &spec, const std::atomic<bool> *cancel = nullptr);
 
 private:
     IHttpClient *http_ = nullptr;

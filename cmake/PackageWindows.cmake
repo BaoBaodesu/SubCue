@@ -34,6 +34,7 @@ set(_qt_plugins "${_qt_prefix}/plugins")
 file(REMOVE_RECURSE "${SUBCUE_PACKAGE_DIR}")
 file(MAKE_DIRECTORY "${SUBCUE_PACKAGE_DIR}")
 file(COPY "${SUBCUE_EXE}" DESTINATION "${SUBCUE_PACKAGE_DIR}")
+file(COPY "${SUBCUE_SOURCE_DIR}/tools/asr_python_worker.py" DESTINATION "${SUBCUE_PACKAGE_DIR}")
 
 set(_system_root "$ENV{SystemRoot}")
 if(NOT _system_root)
@@ -148,7 +149,7 @@ file(WRITE "${SUBCUE_PACKAGE_DIR}/README.txt"
 ==================
 
 Run SubCue.exe. Qt, FFmpeg, and the MSVC runtime are in this folder.
-Python, Visual Studio, and external FFmpeg command-line tools are not required.
+Whisper runs without Python. Qwen3-ASR and Fun-ASR require a compatible local Python CUDA environment.
 
 Third-party licenses are in licenses/.
 ")

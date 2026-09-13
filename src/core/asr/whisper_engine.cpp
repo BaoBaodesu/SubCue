@@ -1,20 +1,45 @@
 #include "asr/whisper_engine.h"
 
 #ifdef SUBCUE_HAS_WHISPER
+#include "common/logging.h"
+
 #include <whisper.h>
 
 #include <QtCore/QFileInfo>
+#include <QtCore/QStringList>
 
 #include <algorithm>
+
+namespace {
+
+// whisper.cpp/ggml 的后端信息平时只写 stderr，转发到应用日志后，
+// 打轴日志里就能确认推理实际落在 CUDA 还是 CPU 上。
+void forwardWhisperLog(ggml_log_level level, const char *text, void *userData)
+{
+    Q_UNUSED(userData);
+    if (text == nullptr) return;
+    const QStringList lines = QString::fromUtf8(text).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    for (const QString &line : lines) {
+        const QString message = line.trimmed();
+        if (message.isEmpty()) continue;
+        if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) qCWarning(subcueAsrLog) << message;
+        else if (level == GGML_LOG_LEVEL_DEBUG) qCDebug(subcueAsrLog) << message;
+        else qCInfo(subcueAsrLog) << message;
+    }
+}
+
+} // namespace
 #endif
 
 namespace subcue {
 
 AsrResult UnlinkedWhisperEngine::transcribePcm(
     const QVector<float> &pcm16kMono,
-    const std::atomic<bool> *cancel)
+    const std::atomic<bool> *cancel,
+    const std::function<void(int)> &progress)
 {
     Q_UNUSED(pcm16kMono);
+    Q_UNUSED(progress);
     if (asrCancelled(cancel)) {
         return asrCancelledError();
     }
@@ -56,19 +81,28 @@ bool LinkedWhisperEngine::setModelPath(const QString &path, QString *errorMessag
         d_->modelPath.clear();
     }
     whisper_context_params contextParams = whisper_context_default_params();
+#ifdef SUBCUE_HAS_CUDA
     contextParams.use_gpu = d_->device != QLatin1String("cpu");
+#else
+    // 纯 CPU 构建即使读到 cuda 配置也不能请求 GPU 后端。
+    contextParams.use_gpu = false;
+#endif
+    whisper_log_set(forwardWhisperLog, nullptr);
+    qCInfo(subcueAsrLog) << "whisper_system_info=" << whisper_print_system_info() << "device=" << d_->device << "use_gpu=" << contextParams.use_gpu;
     d_->context = whisper_init_from_file_with_params(absolutePath.toUtf8().constData(), contextParams);
     if (!d_->context) {
         if (errorMessage) *errorMessage = QStringLiteral("whisper.cpp 无法读取模型文件：%1").arg(absolutePath);
         return false;
     }
     d_->modelPath = absolutePath;
+    qCInfo(subcueAsrLog) << "whisper_model_loaded=" << absolutePath << "use_gpu=" << contextParams.use_gpu;
     return true;
 }
 
 AsrResult LinkedWhisperEngine::transcribePcm(
     const QVector<float> &pcm16kMono,
-    const std::atomic<bool> *cancel)
+    const std::atomic<bool> *cancel,
+    const std::function<void(int)> &progress)
 {
     if (asrCancelled(cancel)) {
         return asrCancelledError();
@@ -89,6 +123,13 @@ AsrResult LinkedWhisperEngine::transcribePcm(
         return flag && flag->load(std::memory_order_acquire);
     };
     params.abort_callback_user_data = const_cast<std::atomic<bool> *>(cancel);
+    params.progress_callback = [](whisper_context *, whisper_state *, int value, void *userData) {
+        const auto *callback = static_cast<const std::function<void(int)> *>(userData);
+        if (callback && *callback) {
+            (*callback)(value);
+        }
+    };
+    params.progress_callback_user_data = const_cast<std::function<void(int)> *>(&progress);
     if (whisper_full(d_->context, params, pcm16kMono.constData(), pcm16kMono.size()) != 0) {
         if (asrCancelled(cancel)) {
             return asrCancelledError();

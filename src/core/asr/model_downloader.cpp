@@ -70,7 +70,7 @@ ModelDownloader::ModelDownloader(IHttpClient *http)
 {
 }
 
-QByteArray ModelDownloader::sha256HexOfFile(const QString &path)
+QByteArray ModelDownloader::sha256HexOfFile(const QString &path, const std::atomic<bool> *cancel)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -78,18 +78,21 @@ QByteArray ModelDownloader::sha256HexOfFile(const QString &path)
     }
     QCryptographicHash hash(QCryptographicHash::Sha256);
     while (!file.atEnd()) {
-        hash.addData(file.read(1 << 20));
+        if (asrCancelled(cancel)) return {};
+        const QByteArray data = file.read(1 << 20);
+        if (data.isEmpty() && file.error() != QFileDevice::NoError) return {};
+        hash.addData(data);
     }
     return hash.result().toHex();
 }
 
-bool ModelDownloader::matchesSpec(const QString &path, const WhisperModelSpec &spec)
+bool ModelDownloader::matchesSpec(const QString &path, const WhisperModelSpec &spec, const std::atomic<bool> *cancel)
 {
     const QFileInfo info(path);
     if (!info.isFile() || info.size() != spec.size) {
         return false;
     }
-    return sha256HexOfFile(path).toLower() == spec.sha256Hex.toLower();
+    return sha256HexOfFile(path, cancel).toLower() == spec.sha256Hex.toLower();
 }
 
 std::variant<QString, AppError> ModelDownloader::ensure(

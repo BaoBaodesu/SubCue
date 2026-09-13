@@ -24,6 +24,7 @@ private slots:
     void audioClockUsesFirstPtsConsumedSamplesAndBuffer();
     void audioClockPauseResumeDoesNotJump();
     void audioOutputRejectsStaleGeneration();
+    void audioOutputKeepsWholeDecodeBlockAtCapacityBoundary();
     void videoSchedulerWaitsDisplaysAndDrops();
     void seekControllerLatestWins();
     void seekDecodesFromKeyframeToTarget();
@@ -89,6 +90,18 @@ void PlaybackTests::audioOutputRejectsStaleGeneration()
     QVERIFY(output.write(stale, MediaTime::fromMilliseconds(10), 4));
     QCOMPARE(output.writtenSamples(), 48);
     QCOMPARE(output.bufferedSamples(), 48);
+}
+
+void PlaybackTests::audioOutputKeepsWholeDecodeBlockAtCapacityBoundary()
+{
+    AudioOutput output;
+    QVERIFY(output.configure(48'000, 2));
+    QVector<float> almostFull(47'040, 0.1f);
+    QVector<float> decodeBlock(1'920, 0.2f);
+    QVERIFY(output.write(almostFull, MediaTime::fromMilliseconds(0), 0));
+    QVERIFY(output.write(decodeBlock, MediaTime::fromMilliseconds(490), 0));
+    QCOMPARE(output.bufferedFrames(), 24'480);
+    QVERIFY(!output.write(decodeBlock, MediaTime::fromMilliseconds(510), 0));
 }
 
 void PlaybackTests::videoSchedulerWaitsDisplaysAndDrops()

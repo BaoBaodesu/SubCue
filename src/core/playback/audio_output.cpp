@@ -21,6 +21,8 @@ bool AudioOutput::configure(int sampleRate, int channels, AppError *error)
     sampleRate_ = sampleRate;
     channels_ = channels;
     buffer_.clear();
+    buffer_.squeeze();
+    reservedSamples_ = 0;
     firstPts_ = MediaTime::fromMicroseconds(-1);
     writtenFrames_ = 0;
     consumedFrames_ = 0;
@@ -68,10 +70,16 @@ bool AudioOutput::write(QVector<float> samples, MediaTime pts, quint64 generatio
     if (samples.size() % channels_ != 0) {
         return false;
     }
+    const qint64 frames = static_cast<qint64>(samples.size() / channels_);
+    const qint64 capacityFrames = av_rescale(sampleRate_, kMaximumBufferMilliseconds, 1'000);
+    // 已低于水位线时允许完整写入一个解码块，避免因为块大小大于刚腾出的空间而整块丢音。
+    if (bufferedFramesLocked() >= capacityFrames) {
+        return false;
+    }
     if (firstPts_.microseconds() < 0) {
         firstPts_ = pts;
     }
-    const qint64 frames = static_cast<qint64>(samples.size() / channels_);
+    reserveLocked();
     buffer_ += samples;
     writtenFrames_ += frames;
     return true;
@@ -83,8 +91,8 @@ QVector<float> AudioOutput::takeFrames(qint64 frames)
     if (paused_ || frames <= 0 || channels_ <= 0) {
         return {};
     }
-    const qint64 bufferedFrames = static_cast<qint64>(buffer_.size() / channels_);
-    const qint64 consumed = std::min(frames, bufferedFrames);
+    const qint64 buffered = bufferedFramesLocked();
+    const qint64 consumed = std::min(frames, buffered);
     if (consumed <= 0) {
         return {};
     }
@@ -156,13 +164,37 @@ qint64 AudioOutput::writtenSamples() const
 qint64 AudioOutput::bufferedSamples() const
 {
     std::lock_guard lock(mutex_);
-    return channels_ <= 0 ? 0 : static_cast<qint64>(buffer_.size() / channels_);
+    return bufferedFramesLocked();
+}
+
+qint64 AudioOutput::bufferedFrames() const
+{
+    std::lock_guard lock(mutex_);
+    return bufferedFramesLocked();
 }
 
 qint64 AudioOutput::consumedSamples() const
 {
     std::lock_guard lock(mutex_);
     return consumedFrames_;
+}
+
+qint64 AudioOutput::bufferedFramesLocked() const
+{
+    return channels_ <= 0 ? 0 : static_cast<qint64>(buffer_.size() / channels_);
+}
+
+void AudioOutput::reserveLocked()
+{
+    if (sampleRate_ <= 0 || channels_ <= 0) {
+        return;
+    }
+    const qsizetype target = static_cast<qsizetype>(
+        av_rescale(sampleRate_, kMaximumBufferMilliseconds, 1'000)) * channels_;
+    if (target > reservedSamples_) {
+        buffer_.reserve(target);
+        reservedSamples_ = target;
+    }
 }
 
 } // namespace subcue

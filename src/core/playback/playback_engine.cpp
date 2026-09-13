@@ -12,10 +12,19 @@ extern "C" {
 #include <libavutil/mathematics.h>
 }
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <thread>
 #include <utility>
 
 namespace subcue {
+namespace {
+
+// 预泵入的最长等待：解码线程通常几毫秒就够，超时也只是先出声再补齐。
+constexpr int kPrimeTimeoutMs = 400;
+
+} // namespace
 
 PlaybackEngine::PlaybackEngine(QObject *parent)
     : QObject(parent)
@@ -76,6 +85,10 @@ bool PlaybackEngine::open(const QString &path, AppError *error)
         close();
         return false;
     }
+    audioOutput_.flush();
+    clockStart_ = MediaTime::fromMicroseconds(0);
+    priming_ = false;
+    endOfStream_ = false;
 
     seek_.reset();
 
@@ -106,8 +119,14 @@ void PlaybackEngine::close()
     videoDecoder_.close();
     audioDecoder_.close();
     demuxer_.close();
+    if (audioDevice_) {
+        audioDevice_->setSampleProvider({});
+    }
     audioOutput_.flush();
     clock_.reset();
+    priming_ = false;
+    endOfStream_ = false;
+    clockStart_ = MediaTime::fromMicroseconds(0);
     {
         std::lock_guard lock(displayMutex_);
         displayed_ = {};
@@ -129,6 +148,7 @@ void PlaybackEngine::play()
     paused_ = false;
     audioOutput_.resume();
     clock_.resume();
+    priming_ = hasAudio_.load();
     onSchedulerWake();
 }
 
@@ -138,6 +158,7 @@ void PlaybackEngine::pause()
     clock_.pause();
     audioOutput_.pause();
     paused_ = true;
+    priming_ = false;
     wakeTimer_.stop();
 }
 
@@ -149,7 +170,14 @@ quint64 PlaybackEngine::seek(MediaTime target)
     videoFrames_.setGeneration(generation);
     audioFrames_.setGeneration(generation);
     audioOutput_.setGeneration(generation);
+    if (audioDevice_) {
+        audioDevice_->flushResampler();
+    }
     clock_.reset();
+    // 跳转后先重新泵入解码数据再出声，避免从空缓冲直接开始渲染。
+    priming_ = hasAudio_.load() && !paused_.load();
+    clockStart_ = target;
+    endOfStream_ = false;
     pendingVideo_.reset();
     {
         std::lock_guard lock(displayMutex_);
@@ -195,9 +223,89 @@ qint64 PlaybackEngine::consumeAudio(MediaTime duration)
     return consumed;
 }
 
+void PlaybackEngine::setAudioDevice(IAudioDevice *device, int preRollMs)
+{
+    audioDevice_ = device;
+    const int milliseconds = std::clamp(preRollMs, 4 * 1'000 / 60, AudioOutput::kMaximumBufferMilliseconds);
+    preRollFrames_ = outputSampleRate_ > 0
+        ? av_rescale(milliseconds, outputSampleRate_, 1'000)
+        : 0;
+    installSampleProvider();
+}
+
+qint64 PlaybackEngine::primeAudio(int timeoutMs)
+{
+    if (!hasAudio_.load() || preRollFrames_ <= 0) {
+        return audioOutput_.bufferedFrames();
+    }
+    QElapsedTimer timer;
+    timer.start();
+    for (;;) {
+        drainAudioToOutput();
+        const qint64 buffered = audioOutput_.bufferedFrames();
+        if (buffered >= preRollFrames_ || endOfStream_.load() || timer.elapsed() >= timeoutMs) {
+            if (buffered > 0) {
+                beginClock(clockStart_);
+            }
+            return buffered;
+        }
+        // 解码、解封装在各自线程推进，这里只等它们把数据送进环缓冲。
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+void PlaybackEngine::installSampleProvider()
+{
+    if (!audioDevice_) {
+        return;
+    }
+    audioDevice_->setSampleProvider([this](float *destination, qint64 maximumFrames) -> qint64 {
+        if (!destination || maximumFrames <= 0) {
+            return 0;
+        }
+        const int channels = audioOutput_.channels();
+        const int sampleRate = audioOutput_.sampleRate();
+        if (channels <= 0 || sampleRate <= 0) {
+            return 0;
+        }
+        // 只取走环缓冲里已有的解码数据，留一点余量避免和生产端抢同一段。
+        const qint64 available = audioOutput_.bufferedFrames();
+        if (available <= 0) {
+            return 0;
+        }
+        const qint64 guard = av_rescale(sampleRate, 2, 1'000);
+        const qint64 requestedFrames = std::min(
+            maximumFrames, std::max<qint64>(0, available - guard));
+        if (requestedFrames <= 0) {
+            return 0;
+        }
+        const qint64 wanted = std::min<qint64>(requestedFrames, available);
+        const QVector<float> samples = audioOutput_.takeFrames(wanted);
+        const qint64 frames = static_cast<qint64>(samples.size() / channels);
+        if (frames > 0) {
+            std::memcpy(destination, samples.constData(),
+                        static_cast<size_t>(samples.size()) * sizeof(float));
+        }
+        return frames;
+    });
+}
+
+void PlaybackEngine::beginClock(MediaTime start)
+{
+    clock_.start(start.microseconds() >= 0 ? start : MediaTime::fromMicroseconds(0),
+                 audioOutput_.sampleRate());
+    clock_.setWrittenSamples(audioOutput_.writtenSamples());
+    clock_.setBufferedSamples(audioOutput_.bufferedSamples());
+}
+
 void PlaybackEngine::pump()
 {
     drainAudioToOutput();
+    if (priming_ && !paused_.load()) {
+        // 本帧先把解码数据泵进环缓冲，再交给音频线程渲染，不出现"边解码边硬切"。
+        (void)primeAudio(kPrimeTimeoutMs);
+        priming_ = false;
+    }
     clock_.syncFrom(audioOutput_);
     onSchedulerWake();
 }
@@ -316,11 +424,18 @@ void PlaybackEngine::scheduleWake(MediaTime delay)
 void PlaybackEngine::drainAudioToOutput()
 {
     BoundedQueue<AudioItem>::Item item;
-    while (audioFrames_.tryPop(item)) {
+    bool drained = false;
+    const qint64 capacityFrames = av_rescale(
+        audioOutput_.sampleRate(), AudioOutput::kMaximumBufferMilliseconds, 1'000);
+    while (audioOutput_.bufferedFrames() < capacityFrames && audioFrames_.tryPop(item)) {
         if (!seek_.canCommit(item.generation)) {
             continue;
         }
         (void)audioOutput_.write(std::move(item.value.samples), item.value.pts, item.generation);
+        drained = true;
+    }
+    if (drained && !clock_.isStarted() && audioOutput_.bufferedFrames() > 0) {
+        beginClock(clockStart_);
     }
 }
 
@@ -552,9 +667,6 @@ void PlaybackEngine::audioLoop()
         }
         if (item.generation != lastGeneration) {
             audioDecoder_.flush();
-            if (audioDecoder_.context()) {
-                (void)resampler_.configure(*audioDecoder_.context(), outputSampleRate_, outputChannels_, nullptr);
-            }
             lastGeneration = item.generation;
         }
         if (!seek_.canCommit(item.generation)) {
@@ -598,6 +710,10 @@ void PlaybackEngine::audioLoop()
         while (sent == AVERROR(EAGAIN)) {
             receiveAll();
             sent = audioDecoder_.send(item.value.get());
+        }
+        if (sent == AVERROR_EOF) {
+            endOfStream_ = true;
+            continue;
         }
         if (sent < 0) {
             continue;

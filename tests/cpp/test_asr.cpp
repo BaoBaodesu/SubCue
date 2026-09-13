@@ -106,12 +106,14 @@ public:
 
     AsrResult transcribePcm(
         const QVector<float> &pcm16kMono,
-        const std::atomic<bool> *cancel) override
+        const std::atomic<bool> *cancel,
+        const std::function<void(int)> &progress) override
     {
         lastPcm = pcm16kMono;
         if (asrCancelled(cancel)) {
             return asrCancelledError();
         }
+        if (progress) progress(50);
         Transcript transcript;
         transcript.words = {
             {1, QStringLiteral("Hello"), 100, 500},
@@ -152,6 +154,7 @@ private slots:
     void whisperCatalogIsPinned();
     void modelDownloadResumeChecksumAndAtomic();
     void factoryKeepsDashScopeDefault();
+    void whisperDeviceDefaultFollowsBuild();
     void extractorWritesFlacAndPcm();
     void whisperServiceUsesEngine();
     void whisperServiceMergesChunks();
@@ -369,6 +372,10 @@ void AsrTests::modelDownloadResumeChecksumAndAtomic()
     QVERIFY(QFileInfo::exists(path));
     QCOMPARE(QFileInfo(path).size(), payload.size());
     QVERIFY(!QFileInfo::exists(path + QStringLiteral(".part")));
+    std::atomic<bool> cancelHash{true};
+    QVERIFY(!ModelDownloader::matchesSpec(path, spec, &cancelHash));
+    QVERIFY(QFileInfo::exists(path));
+    QVERIFY(ModelDownloader::matchesSpec(path, spec));
 
     http.lastRequest = {};
     http.downloadPayload = QByteArray();
@@ -410,6 +417,10 @@ void AsrTests::factoryKeepsDashScopeDefault()
     QCOMPARE(defaults.value(QStringLiteral("asrModel")).toString(),
         QStringLiteral("fun-asr-flash-2026-06-15"));
     QCOMPARE(defaults.value(QStringLiteral("whisperModel")).toString(), QStringLiteral("small"));
+    QCOMPARE(QDir::cleanPath(defaults.value(QStringLiteral("whisperModelsDirectory")).toString()),
+        AsrProviderFactory::defaultWhisperModelsDirectory());
+    QVERIFY(AsrProviderFactory::defaultWhisperModelsDirectory().endsWith(
+        QStringLiteral("models/whisper")));
 
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
@@ -436,6 +447,17 @@ void AsrTests::factoryKeepsDashScopeDefault()
     QCOMPARE(whisper->providerId(), QStringLiteral("whisper"));
     QCOMPARE(loaded.value(QStringLiteral("asrModel")).toString(),
         QStringLiteral("fun-asr-flash-2026-06-15"));
+}
+
+void AsrTests::whisperDeviceDefaultFollowsBuild()
+{
+    // 默认值跟随构建能力：带 CUDA 的构建默认走显卡，纯 CPU 构建默认锁 CPU。
+    const QString device = SettingsManager::defaults().value(QStringLiteral("whisperDevice")).toString();
+#ifdef SUBCUE_HAS_CUDA
+    QCOMPARE(device, QStringLiteral("cuda"));
+#else
+    QCOMPARE(device, QStringLiteral("cpu"));
+#endif
 }
 
 void AsrTests::extractorWritesFlacAndPcm()
@@ -488,11 +510,13 @@ void AsrTests::whisperServiceMergesChunks()
     second.pcm16kMono = QVector<float>(1600, 0.1f);
     int progressCurrent = 0;
     int progressTotal = 0;
+    QVector<int> progressUpdates;
 
     AsrResult result = service.transcribePreparedChunks(
         {first, second}, nullptr, [&](int current, int total) {
             progressCurrent = current;
             progressTotal = total;
+            progressUpdates.push_back(current);
         });
 
     QVERIFY(std::holds_alternative<Transcript>(result));
@@ -500,8 +524,10 @@ void AsrTests::whisperServiceMergesChunks()
     QCOMPARE(transcript.words.size(), 4);
     QCOMPARE(transcript.words.at(2).startMs, 269'100);
     QCOMPARE(transcript.words.at(3).endMs, 269'900);
-    QCOMPARE(progressCurrent, 2);
-    QCOMPARE(progressTotal, 2);
+    QCOMPARE(progressCurrent, 200);
+    QCOMPARE(progressTotal, 200);
+    QVERIFY(progressUpdates.contains(50));
+    QVERIFY(progressUpdates.contains(150));
 }
 
 void AsrTests::qtNetworkClientDownloadsAndPosts()

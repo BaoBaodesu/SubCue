@@ -104,12 +104,13 @@ ProviderTestResult WhisperCppService::testConnection(const std::atomic<bool> *ca
 
 AsrResult WhisperCppService::transcribePcm(
     const QVector<float> &pcm16kMono,
-    const std::atomic<bool> *cancel)
+    const std::atomic<bool> *cancel,
+    const std::function<void(int)> &progress)
 {
     if (asrCancelled(cancel)) {
         return asrCancelledError();
     }
-    AsrResult result = engine_->transcribePcm(pcm16kMono, cancel);
+    AsrResult result = engine_->transcribePcm(pcm16kMono, cancel, progress);
     if (std::holds_alternative<AppError>(result)) {
         return result;
     }
@@ -124,12 +125,15 @@ AsrResult WhisperCppService::transcribePreparedChunks(
     const std::function<void(int, int)> &progress)
 {
     QVector<TranscriptWord> merged;
-    if (progress) progress(0, chunks.size());
+    if (progress) progress(0, chunks.size() * 100);
     for (int index = 0; index < chunks.size(); ++index) {
         if (asrCancelled(cancel)) {
             return asrCancelledError();
         }
-        AsrResult local = transcribePcm(chunks.at(index).pcm16kMono, cancel);
+        AsrResult local = transcribePcm(chunks.at(index).pcm16kMono, cancel,
+            [index, total = chunks.size(), &progress](int percent) {
+                if (progress) progress(index * 100 + percent, total * 100);
+            });
         if (std::holds_alternative<AppError>(local)) {
             return local;
         }
@@ -141,7 +145,7 @@ AsrResult WhisperCppService::transcribePreparedChunks(
             }
         }
         if (progress) {
-            progress(index + 1, chunks.size());
+            progress((index + 1) * 100, chunks.size() * 100);
         }
     }
     Transcript transcript;
@@ -188,9 +192,12 @@ AsrResult WhisperCppService::transcribe(const AsrRequest &request)
         if (std::holds_alternative<AppError>(extracted)) {
             return std::get<AppError>(extracted);
         }
-        if (request.progress) request.progress(index, windows.size());
+        if (request.progress) request.progress(index * 100, windows.size() * 100);
         AsrResult local = transcribePcm(
-            std::get<PreparedAudioChunk>(extracted).pcm16kMono, request.cancel);
+            std::get<PreparedAudioChunk>(extracted).pcm16kMono, request.cancel,
+            [index, total = windows.size(), &request](int percent) {
+                if (request.progress) request.progress(index * 100 + percent, total * 100);
+            });
         if (std::holds_alternative<AppError>(local)) {
             return local;
         }
@@ -202,7 +209,7 @@ AsrResult WhisperCppService::transcribe(const AsrRequest &request)
             }
         }
         if (request.progress) {
-            request.progress(index + 1, windows.size());
+            request.progress((index + 1) * 100, windows.size() * 100);
         }
     }
     qCInfo(subcueAsrLog) << "whisper chunks" << windows.size();

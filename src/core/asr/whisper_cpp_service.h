@@ -33,7 +33,8 @@ public:
 
     [[nodiscard]] AsrResult transcribePcm(
         const QVector<float> &pcm16kMono,
-        const std::atomic<bool> *cancel = nullptr);
+        const std::atomic<bool> *cancel = nullptr,
+        const std::function<void(int)> &progress = {});
 
     [[nodiscard]] AsrResult transcribePreparedChunks(
         const QVector<PreparedAudioChunk> &chunks,

@@ -3,7 +3,7 @@ import QtQuick
 Rectangle {
     id: bar
     required property var timeline
-    height: 18
+    height: 24
     color: Theme.scrollTrack
     border.color: Theme.border
     readonly property bool interacting: mouse.pressed
@@ -20,8 +20,8 @@ Rectangle {
         height: parent.height
         color: mouse.pressed ? Theme.scrollThumbPressed : mouse.containsMouse ? Theme.scrollThumbHover : Theme.scrollThumb
         border.color: Theme.border
-        Rectangle { x: 1; y: 2; width: 2; height: parent.height - 4; color: Theme.secondaryText }
-        Rectangle { x: parent.width - 3; y: 2; width: 2; height: parent.height - 4; color: Theme.secondaryText }
+        Rectangle { x: 2; y: 4; width: 4; height: parent.height - 8; color: Theme.secondaryText }
+        Rectangle { x: parent.width - 6; y: 4; width: 4; height: parent.height - 8; color: Theme.secondaryText }
     }
     MouseArea {
         id: mouse

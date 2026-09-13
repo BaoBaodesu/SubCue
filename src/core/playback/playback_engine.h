@@ -9,6 +9,7 @@
 #include "media/hw_accel.h"
 #include "media/video_frame_converter.h"
 #include "playback/audio_clock.h"
+#include "playback/audio_device.h"
 #include "playback/audio_output.h"
 #include "playback/frame_stepper.h"
 #include "playback/seek_controller.h"
@@ -52,6 +53,9 @@ public:
 
     qint64 consumeAudio(MediaTime duration);
     void pump();
+    // 绑定输出设备：主线程用它预泵入解码数据，音频线程用它取走已解码样本。
+    void setAudioDevice(IAudioDevice *device, int preRollMs);
+    [[nodiscard]] qint64 primeAudio(int timeoutMs = 400);
     [[nodiscard]] bool waitForDisplayedFrame(int timeoutMs);
     void requestHwRuntimeFailure();
 
@@ -95,11 +99,14 @@ private:
     void scheduleWake(MediaTime delay);
     void onSchedulerWake();
     void drainAudioToOutput();
+    void installSampleProvider();
+    void beginClock(MediaTime start);
     [[nodiscard]] bool receiveVideoFrame(quint64 generation, AVFrame *frame, AppError *error);
 
     SeekController seek_;
     AudioClock clock_;
     AudioOutput audioOutput_;
+    IAudioDevice *audioDevice_ = nullptr;
     VideoScheduler scheduler_;
     FrameStepper stepper_;
     Demuxer demuxer_;
@@ -139,6 +146,10 @@ private:
     QVector<HwAccelAttempt> hwAttempts_;
     AVRational videoTimeBase_{0, 1};
     AVRational audioTimeBase_{0, 1};
+    MediaTime clockStart_ = MediaTime::fromMicroseconds(0);
+    bool priming_ = false;
+    qint64 preRollFrames_ = 0;
+    std::atomic<bool> endOfStream_{false};
     int outputSampleRate_ = 48'000;
     int outputChannels_ = 2;
 };
