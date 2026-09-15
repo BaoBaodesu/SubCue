@@ -11,7 +11,7 @@ src/
 └── platform/     平台层：仅 Windows 的系统能力实现
 ```
 
-依赖方向固定为 `app → core → platform`。`core` 通过接口（`IAsrService`、`IAiProvider`、`IHttpClient`、`IWhisperEngine`、`PreviewRenderer`、`ICredentialStore` 等）声明能力，具体实现按平台注入，因此测试可在不启动真实网络或音频设备的前提下替换实现。
+依赖方向固定为 `app → core → platform`。`core` 通过接口（`IAsrService`、`IAiProvider`、`IHttpClient`、`PreviewRenderer`、`ICredentialStore` 等）声明能力，具体实现按平台注入，因此测试可在不启动真实网络或音频设备的前提下替换实现。
 
 ## 应用层 `src/app`
 
@@ -41,7 +41,7 @@ QML 位于 `src/app/qml/`，与 `qt_add_qml_module` 的 `SubCue` 模块同源。
 | `timeline/` | 时间轴视口、吸附引擎、编辑命令场景 |
 | `subtitle/` | 时间码、TXT/SRT/ASS 解析与写出、字幕模型与撤销栈 |
 | `alignment/` | 文本与音频词级时间戳对齐、强制对齐、模糊匹配 |
-| `asr/` | ASR Provider 工厂、DashScope、whisper.cpp、分块与下载 |
+| `asr/` | ASR Provider 工厂、DashScope、本地 Python 推理与分块 |
 | `ai/` | OpenAI-compatible Provider 与复核工厂 |
 | `project/` | 工程文件序列化 |
 | `roughcut/` | 自动粗剪的采样区间模型与 Premiere xmeml 导出 |
@@ -65,7 +65,7 @@ QML 位于 `src/app/qml/`，与 `qt_add_qml_module` 的 `SubCue` 模块同源。
 | `SubCueTimelineTests` | `test_timeline.cpp` | 视口换算与缩放、吸附、拖动/修剪/切分/合并与 Undo、场景布局与命中测试 |
 | `SubCueRoughCutXmlTests` | `test_roughcut_xml.cpp` | 非破坏性源区间、帧量化、声道轨和完整 WAV 引用 |
 | `SubCueAlignmentTests` | `test_alignment.cpp` | 对齐 golden、模糊比、归一化、强制对齐、转写排序与置信度阈值 |
-| `SubCueAsrTests` | `test_asr.cpp` | 分块计划、DashScope 解析、模型清单与下载校验、whisper 服务、HTTP 客户端 |
+| `SubCueAsrTests` | `test_asr.cpp` | 分块计划、DashScope 解析、本地模型校验、HTTP 客户端 |
 | `SubCueAiReviewTests` | `test_ai_review.cpp` | 复核窗口、载荷脱敏、低置信度跳过、模型发现与错误处理 |
 | `SubCueAppControllerTests` | `test_app_controller.cpp` | 媒体加载、工程导入、字幕应用、设置往返、导出、预览后端、WASAPI 探测 |
 | `SubCueEditorIntegrationTests` | `test_editor_integration.cpp` | 真实 QML 加载与快捷键矩阵、打轴流水线、A/V 同步与播放稳定性 |
@@ -77,4 +77,4 @@ QML 位于 `src/app/qml/`，与 `qt_add_qml_module` 的 `SubCue` 模块同源。
 
 ## 第三方
 
-`third_party/whisper.cpp` 为固定版本的本地推理运行时，由顶层 `CMakeLists.txt` 以 `add_subdirectory(... EXCLUDE_FROM_ALL)` 引入，可用 `SUBCUE_ENABLE_CUDA` 切换加速。FFmpeg 通过 `vcpkg_installed/x64-windows` 以动态库形式链接，不依赖外部 `ffmpeg.exe`。
+本地识别通过独立 Python 推理进程加载 PyTorch。FFmpeg 通过 `vcpkg_installed/x64-windows` 以动态库形式链接，不依赖外部 `ffmpeg.exe`。

@@ -80,7 +80,7 @@ Debug 启动用根目录下的 `run-debug.bat`，Release 启动用 `tools\run-re
 
 ### CUDA 加速（可选）
 
-本地 Whisper 的默认推理设备是显卡。带 CUDA 的构建需要 NVIDIA 显卡 + CUDA Toolkit 13.x（`nvcc` 在 `PATH` 上）：
+本地 Qwen3 推理使用独立 Python 进程中的 PyTorch CUDA 运行时，需要兼容的 NVIDIA 显卡：
 
 ```powershell
 tools\build-windows.bat cuda        # 配置并构建 out/build/windows-release-cuda
@@ -88,7 +88,7 @@ tools\package-windows.bat cuda      # 便携包 → dist/windows-x64-cuda（随�
 tools\run-cuda.bat                  # 启动 CUDA 版 Release
 ```
 
-设置 → 语音识别 → 推理设备 可选「CUDA 加速」或「纯 CPU」；只有包含 CUDA 的构建才会出现 CUDA 选项。打轴日志中的 `whisper_system_info=` 与 `using CUDA0 backend` 用于确认实际生效的后端。
+本地识别的设备选择由 Python 推理运行时决定；CUDA 便携包同时保留 CUDA Toolkit 运行时 DLL。
 
 只跑部分测试（全量约 45 秒，其中 `SubCueEditorIntegrationTests` 占大部分）：
 
@@ -124,7 +124,6 @@ SubCue/
 │   ├── cpp/                    # 按模块命名的 Qt Test / CTest
 │   ├── golden/                 # 对齐与字幕格式 fixtures
 │   └── media/                  # 小型 CFR/VFR/音频/损坏样本
-├── third_party/whisper.cpp/    # 固定版本的本地推理运行时
 ├── run-debug.bat               # 补齐运行时依赖后启动 Debug 版
 └── tools/
     ├── build-windows.bat       # MSVC 环境中的增量 CMake/CTest
@@ -163,13 +162,13 @@ tools\package-windows.bat
 .\dist\windows-x64\SubCue.exe
 ```
 
-CUDA 版由 `tools\package-windows.bat cuda` 打包到 `dist/windows-x64-cuda`，额外随带 cuBLAS 与 CUDA Runtime DLL（整个目录约 630 MB）：
+CUDA 版由 `tools\package-windows.bat cuda` 打包到 `dist/windows-x64-cuda`，CUDA Toolkit DLL 位于包根目录，PyTorch 的 CUDA 运行时位于独立的 `inference/` 目录：
 
 ```powershell
 tools\package-windows.bat cuda
 .\dist\windows-x64-cuda\SubCue.exe
 ```
 
-FFmpeg、ASR/LLM 权重不会被打包进源码树。Whisper ggml 模型按清单下载，不随程序分发；本地推理由固定版本的 whisper.cpp 运行时提供。
+FFmpeg、ASR/LLM 权重不会被打包进源码树。本地模型保存在工作区，不随程序分发。
 "# SubCue" 
 "# SubCue"  

@@ -65,22 +65,11 @@ QVector<PreflightIssue> AlignmentPreflight::check(
 
     const QString asrProvider = settings.value(QStringLiteral("asrProvider")).toString();
     if (asrProvider != QLatin1String(kAsrProviderDashScope)
-        && asrProvider != QLatin1String(kAsrProviderWhisper)) {
+        && asrProvider != QLatin1String("qwen3")
+        && asrProvider != QLatin1String("funasr")) {
         addIssue(issues, "asr_provider_missing", QStringLiteral("请选择语音识别 Provider"),
                  {}, QStringLiteral("asr"));
-    } else if (asrProvider == QLatin1String(kAsrProviderWhisper)) {
-        if (settings.value(QStringLiteral("whisperModel")).toString().isEmpty()) {
-            addIssue(issues, "asr_model_missing", QStringLiteral("请选择 Whisper 模型"),
-                     {}, QStringLiteral("asr"));
-        }
-        if (!state.whisperRuntimeAvailable) {
-            addIssue(issues, "whisper_runtime_missing", QStringLiteral("本地 Whisper 运行时不可用"),
-                     {}, QStringLiteral("asr"));
-        } else if (!state.whisperModelReady) {
-            addIssue(issues, "whisper_model_not_ready", QStringLiteral("Whisper 模型尚未下载或校验失败"),
-                     {}, QStringLiteral("asr"));
-        }
-    } else {
+    } else if (asrProvider == QLatin1String(kAsrProviderDashScope)) {
         if (settings.value(QStringLiteral("asrModel")).toString().isEmpty()) {
             addIssue(issues, "asr_model_missing", QStringLiteral("请选择云端 ASR 模型"),
                      {}, QStringLiteral("asr"));

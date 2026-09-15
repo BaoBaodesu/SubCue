@@ -33,14 +33,12 @@ void RoughCutAuxiliaryTests::plansOnlyReviewAndMergesOverlap()
 
 void RoughCutAuxiliaryTests::conflictCannotBecomeCut()
 {
-    RoughCutAuxiliaryResult conflict{0, QStringLiteral("正确版本"), QStringLiteral("正确版本"),
-        QStringLiteral("另一版本")};
+    RoughCutAuxiliaryResult conflict{0, QStringLiteral("正确版本"), QStringLiteral("另一版本")};
     QCOMPARE(RoughCutAuxiliaryRecognition::reconcile(RoughCutDecision::Cut, &conflict),
         RoughCutDecision::Review);
     QVERIFY(conflict.conflict);
 
-    RoughCutAuxiliaryResult agreement{0, QStringLiteral("正确，版本。"), QStringLiteral("正确版本"),
-        QStringLiteral("正确版本")};
+    RoughCutAuxiliaryResult agreement{0, QStringLiteral("正确，版本。"), QStringLiteral("正确版本")};
     QCOMPARE(RoughCutAuxiliaryRecognition::reconcile(RoughCutDecision::Keep, &agreement),
         RoughCutDecision::Keep);
     QVERIFY(!agreement.conflict);

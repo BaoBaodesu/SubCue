@@ -17,7 +17,6 @@ inline constexpr double kAsrChunkOverlapSeconds = 1.0;
 inline constexpr int kAsrSampleRate = 16'000;
 
 inline constexpr auto kAsrProviderDashScope = "dashscope";
-inline constexpr auto kAsrProviderWhisper = "whisper";
 
 enum class AsrErrorCode {
     Cancelled = 1,

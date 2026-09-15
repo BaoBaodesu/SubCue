@@ -2,47 +2,28 @@
 
 #include "asr/dashscope_asr_service.h"
 #include "asr/local_python_asr_service.h"
-#include "asr/whisper_cpp_service.h"
 #include "settings/settings_manager.h"
 
 #include <QtCore/QDir>
 #include <QtCore/QFileInfo>
 namespace subcue {
 
-AsrProviderFactory::AsrProviderFactory(IHttpClient *http, IWhisperEngine *whisperEngine)
-    : http_(http),
-      whisperEngine_(whisperEngine)
+AsrProviderFactory::AsrProviderFactory(IHttpClient *http)
+    : http_(http)
 {
 }
 
 QString AsrProviderFactory::providerIdFromSettings(const QJsonObject &settings)
 {
     const QString provider = settings.value(QStringLiteral("asrProvider")).toString();
-    if (provider == QLatin1String("whisper") || provider == QLatin1String("qwen3") || provider == QLatin1String("funasr")) return provider;
+    if (provider == QLatin1String("qwen3") || provider == QLatin1String("funasr")) return provider;
     return QString::fromLatin1(kAsrProviderDashScope);
-}
-
-QString AsrProviderFactory::defaultWhisperModelsDirectory()
-{
-    return QDir::cleanPath(QString::fromUtf8(SUBCUE_PROJECT_WHISPER_MODELS_DIR));
 }
 
 std::unique_ptr<IAsrService> AsrProviderFactory::create(
     const QJsonObject &settings,
     const QString &apiKey) const
 {
-    if (providerIdFromSettings(settings) == QLatin1String(kAsrProviderWhisper)) {
-        QString directory = settings.value(QStringLiteral("whisperModelsDirectory")).toString();
-        if (directory.isEmpty()) {
-            directory = defaultWhisperModelsDirectory();
-        }
-        const QString modelId = settings.value(QStringLiteral("whisperModel")).toString(
-            QStringLiteral("small"));
-        const QString device = settings.value(QStringLiteral("whisperDevice")).toString(
-            QStringLiteral("auto"));
-        return std::make_unique<WhisperCppService>(
-            modelId, directory, device, http_, whisperEngine_);
-    }
     const QString provider = providerIdFromSettings(settings);
     if (provider == QLatin1String("qwen3") || provider == QLatin1String("funasr")) {
         const QString key = provider == QLatin1String("qwen3") ? QStringLiteral("qwen3AsrModelsDirectory") : QStringLiteral("funAsrModelsDirectory");

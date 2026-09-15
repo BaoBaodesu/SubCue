@@ -32,6 +32,6 @@ Fun-ASR 目录中的 `model.pt.incomplete` 不是可用权重，本阶段不把�
 
 `SubCueInference.exe --stdio` 内嵌 Python 3.11，并从标准输入逐行接收 JSON。每个任务必须包含 `taskId`，标准输出返回同一任务 ID 的 `accepted`、`progress` 和 `result` 事件。进度区分模型加载、识别和对齐阶段；识别结果通过 `resultPath` 文件传递，诊断日志写入标准错误。
 
-主程序中的 `InferenceManager` 串行化 GPU 推理，并在取消或 Worker 超时后结束子进程。字幕编辑器原有 Whisper 与本地 Qwen/Fun-ASR 调用共享同一门禁。
+主程序中的 `InferenceManager` 串行化 GPU 推理，并在取消或 Worker 超时后结束子进程。字幕编辑器与粗剪中的本地 Qwen/Fun-ASR 调用共享同一门禁。
 
 分析缓存读取完整媒体内容并计算 SHA-256，缓存键还包含模型、语言、参数和算法版本。修改媒体中间内容也会使缓存失效。

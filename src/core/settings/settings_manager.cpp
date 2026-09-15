@@ -20,12 +20,6 @@ SettingsManager::SettingsManager(QString path)
 
 QJsonObject SettingsManager::defaults()
 {
-    // 本地 Whisper 默认使用显卡：CUDA 构建默认走 CUDA，纯 CPU 构建默认回落 CPU。
-#ifdef SUBCUE_HAS_CUDA
-    const QString defaultWhisperDevice = QStringLiteral("cuda");
-#else
-    const QString defaultWhisperDevice = QStringLiteral("cpu");
-#endif
     return {
         {QStringLiteral("version"), 2},
         {QStringLiteral("appearanceMode"), QStringLiteral("dark")},
@@ -48,10 +42,6 @@ QJsonObject SettingsManager::defaults()
         {QStringLiteral("asrCredentialRevision"), 0},
         {QStringLiteral("asrModel"), QStringLiteral("fun-asr-flash-2026-06-15")},
         {QStringLiteral("asrProvider"), QStringLiteral("dashscope")},
-        {QStringLiteral("whisperModel"), QStringLiteral("small")},
-        {QStringLiteral("whisperModelsDirectory"),
-         QString::fromUtf8(SUBCUE_PROJECT_WHISPER_MODELS_DIR)},
-        {QStringLiteral("whisperDevice"), defaultWhisperDevice},
         {QStringLiteral("qwen3AsrModelsDirectory"),
          QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("qwen3-asr-0.6b"))},
         {QStringLiteral("qwen3ForcedAlignerModelsDirectory"),
@@ -99,14 +89,9 @@ QJsonObject SettingsManager::load() const
         // 旧版 Qwen 配置不再隐式创建云 Provider，等待用户显式配置兼容端点。
         result.insert(QStringLiteral("aiAssistEnabled"), false);
     }
-    // 仅迁移旧默认目录；用户明确配置的其他自定义目录保持不变。
-    const QString appData = QProcessEnvironment::systemEnvironment().value(QStringLiteral("APPDATA"));
-    const QString legacyWhisperDirectory = QDir(appData).filePath(QStringLiteral("SubCue/models"));
-    if (!appData.isEmpty()
-        && QDir::cleanPath(result.value(QStringLiteral("whisperModelsDirectory")).toString())
-            == QDir::cleanPath(legacyWhisperDirectory)) {
-        result.insert(QStringLiteral("whisperModelsDirectory"),
-            QString::fromUtf8(SUBCUE_PROJECT_WHISPER_MODELS_DIR));
+    if (result.value(QStringLiteral("asrProvider")).toString() == QLatin1String("whisper")) {
+        result.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));
+        result.insert(QStringLiteral("asrVerification"), QJsonObject{});
     }
     result.insert(QStringLiteral("version"), 2);
     return result;

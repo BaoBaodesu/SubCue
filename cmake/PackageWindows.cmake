@@ -56,9 +56,16 @@ file(COPY "${SUBCUE_PYTHON_ROOT}/Lib/" DESTINATION "${_inference_runtime}/Lib"
     PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE
     PATTERN "ensurepip" EXCLUDE PATTERN "idlelib" EXCLUDE
     PATTERN "lib2to3" EXCLUDE PATTERN "turtledemo" EXCLUDE)
+file(GLOB_RECURSE _development_files LIST_DIRECTORIES false
+    "${SUBCUE_INFERENCE_SITE_PACKAGES}/*.lib")
+set(_development_bytes 0)
+foreach(_file IN LISTS _development_files)
+    file(SIZE "${_file}" _file_size)
+    math(EXPR _development_bytes "${_development_bytes} + ${_file_size}")
+endforeach()
 file(COPY "${SUBCUE_INFERENCE_SITE_PACKAGES}/" DESTINATION "${_inference_runtime}/Lib/site-packages"
     PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE PATTERN "tests" EXCLUDE
-    PATTERN "test" EXCLUDE)
+    PATTERN "test" EXCLUDE PATTERN "*.lib" EXCLUDE PATTERN "*.pdb" EXCLUDE)
 # Torch C++ 头文件只供扩展编译使用，推理运行时无需携带。
 file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/torch/include")
 
@@ -190,7 +197,6 @@ file(MAKE_DIRECTORY "${_license_dir}")
 file(COPY "${SUBCUE_SOURCE_DIR}/licenses/NOTICE.txt" DESTINATION "${_license_dir}")
 file(COPY "${SUBCUE_SOURCE_DIR}/docs/third-party-licenses.md" DESTINATION "${_license_dir}")
 file(COPY "${SUBCUE_SOURCE_DIR}/licenses/qt" DESTINATION "${_license_dir}")
-file(COPY "${SUBCUE_SOURCE_DIR}/licenses/whisper.cpp" DESTINATION "${_license_dir}")
 if(EXISTS "${FFMPEG_SHARE_DIR}/copyright")
     file(MAKE_DIRECTORY "${_license_dir}/FFmpeg")
     file(COPY "${FFMPEG_SHARE_DIR}/copyright" DESTINATION "${_license_dir}/FFmpeg")
@@ -201,7 +207,7 @@ file(WRITE "${SUBCUE_PACKAGE_DIR}/README.txt"
 ==================
 
 Run SubCue.exe. Qt, FFmpeg, and the MSVC runtime are in this folder.
-Whisper runs without Python. Qwen3-ASR and Fun-ASR require a compatible local Python CUDA environment.
+Qwen3-ASR and Fun-ASR require a compatible local Python CUDA environment.
 
 Third-party licenses are in licenses/.
 ")
@@ -283,7 +289,6 @@ set(_required
     "${SUBCUE_PACKAGE_DIR}/swscale-10.dll"
     "${SUBCUE_PACKAGE_DIR}/licenses/NOTICE.txt"
     "${SUBCUE_PACKAGE_DIR}/licenses/qt/LICENSE.LGPLv3"
-    "${SUBCUE_PACKAGE_DIR}/licenses/whisper.cpp/LICENSE"
 )
 foreach(_file IN LISTS _required)
     if(NOT EXISTS "${_file}")
@@ -335,5 +340,12 @@ foreach(_path IN LISTS _package_files)
     string(APPEND _manifest "${_rel}\n")
 endforeach()
 file(WRITE "${SUBCUE_PACKAGE_DIR}/package-manifest.txt" "${_manifest}")
+set(_package_bytes 0)
+foreach(_path IN LISTS _package_files)
+    file(SIZE "${_path}" _file_size)
+    math(EXPR _package_bytes "${_package_bytes} + ${_file_size}")
+endforeach()
+file(WRITE "${SUBCUE_PACKAGE_DIR}/package-size.txt"
+    "Package bytes: ${_package_bytes}\nExcluded development library bytes: ${_development_bytes}\n")
 file(WRITE "${SUBCUE_PACKAGE_DIR}/package.stamp" "SubCue ${SUBCUE_BUILD_TYPE} package\n")
-message(STATUS "Windows package ready: ${SUBCUE_PACKAGE_DIR}")
+message(STATUS "Windows package ready: ${SUBCUE_PACKAGE_DIR} (${_package_bytes} bytes; ${_development_bytes} development library bytes excluded)")

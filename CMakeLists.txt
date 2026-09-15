@@ -10,11 +10,12 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOGEN_PARALLEL 1)
 
 option(SUBCUE_BUILD_APP "Build the Qt Quick application" ON)
-option(SUBCUE_ENABLE_CUDA "Enable CUDA acceleration for local Whisper" OFF)
+option(SUBCUE_ENABLE_CUDA "Package CUDA runtime for local inference" OFF)
+if(SUBCUE_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
 set(SUBCUE_PYTHON_ROOT "C:/Users/baobao/AppData/Roaming/uv/python/cpython-3.11.16-windows-x86_64-none"
     CACHE PATH "Python 3.11 runtime used only by SubCueInference")
-set(SUBCUE_WHISPER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/whisper.cpp"
-    CACHE PATH "Path to the pinned whisper.cpp source tree")
 
 set(CMAKE_PREFIX_PATH "C:/Qt/6.10.3/msvc2022_64")
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Sql Test)
@@ -51,25 +52,6 @@ foreach(SUBCUE_FFMPEG_LIBRARY avcodec avformat avutil swresample swscale)
     )
 endforeach()
 add_library(SubCue::FFmpeg ALIAS SubCueFFmpeg)
-
-set(SUBCUE_HAS_WHISPER OFF)
-if(EXISTS "${SUBCUE_WHISPER_ROOT}/CMakeLists.txt")
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static third-party libraries" FORCE)
-    set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    if(SUBCUE_ENABLE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures for local Whisper")
-    endif()
-    set(GGML_CUDA ${SUBCUE_ENABLE_CUDA} CACHE BOOL "" FORCE)
-    set(GGML_CUDA_FA OFF CACHE BOOL "" FORCE)
-    set(GGML_CUDA_FORCE_CUBLAS ${SUBCUE_ENABLE_CUDA} CACHE BOOL "" FORCE)
-    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
-    add_subdirectory("${SUBCUE_WHISPER_ROOT}" "${CMAKE_BINARY_DIR}/third_party/whisper.cpp"
-        EXCLUDE_FROM_ALL)
-    set(SUBCUE_HAS_WHISPER ON)
-endif()
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -115,14 +97,6 @@ qt_add_library(SubCueCore STATIC
     src/core/asr/http_client.h
     src/core/asr/local_python_asr_service.cpp
     src/core/asr/local_python_asr_service.h
-    src/core/asr/model_downloader.cpp
-    src/core/asr/model_downloader.h
-    src/core/asr/whisper_cpp_service.cpp
-    src/core/asr/whisper_cpp_service.h
-    src/core/asr/whisper_engine.cpp
-    src/core/asr/whisper_engine.h
-    src/core/asr/whisper_model_catalog.cpp
-    src/core/asr/whisper_model_catalog.h
     src/core/common/app_error.cpp
     src/core/common/app_error.h
     src/core/common/logging.cpp
@@ -247,17 +221,9 @@ target_include_directories(SubCueCore PUBLIC
 )
 target_link_libraries(SubCueCore PUBLIC Qt6::Core Qt6::Gui Qt6::Network Qt6::Quick Qt6::Sql SubCue::FFmpeg)
 target_compile_definitions(SubCueCore PUBLIC
-    SUBCUE_PROJECT_WHISPER_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models/whisper"
     SUBCUE_PROJECT_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models"
     SUBCUE_PROJECT_INFERENCE_PYTHON="${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Scripts/python.exe"
 )
-if(SUBCUE_HAS_WHISPER)
-    target_link_libraries(SubCueCore PRIVATE whisper)
-    target_compile_definitions(SubCueCore PUBLIC SUBCUE_HAS_WHISPER=1)
-    if(SUBCUE_ENABLE_CUDA)
-        target_compile_definitions(SubCueCore PUBLIC SUBCUE_HAS_CUDA=1)
-    endif()
-endif()
 if(WIN32)
     target_link_libraries(SubCueCore PRIVATE Crypt32 Advapi32 ole32 uuid d3d11 dxgi avrt)
 endif()
@@ -371,10 +337,6 @@ if(SUBCUE_BUILD_APP)
         # 调试 DLL 单独位于 debug/bin，二者都不在默认 PATH 上。
         set_target_properties(SubCue PROPERTIES
             VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:Qt6::Core>;$<IF:$<CONFIG:Debug>,${SUBCUE_FFMPEG_ROOT}/debug/bin,${SUBCUE_FFMPEG_ROOT}/bin>;%PATH%")
-        if(SUBCUE_ENABLE_CUDA)
-            set_target_properties(SubCue PROPERTIES
-                VS_DEBUGGER_ENVIRONMENT "PATH=${CUDAToolkit_BIN_DIR}/x64;${CUDAToolkit_BIN_DIR};$<TARGET_FILE_DIR:Qt6::Core>;${SUBCUE_FFMPEG_ROOT}/bin;%PATH%")
-        endif()
         set(SUBCUE_PACKAGE_DIR "${CMAKE_BINARY_DIR}/package")
         add_custom_command(
             OUTPUT "${SUBCUE_PACKAGE_DIR}/package.stamp"

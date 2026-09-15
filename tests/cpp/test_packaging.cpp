@@ -155,6 +155,11 @@ void PackagingTests::packageLayoutContainsRuntime()
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("avutil-61.dll"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("swresample-7.dll"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("swscale-10.dll"))));
+#ifdef SUBCUE_PACKAGE_HAS_CUDA
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("cublas64_13.dll"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("cublasLt64_13.dll"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("cudart64_13.dll"))));
+#endif
     QVERIFY(packageHasAny({
         QStringLiteral("vcruntime140.dll"),
         QStringLiteral("VCRUNTIME140.dll"),
@@ -175,6 +180,7 @@ void PackagingTests::packageLayoutContainsRuntime()
     }));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package.stamp"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-manifest.txt"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-size.txt"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/SubCueInference.exe"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/python311.dll"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/runtime/python311.dll"))));
@@ -182,7 +188,8 @@ void PackagingTests::packageLayoutContainsRuntime()
 
 void PackagingTests::packageContainsOnlyBasicQuickControlsStyle()
 {
-    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("Qt6QuickControls2Basic.dll"))));
+    QVERIFY(packageHasAny({QStringLiteral("Qt6QuickControls2Basic.dll"),
+        QStringLiteral("Qt6QuickControls2Basicd.dll")}));
     QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("vc_redist.x64.exe"))));
     const QStringList unusedStyles = {
         QStringLiteral("FluentWinUI3"), QStringLiteral("Fusion"),
@@ -208,7 +215,10 @@ void PackagingTests::packageRestrictsPythonAndCliTools()
             || (name == QLatin1String("avfilter-12.dll") && !relative.startsWith(QLatin1String("inference/")))
             || name == QLatin1String("ffmpeg.exe")
             || name == QLatin1String("ffprobe.exe")
-            || name == QLatin1String("ffplay.exe")) {
+            || name == QLatin1String("ffplay.exe")
+            || (relative.startsWith(QLatin1String("inference/runtime/Lib/site-packages/"))
+                && (name.endsWith(QLatin1String(".lib"))
+                    || name.endsWith(QLatin1String(".pdb"))))) {
             hits.append(QDir(packageDir()).relativeFilePath(path));
         }
     }
@@ -222,10 +232,9 @@ void PackagingTests::packageShipsThirdPartyLicenses()
     QVERIFY(notice.contains(QStringLiteral("Qt")));
     QVERIFY(notice.contains(QStringLiteral("FFmpeg")));
     QVERIFY(notice.contains(QStringLiteral("LGPL")));
-    QVERIFY(notice.contains(QStringLiteral("whisper.cpp")));
     QVERIFY(notice.contains(QStringLiteral("Python")));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("licenses/qt/LICENSE.LGPLv3"))));
-    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("licenses/whisper.cpp/LICENSE"))));
+    QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("licenses/whisper.cpp/LICENSE"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("licenses/FFmpeg/copyright"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("licenses/third-party-licenses.md"))));
 }
@@ -237,8 +246,7 @@ void PackagingTests::aboutWindowDocumentsFfmpegLgpl()
     const QString source = QString::fromUtf8(about.readAll());
     QVERIFY(source.contains(QStringLiteral("FFmpeg")));
     QVERIFY(source.contains(QStringLiteral("LGPL")));
-    QVERIFY(source.contains(QStringLiteral("whisper.cpp")));
-    QVERIFY(!source.contains(QStringLiteral("未链接 whisper.cpp")));
+    QVERIFY(!source.contains(QStringLiteral("whisper.cpp")));
     QVERIFY(!source.contains(QStringLiteral("ffmpeg.exe")));
     QVERIFY(!source.contains(QStringLiteral("python.exe")));
 
@@ -293,6 +301,9 @@ void PackagingTests::packagedBinaryImportsAreClean()
 
 void PackagingTests::packagedAppStartsWithIsolatedPath()
 {
+#ifdef _DEBUG
+    QSKIP("Debug CRT is available from the development environment, not the portable package");
+#endif
     const QString appPath = packageFile(QStringLiteral("SubCue.exe"));
     QVERIFY(QFileInfo::exists(appPath));
 

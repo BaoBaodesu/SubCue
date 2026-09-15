@@ -190,13 +190,11 @@ public:
     Q_INVOKABLE QVariant setting(const QString &key) const;
     Q_INVOKABLE QVariantList asrProviders() const;
     Q_INVOKABLE QVariantList asrModels(const QString &providerId) const;
-    Q_INVOKABLE bool whisperCudaAvailable() const;
     Q_INVOKABLE QVariantList aiProviders() const;
     Q_INVOKABLE QVariantList aiModels(const QString &providerId) const;
     Q_INVOKABLE QString newProviderId() const;
     Q_INVOKABLE void testAiConnection(const QVariantMap &provider, const QString &apiKey = {});
     Q_INVOKABLE void testAsrConnection(const QVariantMap &values, const QString &apiKey = {});
-    Q_INVOKABLE void downloadWhisperModel(const QString &modelId, const QString &directory = {});
     Q_INVOKABLE bool saveSettings(const QVariantMap &values, const QString &asrApiKey = {},
                                   const QString &aiApiKey = {});
     Q_INVOKABLE QString credentialStatus(const QString &credentialId = QStringLiteral("SubCue/ASR/dashscope")) const;
@@ -229,7 +227,6 @@ signals:
     void alignmentPreflightFailed(const QVariantList &issues);
     void aiConnectionTestFinished(const QString &providerId, const QVariantMap &result);
     void asrConnectionTestFinished(const QVariantMap &result);
-    void whisperDownloadFinished(const QString &modelId, const QVariantMap &result);
 
 private:
     void rememberProjectFile(const QString &path, const QString &type, qint64 durationMs = 0);

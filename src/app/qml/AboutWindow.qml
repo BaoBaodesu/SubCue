@@ -49,7 +49,7 @@ Window {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 color: Theme.text
-                text: qsTr("本程序已集成 whisper.cpp 本地识别运行时；模型由用户按需下载。完整第三方许可证在程序目录的 licenses 文件夹。")
+                text: qsTr("本程序支持本地 Qwen3-ASR 和 Fun-ASR 识别。完整第三方许可证在程序目录的 licenses 文件夹。")
             }
             ScrollView {
                 Layout.fillWidth: true

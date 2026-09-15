@@ -31,12 +31,6 @@ Microsoft Visual C++ Runtime
 The package includes the MSVC x64 redistributable DLLs next to SubCue.exe
 so a clean Windows 10/11 x64 machine does not need Visual Studio.
 
-whisper.cpp
------------
-This build statically links whisper.cpp v1.9.1 and ggml under the MIT License.
-The full license text is included in licenses/whisper.cpp/LICENSE. Whisper
-model files are downloaded by the user and are not program source.
-
 RapidFuzz
 ---------
 Alignment uses an in-tree Indel fuzz.ratio implementation that matches

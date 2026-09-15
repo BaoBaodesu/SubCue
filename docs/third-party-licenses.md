@@ -6,15 +6,14 @@
 
 - Qt 6.11.2：动态链接；仅使用 Qt Core、Gui、Qml、Quick、QuickControls2、Network、Multimedia、Test 等 LGPL 可用模块，不链接 GPL-only 的 Qt Quick Timeline。Phase 1 暂以 6.10.3 验证，不能视为最终版本替代。
 - FFmpeg 9.0.1#1：通过已锁定 baseline 的 vcpkg `x64-windows` 动态构建，只启用 avcodec、avformat、avfilter、swresample、swscale；禁止 `gpl`、`nonfree`、x264、x265。
-- whisper.cpp v1.9.1：MIT；只链接核心库，不复制许可证存疑的示例源码。
 - rapidfuzz-cpp v3.3.3：MIT。
 
 ## 发布要求
 
-- 随包附带 Qt、FFmpeg 及其实际传递依赖的许可证文本。whisper.cpp 仅在实际链接核心库后再附其 MIT 文本。RapidFuzz 为 in-tree 实现，不链接 rapidfuzz-cpp。
+- 随包附带 Qt、FFmpeg 及其实际传递依赖的许可证文本。RapidFuzz 为 in-tree 实现，不链接 rapidfuzz-cpp。
 - 保存 vcpkg baseline、resolved versions、FFmpeg configure options、对应源码下载地址及修改补丁。
 - FFmpeg DLL 保持原名并提供相同源码；About 对话框和发布说明注明 FFmpeg LGPL 使用情况。
-- 不将 Whisper 模型混同为程序源码依赖；模型清单独立记录来源、许可证、大小和 SHA-256。当前清单在 `src/core/asr/whisper_model_catalog.cpp`，URL 为 `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{id}.bin`，SHA-256 取自 Hugging Face LFS oid。
+- 模型文件与程序源码依赖分别记录，现用本地模型不随便携包复制。
 
 ## 当前锁定信息
 

@@ -4,7 +4,6 @@
 #include "alignment/normalizer.h"
 #include "asr/asr_provider_factory.h"
 #include "asr/audio_chunk_extractor.h"
-#include "asr/whisper_model_catalog.h"
 #include "media/media_probe.h"
 #include "roughcut/retake_detector.h"
 #include "roughcut/rough_cut_project.h"
@@ -414,9 +413,7 @@ void RoughCutController::startAuxiliaryRecognition()
                 range.endSample * 1000 / sampleRate};
             const auto extracted = AudioChunkExtractor::extract(mediaPath, window, &cancel_, true);
             QString funText;
-            QString whisperText;
             bool funFailed = true;
-            bool whisperFailed = true;
             if (temporary.isValid() && std::holds_alternative<PreparedAudioChunk>(extracted)) {
                 const QString clipPath = QDir(temporary.path()).filePath(
                     QStringLiteral("review_%1.flac").arg(rangeIndex));
@@ -431,27 +428,11 @@ void RoughCutController::startAuxiliaryRecognition()
                     if (std::holds_alternative<Transcript>(fun)) {
                         funText = transcriptText(std::get<Transcript>(fun)); funFailed = funText.isEmpty();
                     }
-                    const QString whisperDirectory = settings.value(
-                        QStringLiteral("whisperModelsDirectory")).toString(
-                            AsrProviderFactory::defaultWhisperModelsDirectory());
-                    const QString whisperModel = settings.value(QStringLiteral("whisperModel")).toString(
-                        QStringLiteral("small"));
-                    if (QFileInfo::exists(QDir(whisperDirectory).filePath(
-                        WhisperModelCatalog::fileNameFor(whisperModel)))) {
-                        QJsonObject whisperSettings = settings;
-                        whisperSettings.insert(QStringLiteral("asrProvider"), QStringLiteral("whisper"));
-                        AsrResult whisper = factory.create(whisperSettings, QString())->transcribe(
-                            {clipPath, &cancel_, {}});
-                        if (std::holds_alternative<Transcript>(whisper)) {
-                            whisperText = transcriptText(std::get<Transcript>(whisper));
-                            whisperFailed = whisperText.isEmpty();
-                        }
-                    }
                 }
             }
             for (int index : range.recordingIndexes) {
-                RoughCutAuxiliaryResult result{index, recording.at(index).text, funText, whisperText,
-                    funFailed, whisperFailed, false};
+                RoughCutAuxiliaryResult result{index, recording.at(index).text, funText, {},
+                    funFailed, false, false};
                 (void)RoughCutAuxiliaryRecognition::reconcile(
                     decisions.at(index).autoDecision, &result);
                 results.append(std::move(result));

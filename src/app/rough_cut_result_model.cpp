@@ -71,8 +71,6 @@ void RoughCutResultModel::applyAuxiliaryResult(RoughCutAuxiliaryResult result)
     decision.autoDecision = RoughCutAuxiliaryRecognition::reconcile(decision.autoDecision, &result);
     decision.evidence.append(QStringLiteral("Fun-ASR：%1").arg(
         result.funAsrFailed ? QStringLiteral("失败") : result.funAsrText));
-    decision.evidence.append(QStringLiteral("Whisper：%1").arg(
-        result.whisperFailed ? QStringLiteral("失败") : result.whisperText));
     if (result.conflict) decision.reason = QStringLiteral("辅助识别冲突或失败，保留复核");
     const QModelIndex changed = index(result.recordingIndex);
     emit dataChanged(changed, changed, {StatusRole, ReasonRole, EvidenceRole});

@@ -4,7 +4,7 @@
 
 namespace subcue {
 
-// 通过独立 Python 进程调用官方本地 SDK，不影响 whisper.cpp 的依赖和显存。
+// 通过独立 Python 进程调用官方本地 SDK，避免主程序加载推理依赖。
 class LocalPythonAsrService final : public IAsrService {
 public:
     LocalPythonAsrService(QString providerId, QString modelDirectory, QString forcedAlignerDirectory,

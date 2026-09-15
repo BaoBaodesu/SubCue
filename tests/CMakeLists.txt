@@ -2,10 +2,6 @@
 set(SUBCUE_TEST_PATH_MODIFICATION
     "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>;PATH=path_list_prepend:$<IF:$<CONFIG:Debug>,${SUBCUE_FFMPEG_ROOT}/debug/bin,${SUBCUE_FFMPEG_ROOT}/bin>"
 )
-if(SUBCUE_ENABLE_CUDA)
-    string(APPEND SUBCUE_TEST_PATH_MODIFICATION
-        ";PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}/x64")
-endif()
 
 # 应用层测试需要 AppController 与 QML 场景项，集中声明避免逐目标重复。
 set(SUBCUE_APP_TEST_SOURCES
@@ -179,6 +175,9 @@ if(SUBCUE_BUILD_APP AND WIN32)
         SUBCUE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
         SUBCUE_PACKAGE_DIR="${CMAKE_BINARY_DIR}/package"
     )
+    if(SUBCUE_ENABLE_CUDA)
+        target_compile_definitions(SubCuePackagingTests PRIVATE SUBCUE_PACKAGE_HAS_CUDA=1)
+    endif()
     add_dependencies(SubCuePackagingTests subcue-windows-package)
     target_link_libraries(SubCuePackagingTests PRIVATE Qt6::Test)
     subcue_register_test(SubCuePackagingTests

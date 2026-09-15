@@ -67,16 +67,6 @@ Window {
                         if (items[i].id === id) return i
                     return items.length > 0 ? 0 : -1
                 }
-                function whisperDeviceIndex(id) {
-                    // 旧配置里的 "auto" 与缺失值都按 CUDA 处理，和 SettingsManager 的默认值一致。
-                    if (!controller.whisperCudaAvailable()) return 0
-                    return id === "cpu" ? 1 : 0
-                }
-                function whisperDeviceId() {
-                    // 纯 CPU 构建只有 CPU 可选，但不能把已有的 CUDA 偏好写回成 CPU。
-                    if (!controller.whisperCudaAvailable()) return controller.setting("whisperDevice") || "cpu"
-                    return whisperDevice.currentIndex === 1 ? "cpu" : "cuda"
-                }
                 function selectedProvider() {
                     return aiProvider.currentIndex >= 0 && aiProvider.currentIndex < providers.length
                            ? providers[aiProvider.currentIndex] : null
@@ -104,7 +94,7 @@ Window {
                     preferredModel = preferred || ""
                     modelLoading = true
                     ++settingsHost.modelRequestId
-                    controller.requestAsrModels(asrProvider.currentValue || "dashscope", whisperDirectory.text,
+                    controller.requestAsrModels(asrProvider.currentValue || "dashscope", "",
                                                 settingsHost.modelRequestId)
                 }
                 function refreshAiModels(preferred) {
@@ -120,15 +110,11 @@ Window {
                 function loadValues() {
                     saveStatus.text = ""
                     asrProviderData = controller.asrProviders()
-                    whisperDirectory.text = controller.setting("whisperModelsDirectory") || ""
                     const savedAsr = controller.setting("asrProvider") || "dashscope"
                     asrProvider.currentIndex = indexById(asrProviderData, savedAsr)
-                    refreshAsrModels(savedAsr === "whisper"
-                        ? controller.setting("whisperModel") : controller.setting("asrModel"))
+                    refreshAsrModels(controller.setting("asrModel"))
                     region.currentIndex = controller.setting("region") === "singapore" ? 1 : 0
                     asrApiHost.text = controller.setting("asrApiHost") || ""
-                    const savedDevice = controller.setting("whisperDevice") || "cuda"
-                    whisperDevice.currentIndex = whisperDeviceIndex(savedDevice)
                     asrVerification = clone(controller.setting("asrVerification") || {})
                     asrConfigRevision = controller.setting("asrConfigRevision") || 0
                     asrCredentialRevision = controller.setting("asrCredentialRevision") || 0
@@ -209,11 +195,6 @@ Window {
                             aiStatus.text = result.error
                         }
                     }
-                    function onWhisperDownloadFinished(modelId, result) {
-                        settingsWindow.asrOperationBusy = false
-                        asrStatus.text = result.success ? "模型已就绪，请测试" : result.error
-                        settingsWindow.refreshAsrModels(modelId)
-                    }
                 }
 
                 component FieldLabel: Label {
@@ -268,7 +249,7 @@ Window {
                                     textRole: "name"
                                     valueRole: "id"
                                     onActivated: {
-                                        refreshAsrModels(currentValue === "whisper" ? "small" : "fun-asr-flash-2026-06-15")
+                                        refreshAsrModels("fun-asr-flash-2026-06-15")
                                         invalidateAsr()
                                     }
                                 }
@@ -283,16 +264,6 @@ Window {
                                     textRole: "name"
                                     valueRole: "id"
                                     onActivated: invalidateAsr()
-                                }
-                                SubButton {
-                                    text: "下载模型"
-                                    visible: asrProvider.currentValue === "whisper"
-                                    enabled: !settingsWindow.modelLoading && !settingsWindow.asrOperationBusy && asrModel.currentIndex >= 0
-                                    onClicked: {
-                                        settingsWindow.asrOperationBusy = true
-                                        asrStatus.text = "正在下载并校验…"
-                                        controller.downloadWhisperModel(asrModel.currentValue, whisperDirectory.text)
-                                    }
                                 }
                                 StatusLabel {
                                     visible: asrProvider.currentValue === "qwen3" || asrProvider.currentValue === "funasr"
@@ -340,34 +311,6 @@ Window {
                                 }
                                 StatusLabel { id: asrCredentialStatus; visible: asrProvider.currentValue === "dashscope" }
 
-                                FieldLabel { text: "模型目录"; visible: asrProvider.currentValue === "whisper" }
-                                SubTextField {
-                                    id: whisperDirectory
-                                    visible: asrProvider.currentValue === "whisper"
-                                    enabled: !settingsWindow.asrOperationBusy
-                                    Layout.fillWidth: true
-                                    placeholderText: "留空使用默认模型目录"
-                                    onTextEdited: { refreshAsrModels(asrModel.currentValue); invalidateAsr() }
-                                }
-                                Item { visible: asrProvider.currentValue === "whisper"; Layout.fillWidth: true }
-
-                                FieldLabel { text: "推理设备"; visible: asrProvider.currentValue === "whisper" }
-                                SubComboBox {
-                                    id: whisperDevice
-                                    visible: asrProvider.currentValue === "whisper"
-                                    enabled: !settingsWindow.asrOperationBusy
-                                    Layout.fillWidth: true
-                                    model: controller && controller.whisperCudaAvailable()
-                                           ? ["CUDA 加速（显卡推理，默认）", "纯 CPU（无显卡加速，较慢）"]
-                                           : ["纯 CPU（当前构建未包含 CUDA）"]
-                                    onActivated: invalidateAsr()
-                                }
-                                StatusLabel {
-                                    visible: asrProvider.currentValue === "whisper"
-                                    text: controller && controller.whisperCudaAvailable()
-                                          ? (whisperDevice.currentIndex === 1 ? "纯 CPU 推理" : "CUDA 加速已启用")
-                                          : "构建未包含 CUDA"
-                                }
 
                                 Item { Layout.preferredWidth: 1 }
                                 SubButton {
@@ -378,9 +321,6 @@ Window {
                                         const values = {
                                             "asrProvider": asrProvider.currentValue,
                                             "asrModel": asrProvider.currentValue === "dashscope" ? asrModel.currentValue : "",
-                                            "whisperModel": asrProvider.currentValue === "whisper" ? asrModel.currentValue : "",
-                                            "whisperModelsDirectory": whisperDirectory.text,
-                                            "whisperDevice": whisperDeviceId(),
                                             "region": region.currentText,
                                             "asrApiHost": asrApiHost.text
                                         }
@@ -549,9 +489,6 @@ Window {
                                         const ok = controller.saveSettings({
                                             "asrProvider": asrProvider.currentValue,
                                             "asrModel": asrProvider.currentValue === "dashscope" ? asrModel.currentValue : controller.setting("asrModel"),
-                                            "whisperModel": asrProvider.currentValue === "whisper" ? asrModel.currentValue : controller.setting("whisperModel"),
-                                            "whisperModelsDirectory": whisperDirectory.text,
-                                            "whisperDevice": whisperDeviceId(),
                                             "region": region.currentText,
                                             "asrApiHost": asrApiHost.text,
                                             "asrVerification": asrVerification,

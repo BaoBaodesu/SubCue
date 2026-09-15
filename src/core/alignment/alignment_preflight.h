@@ -14,8 +14,6 @@ struct PreflightState final {
     bool aiCredentialExists = false;
     bool asrVerified = false;
     bool aiVerified = false;
-    bool whisperRuntimeAvailable = false;
-    bool whisperModelReady = false;
     bool aiProviderOverride = false;
 };
 

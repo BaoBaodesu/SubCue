@@ -10,8 +10,6 @@
 #include "asr/asr_provider_factory.h"
 #include "asr/asr_types.h"
 #include "asr/local_python_asr_service.h"
-#include "asr/model_downloader.h"
-#include "asr/whisper_model_catalog.h"
 #include "common/logging.h"
 #include "media/media_probe.h"
 #include "subtitle/srt_parser.h"
@@ -106,15 +104,6 @@ QVariantMap providerResult(const ProviderTestResult &result)
     output.insert(QStringLiteral("models"), models);
     output.insert(QStringLiteral("verifiedAtUtc"), connected.verifiedAtUtc.toString(Qt::ISODate));
     return output;
-}
-
-bool whisperRuntimeAvailable() noexcept
-{
-#ifdef SUBCUE_HAS_WHISPER
-    return true;
-#else
-    return false;
-#endif
 }
 
 } // namespace
@@ -617,22 +606,10 @@ void AppController::startAlignment()
         const QJsonObject aiProvider = selectedAiProvider(settings);
         const QJsonObject asrVerification = settings
             .value(QStringLiteral("asrVerification")).toObject();
-        const QString whisperModel = settings.value(QStringLiteral("whisperModel")).toString();
-        QString whisperDirectory = settings
-            .value(QStringLiteral("whisperModelsDirectory")).toString();
-        if (whisperDirectory.isEmpty()) {
-            whisperDirectory = AsrProviderFactory::defaultWhisperModelsDirectory();
-        }
-        bool whisperReady = false;
-        if (const std::optional<WhisperModelSpec> spec = WhisperModelCatalog::find(whisperModel);
-            asrProvider == QLatin1String(kAsrProviderWhisper) && spec && !alignmentCancel_) {
-            whisperReady = ModelDownloader::matchesSpec(QDir(whisperDirectory).filePath(spec->fileName), *spec, &alignmentCancel_);
-        }
         const bool asrVerified = asr != nullptr
             || (asrVerification.value(QStringLiteral("providerId")).toString() == asrProvider
                 && asrVerification.value(QStringLiteral("selectedModel")).toString()
-                    == settings.value(asrProvider == QLatin1String(kAsrProviderWhisper)
-                        ? QStringLiteral("whisperModel") : QStringLiteral("asrModel")).toString()
+                    == settings.value(QStringLiteral("asrModel")).toString()
                 && asrVerification.value(QStringLiteral("configRevision")).toInt()
                     == settings.value(QStringLiteral("asrConfigRevision")).toInt()
                 && asrVerification.value(QStringLiteral("credentialRevision")).toInt()
@@ -656,8 +633,6 @@ void AppController::startAlignment()
                 || context_->credentials.exists(aiCredentialId(aiProvider.value(QStringLiteral("id")).toString())),
             asrVerified,
             aiVerified,
-            whisperRuntimeAvailable(),
-            whisperReady,
             ai != nullptr,
         };
         const QVector<PreflightIssue> issues = AlignmentPreflight::check(
@@ -1135,8 +1110,6 @@ QVariantList AppController::asrProviders() const
     return {
         QVariantMap{{QStringLiteral("id"), QStringLiteral("dashscope")},
                     {QStringLiteral("name"), QStringLiteral("云端语音识别")}},
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("whisper")},
-                    {QStringLiteral("name"), QStringLiteral("本地 Whisper")}},
         QVariantMap{{QStringLiteral("id"), QStringLiteral("qwen3")},
                     {QStringLiteral("name"), QStringLiteral("本地 Qwen3-ASR 0.6B")}},
         QVariantMap{{QStringLiteral("id"), QStringLiteral("funasr")},
@@ -1147,22 +1120,6 @@ QVariantList AppController::asrProviders() const
 QVariantList AppController::asrModels(const QString &providerId) const
 {
     QVariantList result;
-    if (providerId == QLatin1String(kAsrProviderWhisper)) {
-        QString directory = context_->settings.value(QStringLiteral("whisperModelsDirectory")).toString();
-        if (directory.isEmpty()) {
-            directory = AsrProviderFactory::defaultWhisperModelsDirectory();
-        }
-        for (const WhisperModelSpec &model : WhisperModelCatalog::all()) {
-            const QFileInfo modelFile(QDir(directory).filePath(model.fileName));
-            result.append(QVariantMap{
-                {QStringLiteral("id"), model.id},
-                {QStringLiteral("name"), QStringLiteral("%1 · %2 MB").arg(model.id).arg(model.size / 1'000'000)},
-                // 设置页只做轻量状态检查，完整 SHA-256 校验仍在下载和加载时执行。
-                {QStringLiteral("ready"), modelFile.isFile() && modelFile.size() == model.size},
-            });
-        }
-        return result;
-    }
     if (providerId == QLatin1String("qwen3") || providerId == QLatin1String("funasr")) {
         const QString key = providerId == QLatin1String("qwen3")
             ? QStringLiteral("qwen3AsrModelsDirectory") : QStringLiteral("funAsrModelsDirectory");
@@ -1190,33 +1147,8 @@ QVariantList AppController::asrModels(const QString &providerId) const
 
 void AppController::requestAsrModels(const QString &providerId, const QString &directory, int requestId)
 {
-    if (providerId != QLatin1String(kAsrProviderWhisper)) {
-        emit asrModelsReady(requestId, asrModels(providerId));
-        return;
-    }
-    const QPointer<AppController> self(this);
-    QThreadPool::globalInstance()->start([self, directory, requestId] {
-        QVariantList models;
-        const QDir folder(directory.isEmpty() ? AsrProviderFactory::defaultWhisperModelsDirectory() : directory);
-        for (const WhisperModelSpec &model : WhisperModelCatalog::all()) {
-            const QFileInfo file(folder.filePath(model.fileName));
-            models.append(QVariantMap{{QStringLiteral("id"), model.id},
-                {QStringLiteral("name"), QStringLiteral("%1 · %2 MB").arg(model.id).arg(model.size / 1'000'000)},
-                {QStringLiteral("ready"), file.isFile() && file.size() == model.size}});
-        }
-        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, requestId, models] {
-            if (self) emit self->asrModelsReady(requestId, models);
-        }, Qt::QueuedConnection);
-    });
-}
-
-bool AppController::whisperCudaAvailable() const
-{
-#ifdef SUBCUE_HAS_CUDA
-    return true;
-#else
-    return false;
-#endif
+    Q_UNUSED(directory);
+    emit asrModelsReady(requestId, asrModels(providerId));
 }
 
 QVariantList AppController::aiProviders() const
@@ -1308,41 +1240,6 @@ void AppController::testAsrConnection(const QVariantMap &values, const QString &
         if (self && !cancel->load()) {
             QMetaObject::invokeMethod(self, [self, result] {
                 if (self) emit self->asrConnectionTestFinished(result);
-            }, Qt::QueuedConnection);
-        }
-    });
-}
-
-void AppController::downloadWhisperModel(const QString &modelId, const QString &directory)
-{
-    const std::optional<WhisperModelSpec> model = WhisperModelCatalog::find(modelId);
-    if (!model) {
-        emit whisperDownloadFinished(modelId, {
-            {QStringLiteral("success"), false},
-            {QStringLiteral("error"), QStringLiteral("未知的 Whisper 模型")}});
-        return;
-    }
-    const QString targetDirectory = directory.trimmed().isEmpty()
-        ? AsrProviderFactory::defaultWhisperModelsDirectory() : directory.trimmed();
-    if (shuttingDown_) return;
-    QPointer<AppController> self(this);
-    backgroundTasks_.start([self, modelId, model = *model, targetDirectory,
-                            cancel = &backgroundCancel_] {
-        QtNetworkHttpClient http;
-        ModelDownloader downloader(&http);
-        const std::variant<QString, AppError> downloaded = downloader.ensure(
-            model, targetDirectory, cancel);
-        QVariantMap result;
-        if (std::holds_alternative<AppError>(downloaded)) {
-            result = {{QStringLiteral("success"), false},
-                      {QStringLiteral("error"), std::get<AppError>(downloaded).userMessage()}};
-        } else {
-            result = {{QStringLiteral("success"), true},
-                      {QStringLiteral("path"), std::get<QString>(downloaded)}};
-        }
-        if (self && !cancel->load()) {
-            QMetaObject::invokeMethod(self, [self, modelId, result] {
-                if (self) emit self->whisperDownloadFinished(modelId, result);
             }, Qt::QueuedConnection);
         }
     });

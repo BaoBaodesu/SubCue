@@ -1,4 +1,11 @@
+// 嵌入的 Python 仅提供发行版 DLL；避免 Python.h 在 MSVC Debug 下自动链接 python311_d.lib。
+#ifdef _DEBUG
+#undef _DEBUG
 #include <Python.h>
+#define _DEBUG 1
+#else
+#include <Python.h>
+#endif
 
 #include <filesystem>
 #include <string>

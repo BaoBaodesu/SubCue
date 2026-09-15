@@ -36,9 +36,8 @@ RoughCutDecision RoughCutAuxiliaryRecognition::reconcile(
     if (!result) return RoughCutDecision::Review;
     const QString primary = Normalizer::normalizeText(result->primaryText);
     const QString funAsr = Normalizer::normalizeText(result->funAsrText);
-    const QString whisper = Normalizer::normalizeText(result->whisperText);
-    result->conflict = result->funAsrFailed || result->whisperFailed || primary.isEmpty()
-        || funAsr.isEmpty() || whisper.isEmpty() || primary != funAsr || primary != whisper;
+    result->conflict = result->funAsrFailed || primary.isEmpty()
+        || funAsr.isEmpty() || primary != funAsr;
     // 辅助识别只提供复核证据；冲突或失败绝不能把片段升级为 CUT。
     return result->conflict ? RoughCutDecision::Review : current;
 }
