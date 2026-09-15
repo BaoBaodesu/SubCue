@@ -2,7 +2,9 @@
 
 #include "asr/audio_chunk_extractor.h"
 #include "asr/audio_chunk_plan.h"
+#include "cache/analysis_cache.h"
 #include "common/logging.h"
+#include "inference/inference_manager.h"
 #include "media/media_probe.h"
 
 #include <QtCore/QCoreApplication>
@@ -12,8 +14,8 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
-#include <QtCore/QProcess>
 #include <QtCore/QTemporaryDir>
+#include <QtCore/QUuid>
 
 #include <utility>
 
@@ -28,15 +30,45 @@ QString workerPath()
         ? bundled : QDir::current().filePath(QStringLiteral("tools/asr_python_worker.py"));
 }
 
-AppError workerError(const QByteArray &stderr)
+QString workerProgram(const QString &pythonExecutable, QStringList *arguments)
 {
-    const QString details = QString::fromUtf8(stderr).trimmed();
+    QString executable = QDir(QCoreApplication::applicationDirPath()).filePath(
+        QStringLiteral("inference/SubCueInference.exe"));
+    if (!QFileInfo::exists(executable)) {
+        executable = QDir(QCoreApplication::applicationDirPath()).filePath(
+            QStringLiteral("SubCueInference.exe"));
+    }
+    if (QFileInfo::exists(executable)) {
+        arguments->append(QStringLiteral("--stdio"));
+        return executable;
+    }
+    arguments->append({workerPath(), QStringLiteral("--stdio")});
+    return pythonExecutable;
+}
+
+AppError workerError(const QByteArray &errorOutput)
+{
+    const QString details = QString::fromUtf8(errorOutput).trimmed();
     if (details.contains(QStringLiteral("out of memory"), Qt::CaseInsensitive)) {
         return AppError(ErrorDomain::Asr, 10,
             QStringLiteral("CUDA 显存不足，请关闭其他占用显卡的程序后重试。"), details);
     }
     return AppError(ErrorDomain::Asr, static_cast<int>(AsrErrorCode::EngineUnavailable),
         QStringLiteral("本地 ASR Python Worker 执行失败。"), details);
+}
+
+Transcript transcriptFromResponse(const QJsonObject &response)
+{
+    Transcript transcript;
+    for (const QJsonValue &value : response.value(QStringLiteral("segments")).toArray()) {
+        const QJsonObject segment = value.toObject();
+        const QString text = segment.value(QStringLiteral("text")).toString().trimmed();
+        if (!text.isEmpty()) transcript.words.append({-1, text,
+            qRound64(segment.value(QStringLiteral("start")).toDouble() * 1000),
+            qRound64(segment.value(QStringLiteral("end")).toDouble() * 1000)});
+    }
+    transcript.sortAndReindex();
+    return transcript;
 }
 
 } // namespace
@@ -64,10 +96,18 @@ ProviderTestResult LocalPythonAsrService::testConnection(const std::atomic<bool>
         return AppError(ErrorDomain::Asr, static_cast<int>(AsrErrorCode::ModelNotFound),
             QStringLiteral("本地模型未安装或权重不完整：%1").arg(modelDirectory_));
     }
-    QProcess process;
-    process.start(pythonExecutable_, {workerPath(), QStringLiteral("--check"), providerId_, modelDirectory_});
-    if (!process.waitForStarted(10'000) || !process.waitForFinished(60'000) || process.exitCode() != 0) {
-        return workerError(process.readAllStandardError());
+    const QByteArray request = QJsonDocument(QJsonObject{
+        {QStringLiteral("taskId"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {QStringLiteral("action"), QStringLiteral("check")},
+        {QStringLiteral("provider"), providerId_},
+        {QStringLiteral("modelDirectory"), modelDirectory_}}).toJson(QJsonDocument::Compact) + '\n';
+    QStringList arguments;
+    const QString program = workerProgram(pythonExecutable_, &arguments);
+    const InferenceProcessResult result = InferenceManager::instance().run(
+        program, arguments, request, cancel, 60'000);
+    if (result.cancelled) return asrCancelledError();
+    if (!result.started || result.timedOut || result.exitCode != 0) {
+        return workerError(result.standardError + result.standardOutput);
     }
     return ConnectionTestResult{{ModelDescriptor{providerId_, providerId_, 0, true}}, QDateTime::currentDateTimeUtc()};
 }
@@ -78,6 +118,23 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
     if (!modelReady(modelDirectory_)) {
         return AppError(ErrorDomain::Asr, static_cast<int>(AsrErrorCode::ModelNotFound),
             QStringLiteral("本地模型未安装或权重不完整：%1").arg(modelDirectory_));
+    }
+    AnalysisCache cache;
+    const QFileInfo modelWeight(QDir(modelDirectory_).filePath(QStringLiteral("model.safetensors")));
+    const QJsonObject cacheParameters{
+        {QStringLiteral("chunkSeconds"), kAsrChunkDurationSeconds},
+        {QStringLiteral("overlapSeconds"), kAsrChunkOverlapSeconds},
+        {QStringLiteral("forcedAligner"), forcedAlignerDirectory_},
+        {QStringLiteral("modelBytes"), modelWeight.size()},
+        {QStringLiteral("modelModifiedMs"), modelWeight.lastModified().toMSecsSinceEpoch()}};
+    const std::variant<QString, AppError> cacheKeyResult = cache.keyFor(
+        request.mediaPath, providerId_ + QLatin1Char(':') + modelDirectory_,
+        QStringLiteral("Chinese"), cacheParameters, QStringLiteral("local-asr-v2"), request.cancel);
+    if (std::holds_alternative<AppError>(cacheKeyResult)) return std::get<AppError>(cacheKeyResult);
+    const QString cacheKey = std::get<QString>(cacheKeyResult);
+    if (const std::optional<QJsonObject> cached = cache.load(cacheKey)) {
+        Transcript transcript = transcriptFromResponse(*cached);
+        if (!transcript.words.isEmpty()) return transcript;
     }
     const ProbeResult probed = MediaProbe::probe(request.mediaPath);
     if (std::holds_alternative<AppError>(probed)) return std::get<AppError>(probed);
@@ -100,42 +157,49 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
                 QStringLiteral("无法准备本地 ASR 音频分块。"));
         }
         chunks.append(QJsonObject{{QStringLiteral("path"), path},
-            {QStringLiteral("startMs"), windows.at(index).startMs}});
+            {QStringLiteral("startMs"), windows.at(index).startMs},
+            {QStringLiteral("endMs"), windows.at(index).endMs}});
         if (request.progress) request.progress(index, windows.size());
     }
-    const QString requestPath = QDir(temporary.path()).filePath(QStringLiteral("request.json"));
-    QFile input(requestPath);
-    if (!input.open(QIODevice::WriteOnly)) return AppError(ErrorDomain::Asr,
-        static_cast<int>(AsrErrorCode::InvalidRequest), QStringLiteral("无法准备本地 ASR 请求。"));
-    input.write(QJsonDocument(QJsonObject{{QStringLiteral("provider"), providerId_},
+    const QString resultPath = QDir(temporary.path()).filePath(QStringLiteral("result.json"));
+    const QByteArray workerRequest = QJsonDocument(QJsonObject{
+        {QStringLiteral("taskId"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {QStringLiteral("action"), QStringLiteral("transcribe")},
+        {QStringLiteral("provider"), providerId_},
         {QStringLiteral("modelDirectory"), modelDirectory_},
         {QStringLiteral("forcedAlignerDirectory"), forcedAlignerDirectory_},
-        {QStringLiteral("chunks"), chunks}}).toJson(QJsonDocument::Compact));
-    input.close();
+        {QStringLiteral("resultPath"), resultPath},
+        {QStringLiteral("chunks"), chunks}}).toJson(QJsonDocument::Compact) + '\n';
     qCInfo(subcueAsrLog) << "[ASR] Provider:" << providerId_ << "[ASR] Loading model...";
-    QProcess process;
-    process.start(pythonExecutable_, {workerPath(), requestPath});
-    if (!process.waitForStarted(10'000)) return workerError(process.readAllStandardError());
-    while (!process.waitForFinished(200)) {
-        if (asrCancelled(request.cancel)) { process.kill(); process.waitForFinished(); return asrCancelledError(); }
+    QStringList arguments;
+    const QString program = workerProgram(pythonExecutable_, &arguments);
+    const InferenceProcessResult result = InferenceManager::instance().run(
+        program, arguments, workerRequest, request.cancel, -1,
+        [&request](const QByteArray &line) {
+            if (!request.progress) return;
+            const QJsonObject event = QJsonDocument::fromJson(line).object();
+            if (event.value(QStringLiteral("type")).toString() == QLatin1String("progress")) {
+                request.progress(event.value(QStringLiteral("completed")).toInt(),
+                    event.value(QStringLiteral("total")).toInt());
+            }
+        });
+    if (result.cancelled) return asrCancelledError();
+    if (!result.started || result.exitCode != 0) {
+        return workerError(result.standardError + result.standardOutput);
     }
-    if (process.exitCode() != 0) return workerError(process.readAllStandardError());
+    QFile output(resultPath);
+    if (!output.open(QIODevice::ReadOnly)) return workerError(result.standardOutput);
     QJsonParseError error;
-    const QJsonDocument response = QJsonDocument::fromJson(process.readAllStandardOutput(), &error);
-    if (error.error != QJsonParseError::NoError || !response.isObject()) return workerError(process.readAllStandardError());
-    Transcript transcript;
-    for (const QJsonValue &value : response.object().value(QStringLiteral("segments")).toArray()) {
-        const QJsonObject segment = value.toObject();
-        const QString text = segment.value(QStringLiteral("text")).toString().trimmed();
-        if (!text.isEmpty()) transcript.words.append({-1, text,
-            qRound64(segment.value(QStringLiteral("start")).toDouble() * 1000),
-            qRound64(segment.value(QStringLiteral("end")).toDouble() * 1000)});
+    const QJsonDocument response = QJsonDocument::fromJson(output.readAll(), &error);
+    if (error.error != QJsonParseError::NoError || !response.isObject()) {
+        return workerError(result.standardError + result.standardOutput);
     }
-    transcript.sortAndReindex();
+    Transcript transcript = transcriptFromResponse(response.object());
     if (request.progress) request.progress(windows.size(), windows.size());
     qCInfo(subcueAsrLog) << "[ASR] Model unload" << providerId_;
     if (transcript.words.isEmpty()) return AppError(ErrorDomain::Asr,
         static_cast<int>(AsrErrorCode::EmptyTranscript), QStringLiteral("本地 ASR 未返回带时间戳的结果。"));
+    (void)cache.store(cacheKey, response.object());
     return transcript;
 }
 

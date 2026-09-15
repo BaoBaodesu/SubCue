@@ -1,0 +1,19 @@
+---
+description: 防止 SubCue 的模型、构建缓存和发布包重复占用磁盘
+alwaysApply: true
+---
+
+# 项目体积与发布约束
+
+- `models/` 是受保护目录：不得删除、迁移、覆盖、重新下载或纳入通用清理；涉及模型时先记录文件数、总大小和 SHA-256，完成后逐文件复核。
+- CUDA 自包含发布必须保留实际依赖，包括 `cublas64_13.dll`、`cublasLt64_13.dll` 和 `cudart64_13.dll`；不得仅为缩小体积破坏离线运行能力。
+- 新增依赖、资源或发布文件前，先确认运行时确实引用；禁止把源码仓库、测试素材、CLI、Python 环境、探测产物或未使用的 Qt Quick Controls 风格复制进正式包。
+- 应用固定使用 `Basic` 风格；除非产品代码明确改用其他风格，否则不得恢复 Material、Fusion、Universal、Imagine、Fluent 或 Windows 风格资源。
+- VC Runtime DLL 已完整部署时，不得额外附带 `vc_redist.x64.exe`。
+- 构建、测试和打包不得长期保留同一发布包的 staging 与 `dist` 双份副本；复制和校验成功后清理 staging。
+- 临时探测目标、旧构建目录、根目录日志和失败下载残片必须放入已忽略的临时目录，并在任务结束时释放。
+- 修改 CMake、打包或依赖后，报告正式包大小；CUDA 发布包目标保持不超过 610 MiB，超限必须说明新增内容及必要性。
+- 清理只能使用 `tools/clean-workspace.ps1` 的预览优先流程；新增清理项必须解析绝对路径、限制在项目内并硬性排除 `models/`。
+- 删除 `.git/lfs/objects` 前必须执行 `git lfs ls-files --all`；存在任意历史引用时保留。不得删除 Git 可达对象或通过改写历史缩小仓库，除非用户明确授权。
+- 更新 `.gitignore` 时确保模型、日志、IDE 缓存、临时下载和重复构建产物不会触发 Git LFS clean 或进入版本控制。
+

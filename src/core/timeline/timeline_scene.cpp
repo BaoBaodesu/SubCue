@@ -70,6 +70,12 @@ TimelineSceneLayout TimelineSceneBuilder::build(
         visual.rect.y = cueY;
         visual.rect.width = std::max(2.0, viewport.xAtTime(cue.end) - visual.rect.x);
         visual.rect.height = cueHeight;
+        if (visual.selected) {
+            layout.selectedCueRange.x = visual.rect.x;
+            layout.selectedCueRange.y = layout.subtitleTrack.y;
+            layout.selectedCueRange.width = visual.rect.width;
+            layout.selectedCueRange.height = layout.subtitleTrack.height + layout.audioTrack.height;
+        }
         layout.cues.push_back(std::move(visual));
     }
 

@@ -412,6 +412,21 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
         geometry->appendChildNode(makeRect(toRect(layout.inOutRange), rangeColor_));
     }
 
+    if (layout.selectedCueRange.width > 0.0) {
+        geometry->appendChildNode(makeRect(toRect(layout.selectedCueRange), selectedCueRangeColor_));
+        const double left = layout.selectedCueRange.x;
+        const double right = left + layout.selectedCueRange.width;
+        const double top = layout.selectedCueRange.y;
+        const double bottom = top + layout.selectedCueRange.height;
+        QVector<QPointF> boundaries;
+        boundaries.reserve(4);
+        boundaries.append(QPointF(left, top));
+        boundaries.append(QPointF(left, bottom));
+        boundaries.append(QPointF(right, top));
+        boundaries.append(QPointF(right, bottom));
+        geometry->appendChildNode(makeLines(boundaries, selectedCueBoundaryColor_));
+    }
+
     if (layout.subtitleTrack.height > 0.0) {
         geometry->appendChildNode(
             makeRect(QRectF(0.0, layout.subtitleTrack.y, viewWidth, 1.0), trackDividerColor_));

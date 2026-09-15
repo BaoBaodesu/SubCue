@@ -14,6 +14,7 @@
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QJsonObject>
 #include <QtCore/QPointer>
+#include <QtCore/QThreadPool>
 #include <QtCore/QTimer>
 #include <QtCore/QUrl>
 #include <QtCore/QVariant>
@@ -270,6 +271,8 @@ private:
     std::thread alignmentThread_;
     std::atomic<bool> alignmentCancel_{false};
     std::atomic<quint64> alignmentGeneration_{0};
+    QThreadPool backgroundTasks_;
+    std::atomic<bool> backgroundCancel_{false};
     IAsrService *asrOverride_ = nullptr;
     IAiProvider *aiOverride_ = nullptr;
     MediaInfo mediaInfo_;
@@ -295,6 +298,7 @@ private:
     AlignmentProgressState alignmentState_;
     bool canExport_ = false;
     bool hasVideo_ = false;
+    bool shuttingDown_ = false;
 };
 
 } // namespace subcue

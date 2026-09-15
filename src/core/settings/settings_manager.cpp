@@ -58,7 +58,7 @@ QJsonObject SettingsManager::defaults()
          QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("qwen3-forced-aligner-0.6b"))},
         {QStringLiteral("funAsrModelsDirectory"),
          QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("fun-asr-nano-2512"))},
-        {QStringLiteral("localAsrPython"), QStringLiteral("python")},
+        {QStringLiteral("localAsrPython"), QString::fromUtf8(SUBCUE_PROJECT_INFERENCE_PYTHON)},
         {QStringLiteral("region"), QStringLiteral("beijing")},
         {QStringLiteral("asrApiHost"), QString()},
         {QStringLiteral("ffmpegPath"), QString()},

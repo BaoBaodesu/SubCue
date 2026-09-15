@@ -2,13 +2,15 @@
 # Invoked as: cmake -D... -P cmake/PackageWindows.cmake
 #
 # Required -D variables:
-#   SUBCUE_EXE, SUBCUE_SOURCE_DIR, SUBCUE_PACKAGE_DIR, QT_BIN_DIR,
+#   SUBCUE_EXE, SUBCUE_INFERENCE_EXE, SUBCUE_PYTHON_ROOT,
+#   SUBCUE_INFERENCE_SITE_PACKAGES, SUBCUE_SOURCE_DIR, SUBCUE_PACKAGE_DIR, QT_BIN_DIR,
 #   FFMPEG_BIN_DIR, FFMPEG_SHARE_DIR, SUBCUE_BUILD_TYPE
 
 cmake_minimum_required(VERSION 3.28)
 
 foreach(_var IN ITEMS
-    SUBCUE_EXE SUBCUE_SOURCE_DIR SUBCUE_PACKAGE_DIR QT_BIN_DIR
+    SUBCUE_EXE SUBCUE_INFERENCE_EXE SUBCUE_PYTHON_ROOT SUBCUE_INFERENCE_SITE_PACKAGES
+    SUBCUE_SOURCE_DIR SUBCUE_PACKAGE_DIR QT_BIN_DIR
     FFMPEG_BIN_DIR FFMPEG_SHARE_DIR SUBCUE_BUILD_TYPE)
     if(NOT ${_var})
         message(FATAL_ERROR "PackageWindows.cmake missing ${_var}")
@@ -34,7 +36,31 @@ set(_qt_plugins "${_qt_prefix}/plugins")
 file(REMOVE_RECURSE "${SUBCUE_PACKAGE_DIR}")
 file(MAKE_DIRECTORY "${SUBCUE_PACKAGE_DIR}")
 file(COPY "${SUBCUE_EXE}" DESTINATION "${SUBCUE_PACKAGE_DIR}")
-file(COPY "${SUBCUE_SOURCE_DIR}/tools/asr_python_worker.py" DESTINATION "${SUBCUE_PACKAGE_DIR}")
+set(_inference_dir "${SUBCUE_PACKAGE_DIR}/inference")
+set(_inference_runtime "${_inference_dir}/runtime")
+file(MAKE_DIRECTORY "${_inference_runtime}/Lib")
+file(COPY "${SUBCUE_INFERENCE_EXE}" DESTINATION "${_inference_dir}")
+file(COPY "${SUBCUE_SOURCE_DIR}/tools/asr_python_worker.py" DESTINATION "${_inference_dir}")
+file(COPY "${SUBCUE_PYTHON_ROOT}/python311.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
+    DESTINATION "${_inference_dir}")
+file(COPY "${SUBCUE_PYTHON_ROOT}/python311.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
+    DESTINATION "${_inference_runtime}")
+file(COPY "${SUBCUE_PYTHON_ROOT}/DLLs" DESTINATION "${_inference_runtime}")
+foreach(_runtime_dll IN ITEMS vcruntime140.dll vcruntime140_1.dll)
+    if(EXISTS "${SUBCUE_PYTHON_ROOT}/${_runtime_dll}")
+        file(COPY "${SUBCUE_PYTHON_ROOT}/${_runtime_dll}" DESTINATION "${_inference_dir}")
+    endif()
+endforeach()
+file(COPY "${SUBCUE_PYTHON_ROOT}/Lib/" DESTINATION "${_inference_runtime}/Lib"
+    PATTERN "site-packages" EXCLUDE PATTERN "venv" EXCLUDE
+    PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE
+    PATTERN "ensurepip" EXCLUDE PATTERN "idlelib" EXCLUDE
+    PATTERN "lib2to3" EXCLUDE PATTERN "turtledemo" EXCLUDE)
+file(COPY "${SUBCUE_INFERENCE_SITE_PACKAGES}/" DESTINATION "${_inference_runtime}/Lib/site-packages"
+    PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE PATTERN "tests" EXCLUDE
+    PATTERN "test" EXCLUDE)
+# Torch C++ 头文件只供扩展编译使用，推理运行时无需携带。
+file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/torch/include")
 
 set(_system_root "$ENV{SystemRoot}")
 if(NOT _system_root)
@@ -74,6 +100,26 @@ if(NOT _windeploy_result EQUAL 0)
     message(FATAL_ERROR
         "windeployqt failed (${_windeploy_result})\n${_windeploy_out}\n${_windeploy_err}")
 endif()
+
+# 应用启动时固定使用 Basic 风格，删除 windeployqt 额外收集的其他控件主题。
+foreach(_style IN ITEMS FluentWinUI3 Fusion Imagine Material Universal Windows)
+    file(REMOVE_RECURSE "${SUBCUE_PACKAGE_DIR}/qml/QtQuick/Controls/${_style}")
+endforeach()
+foreach(_style_dll IN ITEMS
+    Qt6QuickControls2FluentWinUI3StyleImpl.dll
+    Qt6QuickControls2Fusion.dll
+    Qt6QuickControls2FusionStyleImpl.dll
+    Qt6QuickControls2Imagine.dll
+    Qt6QuickControls2ImagineStyleImpl.dll
+    Qt6QuickControls2Material.dll
+    Qt6QuickControls2MaterialStyleImpl.dll
+    Qt6QuickControls2Universal.dll
+    Qt6QuickControls2UniversalStyleImpl.dll)
+    file(REMOVE "${SUBCUE_PACKAGE_DIR}/${_style_dll}")
+endforeach()
+
+# 已部署具体 VC Runtime DLL，无需再重复携带完整安装器。
+file(REMOVE "${SUBCUE_PACKAGE_DIR}/vc_redist.x64.exe")
 
 set(_ffmpeg_runtime
     avcodec-63.dll
@@ -132,6 +178,12 @@ if(EXISTS "${SUBCUE_PACKAGE_DIR}/plugins/tls")
     set(_tls_dest "${SUBCUE_PACKAGE_DIR}/plugins/tls")
 endif()
 _subcue_copy_config_plugins("${_qt_plugins}/tls" "${_tls_dest}")
+
+set(_sql_dest "${SUBCUE_PACKAGE_DIR}/sqldrivers")
+if(EXISTS "${SUBCUE_PACKAGE_DIR}/plugins/sqldrivers")
+    set(_sql_dest "${SUBCUE_PACKAGE_DIR}/plugins/sqldrivers")
+endif()
+_subcue_copy_config_plugins("${_qt_plugins}/sqldrivers" "${_sql_dest}")
 
 set(_license_dir "${SUBCUE_PACKAGE_DIR}/licenses")
 file(MAKE_DIRECTORY "${_license_dir}")
@@ -201,13 +253,15 @@ set(_forbidden_hits "")
 foreach(_path IN LISTS _package_files)
     get_filename_component(_name "${_path}" NAME)
     string(TOLOWER "${_name}" _lower)
-    if(_lower MATCHES "^python"
+    file(RELATIVE_PATH _relative "${SUBCUE_PACKAGE_DIR}" "${_path}")
+    string(REPLACE "\\" "/" _relative "${_relative}")
+    if((_lower MATCHES "^python" AND NOT _relative MATCHES "^inference/")
         OR _lower STREQUAL "python.exe"
-        OR _lower MATCHES "avdevice"
+        OR (_lower MATCHES "avdevice" AND NOT _relative MATCHES "^inference/")
         OR _lower STREQUAL "ffmpeg.exe"
         OR _lower STREQUAL "ffprobe.exe"
         OR _lower STREQUAL "ffplay.exe"
-        OR _lower MATCHES "^avfilter"
+        OR (_lower MATCHES "^avfilter" AND NOT _relative MATCHES "^inference/")
         OR _lower MATCHES "pyside")
         string(APPEND _forbidden_hits "${_path}\n")
     endif()
@@ -218,6 +272,10 @@ endif()
 
 set(_required
     "${SUBCUE_PACKAGE_DIR}/SubCue.exe"
+    "${SUBCUE_PACKAGE_DIR}/inference/SubCueInference.exe"
+    "${SUBCUE_PACKAGE_DIR}/inference/python311.dll"
+    "${SUBCUE_PACKAGE_DIR}/inference/runtime/python311.dll"
+    "${SUBCUE_PACKAGE_DIR}/inference/asr_python_worker.py"
     "${SUBCUE_PACKAGE_DIR}/avcodec-63.dll"
     "${SUBCUE_PACKAGE_DIR}/avformat-63.dll"
     "${SUBCUE_PACKAGE_DIR}/avutil-61.dll"
@@ -255,6 +313,20 @@ foreach(_platform IN ITEMS
 endforeach()
 if(NOT _platform_ok)
     message(FATAL_ERROR "Package missing qwindows platform plugin")
+endif()
+
+set(_sqlite_ok FALSE)
+foreach(_sqlite IN ITEMS
+    "${SUBCUE_PACKAGE_DIR}/sqldrivers/qsqlite.dll"
+    "${SUBCUE_PACKAGE_DIR}/sqldrivers/qsqlited.dll"
+    "${SUBCUE_PACKAGE_DIR}/plugins/sqldrivers/qsqlite.dll"
+    "${SUBCUE_PACKAGE_DIR}/plugins/sqldrivers/qsqlited.dll")
+    if(EXISTS "${_sqlite}")
+        set(_sqlite_ok TRUE)
+    endif()
+endforeach()
+if(NOT _sqlite_ok)
+    message(FATAL_ERROR "Package missing QSQLITE driver plugin")
 endif()
 
 set(_manifest "")

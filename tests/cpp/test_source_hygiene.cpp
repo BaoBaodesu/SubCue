@@ -166,6 +166,7 @@ private slots:
     void goldenFixturesAndGeneratorRemain();
     void qmlKeepsFrozenShortcutMatrix();
     void nativeSourcesDoNotLaunchPythonRuntime();
+    void controllerDoesNotDetachBackgroundThreads();
     void applicationDoesNotImportPython();
 
 private:
@@ -212,7 +213,6 @@ void SourceHygieneTests::pythonRuntimePathsAreGone()
     QVERIFY(!QDir(sourcePath(QStringLiteral("services"))).exists());
     QVERIFY(!QDir(sourcePath(QStringLiteral("utils"))).exists());
     QVERIFY(!QDir(sourcePath(QStringLiteral("core"))).exists());
-    QVERIFY(!QDir(sourcePath(QStringLiteral("models"))).exists());
 }
 
 void SourceHygieneTests::goldenFixturesAndGeneratorRemain()
@@ -298,7 +298,18 @@ void SourceHygieneTests::nativeSourcesDoNotLaunchPythonRuntime()
             const QString text = QString::fromUtf8(file.readAll());
             for (const QString &token : forbidden) {
                 if (text.contains(token, Qt::CaseSensitive)) {
-                    hits.append(QStringLiteral("%1: %2").arg(sourceRoot.relativeFilePath(path), token));
+                    const QString relative = sourceRoot.relativeFilePath(path);
+                    if (relative.startsWith(QLatin1String("src/inference/"))
+                        && token == QLatin1String("python311.dll")) {
+                        continue;
+                    }
+                    if (relative == QLatin1String("CMakeLists.txt")
+                        && (token == QLatin1String("python.exe")
+                            || token == QLatin1String("python311.dll"))
+                        && text.contains(QStringLiteral("SUBCUE_PROJECT_INFERENCE_PYTHON"))) {
+                        continue;
+                    }
+                    hits.append(QStringLiteral("%1: %2").arg(relative, token));
                 }
             }
         }
@@ -329,6 +340,14 @@ void SourceHygieneTests::applicationDoesNotImportPython()
     }
 #endif
 #endif
+}
+
+void SourceHygieneTests::controllerDoesNotDetachBackgroundThreads()
+{
+    const QString controller = readText(QStringLiteral("src/app/app_controller.cpp"));
+    QVERIFY(!controller.isEmpty());
+    QVERIFY(!controller.contains(QStringLiteral(".detach()")));
+    QVERIFY(controller.contains(QStringLiteral("backgroundTasks_.waitForDone()")));
 }
 
 QTEST_MAIN(SourceHygieneTests)

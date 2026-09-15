@@ -54,6 +54,7 @@ private slots:
     void splitAtPlayheadAndUndo();
     void joinAroundPlayheadUsesSingleUndo();
     void sceneLayoutContainsOnlyVisibleCues();
+    void sceneLayoutProjectsSelectedCueToAudioTrack();
     void sceneLayoutWaveformMatchesViewportWidth();
     void shortWaveformDoesNotStretchPastMedia();
     void sceneLayoutOmitsWaveformWithoutData();
@@ -499,6 +500,25 @@ void TimelineTests::sceneLayoutContainsOnlyVisibleCues()
     QVERIFY(layout.playheadVisible);
     QVERIFY(!layout.ticks.isEmpty());
     QCOMPARE(layout.audioTrack.y, metrics.rulerHeight + metrics.subtitleTrackHeight);
+}
+
+void TimelineTests::sceneLayoutProjectsSelectedCueToAudioTrack()
+{
+    TimelineViewport viewport;
+    viewport.setDuration(MediaTime::fromMilliseconds(10'000));
+    viewport.setPixelsPerMs(0.1);
+    const QList<Subtitle> cues{makeCue(QStringLiteral("selected"), 1'200, 1'800)};
+    TimelineSceneMetrics metrics;
+    metrics.viewportWidth = 300.0;
+    metrics.viewportHeight = 180.0;
+
+    const TimelineSceneLayout layout = TimelineSceneBuilder::build(
+        viewport, cues, nullptr, metrics, QStringLiteral("selected"));
+    QCOMPARE(layout.cues.size(), 1);
+    QCOMPARE(layout.selectedCueRange.x, layout.cues.front().rect.x);
+    QCOMPARE(layout.selectedCueRange.width, layout.cues.front().rect.width);
+    QCOMPARE(layout.selectedCueRange.y, layout.subtitleTrack.y);
+    QCOMPARE(layout.selectedCueRange.height, layout.subtitleTrack.height + layout.audioTrack.height);
 }
 
 void TimelineTests::sceneLayoutWaveformMatchesViewportWidth()

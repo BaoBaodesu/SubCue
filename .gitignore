@@ -14,12 +14,24 @@ build/
 # 本地 IDE 与工具缓存
 .idea/
 .vscode/
+.vs/
 compile_commands.json
 
 # golden 再生脚本的 Python 缓存
 __pycache__/
 *.py[cod]
+.venv-inference/
+.uv-cache/
 
 # 测试运行期临时目录
 .test_appdata/
 .test_tmp/
+
+# 本地模型与运行期数据（模型只保存在工作区，不参与清理或提交）
+models/
+logs/
+/settings.json
+/credentials.dat
+/*.log
+/*.err
+/$log

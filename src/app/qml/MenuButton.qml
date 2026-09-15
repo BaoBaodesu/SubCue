@@ -17,6 +17,7 @@ ToolButton {
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
         color: !control.enabled ? Theme.disabledText
+             : control.highlighted ? Theme.accentText
              : (control.hovered || control.down) ? Theme.menuButtonTextHover
              : Theme.menuButtonText
     }
@@ -24,7 +25,19 @@ ToolButton {
     background: Rectangle {
         radius: Theme.radiusButton
         color: control.down ? Theme.menuButtonPressed
+             : control.highlighted ? Theme.selection
              : control.hovered ? Theme.menuButtonHover
              : "transparent"
+        border.width: control.highlighted ? 1 : 0
+        border.color: control.highlighted ? Theme.focusBorder : "transparent"
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: 2
+            color: Theme.accent
+            visible: control.highlighted
+        }
     }
 }

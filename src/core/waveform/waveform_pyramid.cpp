@@ -39,11 +39,8 @@ WaveformPeak combinePeaks(const QVector<WaveformPeak> &peaks, qsizetype begin, q
 
 WaveformPyramid WaveformPyramid::fromMonoFloat(const float *samples, qsizetype count, int sampleRate)
 {
-    WaveformPyramid pyramid;
-    pyramid.sampleRate_ = sampleRate;
-    pyramid.sampleCount_ = count;
     if (!samples || count <= 0 || sampleRate <= 0) {
-        return pyramid;
+        return {};
     }
 
     WaveformLevel level;
@@ -54,6 +51,24 @@ WaveformPyramid WaveformPyramid::fromMonoFloat(const float *samples, qsizetype c
         const qsizetype end = count - sample < kBaseSamplesPerPeak ? count : sample + kBaseSamplesPerPeak;
         level.peaks.push_back(minMaxRange(samples, sample, end));
     }
+    return fromBasePeaks(std::move(level.peaks), count, sampleRate);
+}
+
+WaveformPyramid WaveformPyramid::fromBasePeaks(
+    QVector<WaveformPeak> peaks,
+    qint64 sampleCount,
+    int sampleRate)
+{
+    WaveformPyramid pyramid;
+    pyramid.sampleRate_ = sampleRate;
+    pyramid.sampleCount_ = sampleCount;
+    if (peaks.isEmpty() || sampleCount <= 0 || sampleRate <= 0) {
+        return pyramid;
+    }
+
+    WaveformLevel level;
+    level.samplesPerPeak = kBaseSamplesPerPeak;
+    level.peaks = std::move(peaks);
     pyramid.levels_.push_back(std::move(level));
 
     while (pyramid.levels_.back().peaks.size() > 1) {

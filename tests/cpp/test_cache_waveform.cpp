@@ -1,3 +1,4 @@
+#include "cache/analysis_cache.h"
 #include "cache/cache_key.h"
 #include "cache/lru_cache.h"
 #include "cache/preview_cache.h"
@@ -29,9 +30,11 @@ class CacheWaveformTests final : public QObject {
 private slots:
     void cacheKeyIncludesCanonicalPathSizeMtimeStreamAndChunkHashes();
     void cacheKeyChangesWhenContentOrStreamChanges();
+    void analysisCacheHashesCompleteMediaAndStoresResult();
     void lruEvictsLeastRecentlyUsedAcrossKinds();
     void pyramidLevelsAreSixteenTimesFour();
     void pyramidPeaksMatchSourceMinMax();
+    void basePeaksBuildSamePyramidAsSamples();
     void pyramidSelectsCoarserLevelForWideViewport();
     void generatorBuildsMonoPyramidFromAudio();
     void generatorCancelDoesNotProducePyramid();
@@ -111,6 +114,40 @@ void CacheWaveformTests::cacheKeyChangesWhenContentOrStreamChanges()
     QVERIFY(firstKey.id() != secondKey.id());
     QVERIFY(firstKey.id() != otherStream.id());
     QCOMPARE(otherStream.streamIndex, 1);
+}
+
+void CacheWaveformTests::analysisCacheHashesCompleteMediaAndStoresResult()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QByteArray firstPayload(3 * 1024 * 1024, 'A');
+    QByteArray secondPayload = firstPayload;
+    secondPayload[secondPayload.size() / 2] = 'B';
+    const QString firstPath = dir.filePath(QStringLiteral("first.wav"));
+    const QString secondPath = dir.filePath(QStringLiteral("second.wav"));
+    QFile first(firstPath);
+    QFile second(secondPath);
+    QVERIFY(first.open(QIODevice::WriteOnly));
+    QVERIFY(second.open(QIODevice::WriteOnly));
+    QCOMPARE(first.write(firstPayload), firstPayload.size());
+    QCOMPARE(second.write(secondPayload), secondPayload.size());
+    first.close();
+    second.close();
+
+    AnalysisCache cache(dir.filePath(QStringLiteral("cache")));
+    const auto firstKey = cache.keyFor(firstPath, QStringLiteral("qwen3:0.6b"),
+        QStringLiteral("Chinese"), QJsonObject{}, QStringLiteral("v1"));
+    const auto secondKey = cache.keyFor(secondPath, QStringLiteral("qwen3:0.6b"),
+        QStringLiteral("Chinese"), QJsonObject{}, QStringLiteral("v1"));
+    QVERIFY(std::holds_alternative<QString>(firstKey));
+    QVERIFY(std::holds_alternative<QString>(secondKey));
+    QVERIFY(std::get<QString>(firstKey) != std::get<QString>(secondKey));
+
+    const QJsonObject result{{QStringLiteral("text"), QStringLiteral("测试")}};
+    QVERIFY(cache.store(std::get<QString>(firstKey), result));
+    QVERIFY(cache.load(std::get<QString>(firstKey)).has_value());
+    QCOMPARE(cache.load(std::get<QString>(firstKey))->value(QStringLiteral("text")).toString(),
+        QStringLiteral("测试"));
 }
 
 void CacheWaveformTests::lruEvictsLeastRecentlyUsedAcrossKinds()
@@ -195,6 +232,29 @@ void CacheWaveformTests::pyramidPeaksMatchSourceMinMax()
     QCOMPARE(pyramid.levels()[1].samplesPerPeak, 64);
     QCOMPARE(pyramid.levels()[1].peaks[0].min, -1.0f);
     QCOMPARE(pyramid.levels()[1].peaks[0].max, 1.0f);
+}
+
+void CacheWaveformTests::basePeaksBuildSamePyramidAsSamples()
+{
+    QVector<float> samples(70);
+    for (int index = 0; index < samples.size(); ++index) {
+        samples[index] = static_cast<float>((index % 13) - 6) / 6.0f;
+    }
+    const WaveformPyramid expected = WaveformPyramid::fromMonoFloat(
+        samples.constData(), samples.size(), 8'000);
+    const WaveformPyramid actual = WaveformPyramid::fromBasePeaks(
+        expected.levels().first().peaks, samples.size(), 8'000);
+
+    QCOMPARE(actual.sampleCount(), expected.sampleCount());
+    QCOMPARE(actual.levels().size(), expected.levels().size());
+    for (int level = 0; level < expected.levels().size(); ++level) {
+        QCOMPARE(actual.levels()[level].samplesPerPeak, expected.levels()[level].samplesPerPeak);
+        QCOMPARE(actual.levels()[level].peaks.size(), expected.levels()[level].peaks.size());
+        for (int peak = 0; peak < expected.levels()[level].peaks.size(); ++peak) {
+            QCOMPARE(actual.levels()[level].peaks[peak].min, expected.levels()[level].peaks[peak].min);
+            QCOMPARE(actual.levels()[level].peaks[peak].max, expected.levels()[level].peaks[peak].max);
+        }
+    }
 }
 
 void CacheWaveformTests::pyramidSelectsCoarserLevelForWideViewport()

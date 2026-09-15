@@ -181,12 +181,14 @@ void PlaybackTests::frameStepperUsesGopAndHistoryRing()
     QVERIFY(stepper.index().size() >= 3);
     QCOMPARE(stepper.currentIndex(), 0);
     QVERIFY(stepper.gopSize() >= 1);
+    QVERIFY(stepper.cachedBytes() <= FrameStepper::kMaximumCacheBytes);
 
     const MediaTime first = stepper.currentPts();
     QVERIFY(stepper.stepForward(&error));
     QVERIFY(stepper.historySize() >= 1);
     QVERIFY(stepper.currentPts() > first);
     QVERIFY(stepper.gopSize() >= 1);
+    QVERIFY(stepper.cachedBytes() <= FrameStepper::kMaximumCacheBytes);
 
     const MediaTime second = stepper.currentPts();
     QVERIFY(stepper.stepForward(&error));
@@ -194,6 +196,7 @@ void PlaybackTests::frameStepperUsesGopAndHistoryRing()
     QCOMPARE(stepper.currentPts().microseconds(), second.microseconds());
     QVERIFY(stepper.stepBackward(&error));
     QCOMPARE(stepper.currentPts().microseconds(), first.microseconds());
+    QVERIFY(stepper.cachedBytes() <= FrameStepper::kMaximumCacheBytes);
 }
 
 void PlaybackTests::hwAccelFallbackOrderAndSoftwareDecode()

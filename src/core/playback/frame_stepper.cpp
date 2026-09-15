@@ -41,6 +41,8 @@ void FrameStepper::close()
     index_.clear();
     gop_.clear();
     history_.clear();
+    gopBytes_ = 0;
+    historyBytes_ = 0;
     current_ = {};
     gopStartIndex_ = -1;
     videoStreamIndex_ = -1;
@@ -56,6 +58,7 @@ bool FrameStepper::seekTo(MediaTime pts, AppError *error)
         return false;
     }
     history_.clear();
+    historyBytes_ = 0;
     return showIndex(index_.findIndexAtOrAfter(pts), error);
 }
 
@@ -76,6 +79,7 @@ bool FrameStepper::stepBackward(AppError *error)
     const int previous = current_.index - 1;
     if (!history_.empty() && history_.back().index == previous) {
         current_ = history_.back();
+        historyBytes_ -= history_.back().image.sizeInBytes();
         history_.pop_back();
         return true;
     }
@@ -99,12 +103,17 @@ bool FrameStepper::decodeGopUntil(int targetIndex, AppError *error)
         }
     }
 
-    if (!demuxer_.seek(videoStreamIndex_, index_.at(key).seekTimestamp, error)) {
-        return false;
+    const bool continueCurrentGop = gopStartIndex_ == key && !gop_.isEmpty()
+        && targetIndex > gop_.constLast().index;
+    if (!continueCurrentGop) {
+        if (!demuxer_.seek(videoStreamIndex_, index_.at(key).seekTimestamp, error)) {
+            return false;
+        }
+        decoder_.flush();
+        gop_.clear();
+        gopBytes_ = 0;
+        gopStartIndex_ = key;
     }
-    decoder_.flush();
-    gop_.clear();
-    gopStartIndex_ = key;
 
     FramePtr frame = makeFrame();
     if (!frame) {
@@ -115,13 +124,14 @@ bool FrameStepper::decodeGopUntil(int targetIndex, AppError *error)
     }
 
     const MediaTime targetPts = index_.at(targetIndex).pts;
+    int decodedIndex = continueCurrentGop ? gop_.constLast().index + 1 : key;
     while (gop_.isEmpty() || gop_.constLast().index < targetIndex) {
         if (!decoder_.pullFrame(demuxer_, videoStreamIndex_, frame.get(), error)) {
             break;
         }
         SteppedFrame stepped;
         stepped.pts = mediaTimeFromTimestamp(frame->best_effort_timestamp, timeBase_);
-        stepped.index = gopStartIndex_ + gop_.size();
+        stepped.index = decodedIndex++;
         for (int index = gopStartIndex_; index < index_.size(); ++index) {
             if (qAbs(index_.at(index).pts.microseconds() - stepped.pts.microseconds()) <= 1'000) {
                 stepped.index = index;
@@ -133,7 +143,9 @@ bool FrameStepper::decodeGopUntil(int targetIndex, AppError *error)
         if (stepped.image.isNull()) {
             return false;
         }
+        gopBytes_ += stepped.image.sizeInBytes();
         gop_.push_back(std::move(stepped));
+        trimCache();
         if (gop_.constLast().pts.microseconds() >= targetPts.microseconds()
             && gop_.constLast().index >= targetIndex) {
             break;
@@ -160,8 +172,23 @@ void FrameStepper::rememberCurrent()
         return;
     }
     history_.push_back(current_);
+    historyBytes_ += current_.image.sizeInBytes();
     while (static_cast<int>(history_.size()) > kHistoryRingSize) {
+        historyBytes_ -= history_.front().image.sizeInBytes();
         history_.pop_front();
+    }
+    trimCache();
+}
+
+void FrameStepper::trimCache()
+{
+    while (!history_.empty() && cachedBytes() > kMaximumCacheBytes) {
+        historyBytes_ -= history_.front().image.sizeInBytes();
+        history_.pop_front();
+    }
+    while (gop_.size() > 1 && cachedBytes() > kMaximumCacheBytes) {
+        gopBytes_ -= gop_.front().image.sizeInBytes();
+        gop_.removeFirst();
     }
 }
 

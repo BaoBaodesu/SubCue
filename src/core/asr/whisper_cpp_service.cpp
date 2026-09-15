@@ -4,6 +4,7 @@
 #include "asr/audio_chunk_plan.h"
 #include "asr/whisper_model_catalog.h"
 #include "common/logging.h"
+#include "inference/inference_manager.h"
 
 #include <QtCore/QDir>
 #include "media/media_probe.h"
@@ -107,6 +108,7 @@ AsrResult WhisperCppService::transcribePcm(
     const std::atomic<bool> *cancel,
     const std::function<void(int)> &progress)
 {
+    const InferenceManager::Lease lease = InferenceManager::instance().acquire();
     if (asrCancelled(cancel)) {
         return asrCancelledError();
     }
@@ -156,6 +158,7 @@ AsrResult WhisperCppService::transcribePreparedChunks(
 
 AsrResult WhisperCppService::transcribe(const AsrRequest &request)
 {
+    const InferenceManager::Lease lease = InferenceManager::instance().acquire();
     if (asrCancelled(request.cancel)) {
         return asrCancelledError();
     }

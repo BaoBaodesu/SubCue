@@ -95,7 +95,12 @@ namespace {
 
 [[nodiscard]] QString packageDir()
 {
-    return QString::fromUtf8(SUBCUE_PACKAGE_DIR);
+    const QString staging = QString::fromUtf8(SUBCUE_PACKAGE_DIR);
+    if (QDir(staging).exists()) {
+        return staging;
+    }
+    return QDir(QString::fromUtf8(SUBCUE_SOURCE_DIR)).filePath(
+        QStringLiteral("dist/windows-x64-cuda"));
 }
 
 [[nodiscard]] QString packageFile(const QString &relative)
@@ -129,7 +134,8 @@ class PackagingTests final : public QObject {
 
 private slots:
     void packageLayoutContainsRuntime();
-    void packageExcludesPythonAndCliTools();
+    void packageContainsOnlyBasicQuickControlsStyle();
+    void packageRestrictsPythonAndCliTools();
     void packageShipsThirdPartyLicenses();
     void aboutWindowDocumentsFfmpegLgpl();
     void packagedBinaryImportsAreClean();
@@ -143,6 +149,7 @@ void PackagingTests::packageLayoutContainsRuntime()
     QVERIFY(packageHasAny({QStringLiteral("Qt6Core.dll"), QStringLiteral("Qt6Cored.dll")}));
     QVERIFY(packageHasAny({QStringLiteral("Qt6Quick.dll"), QStringLiteral("Qt6Quickd.dll")}));
     QVERIFY(packageHasAny({QStringLiteral("Qt6Network.dll"), QStringLiteral("Qt6Networkd.dll")}));
+    QVERIFY(packageHasAny({QStringLiteral("Qt6Sql.dll"), QStringLiteral("Qt6Sqld.dll")}));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("avcodec-63.dll"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("avformat-63.dll"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("avutil-61.dll"))));
@@ -155,6 +162,12 @@ void PackagingTests::packageLayoutContainsRuntime()
         QStringLiteral("VCRUNTIME140D.dll"),
     }));
     QVERIFY(packageHasAny({
+        QStringLiteral("sqldrivers/qsqlite.dll"),
+        QStringLiteral("sqldrivers/qsqlited.dll"),
+        QStringLiteral("plugins/sqldrivers/qsqlite.dll"),
+        QStringLiteral("plugins/sqldrivers/qsqlited.dll"),
+    }));
+    QVERIFY(packageHasAny({
         QStringLiteral("platforms/qwindows.dll"),
         QStringLiteral("platforms/qwindowsd.dll"),
         QStringLiteral("plugins/platforms/qwindows.dll"),
@@ -162,19 +175,37 @@ void PackagingTests::packageLayoutContainsRuntime()
     }));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package.stamp"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-manifest.txt"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/SubCueInference.exe"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/python311.dll"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/runtime/python311.dll"))));
 }
 
-void PackagingTests::packageExcludesPythonAndCliTools()
+void PackagingTests::packageContainsOnlyBasicQuickControlsStyle()
+{
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("Qt6QuickControls2Basic.dll"))));
+    QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("vc_redist.x64.exe"))));
+    const QStringList unusedStyles = {
+        QStringLiteral("FluentWinUI3"), QStringLiteral("Fusion"),
+        QStringLiteral("Imagine"), QStringLiteral("Material"),
+        QStringLiteral("Universal"), QStringLiteral("Windows")};
+    for (const QString &style : unusedStyles) {
+        QVERIFY2(!QDir(packageFile(QStringLiteral("qml/QtQuick/Controls/%1").arg(style))).exists(),
+            qPrintable(style));
+    }
+}
+
+void PackagingTests::packageRestrictsPythonAndCliTools()
 {
     QDirIterator iterator(packageDir(), QDir::Files, QDirIterator::Subdirectories);
     QStringList hits;
     while (iterator.hasNext()) {
         const QString path = iterator.next();
         const QString name = QFileInfo(path).fileName().toLower();
-        if (name.startsWith(QLatin1String("python"))
-            || name.contains(QLatin1String("avdevice"))
+        const QString relative = QDir::fromNativeSeparators(QDir(packageDir()).relativeFilePath(path));
+        if ((name.startsWith(QLatin1String("python")) && !relative.startsWith(QLatin1String("inference/")))
+            || (name.contains(QLatin1String("avdevice")) && !relative.startsWith(QLatin1String("inference/")))
             || name.contains(QLatin1String("pyside"))
-            || name == QLatin1String("avfilter-12.dll")
+            || (name == QLatin1String("avfilter-12.dll") && !relative.startsWith(QLatin1String("inference/")))
             || name == QLatin1String("ffmpeg.exe")
             || name == QLatin1String("ffprobe.exe")
             || name == QLatin1String("ffplay.exe")) {

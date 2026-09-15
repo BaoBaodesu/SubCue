@@ -32,4 +32,4 @@ Release 便携目录（`dist/windows-x64`）实际带上：
 - MSVC x64 CRT DLL（`vcruntime140.dll` 等）以及 windeployqt 放入的 `vc_redist.x64.exe`。
 - `licenses/NOTICE.txt` 与本文件副本。
 
-未随包：Python、whisper.cpp 核心库、RapidFuzz 库（对齐用 in-tree 实现）、Whisper 模型文件。About 对话框指向上述许可证目录。
+专用 `inference/` 目录随包包含 Python 与 PyTorch 推理运行库，主程序不加载这些库。模型文件、RapidFuzz 库（对齐用 in-tree 实现）不随包复制。About 对话框指向上述许可证目录。

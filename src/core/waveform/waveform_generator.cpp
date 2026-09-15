@@ -7,6 +7,8 @@
 #include "media/ffmpeg_error.h"
 #include "media/ffmpeg_time.h"
 
+#include <algorithm>
+#include <array>
 #include <utility>
 
 namespace subcue {
@@ -32,10 +34,13 @@ AppError staleError()
     return AppError(ErrorDomain::Media, AVERROR(ECANCELED), QStringLiteral("波形生成已被更新的请求替换"));
 }
 
-bool appendConverted(
+bool appendConvertedPeaks(
     AudioResampler &resampler,
     AVFrame &frame,
-    QVector<float> &samples,
+    QVector<WaveformPeak> &peaks,
+    std::array<float, WaveformPyramid::kBaseSamplesPerPeak> &pending,
+    int &pendingCount,
+    qint64 &sampleCount,
     AppError *error)
 {
     QVector<float> converted = resampler.convert(frame, error);
@@ -43,7 +48,15 @@ bool appendConverted(
     if (converted.isEmpty()) {
         return false;
     }
-    samples.append(converted.constBegin(), converted.constEnd());
+    for (float sample : converted) {
+        pending[static_cast<std::size_t>(pendingCount++)] = sample;
+        ++sampleCount;
+        if (pendingCount == WaveformPyramid::kBaseSamplesPerPeak) {
+            const auto [minimum, maximum] = std::minmax_element(pending.cbegin(), pending.cend());
+            peaks.push_back({*minimum, *maximum});
+            pendingCount = 0;
+        }
+    }
     return true;
 }
 
@@ -97,7 +110,10 @@ WaveformGenerator::Result WaveformGenerator::generate(
         return AppError(ErrorDomain::Decoder, AVERROR(ENOMEM), QStringLiteral("无法分配音频帧"));
     }
 
-    QVector<float> samples;
+    QVector<WaveformPeak> peaks;
+    std::array<float, WaveformPyramid::kBaseSamplesPerPeak> pending{};
+    int pendingCount = 0;
+    qint64 sampleCount = 0;
     while (!isCancelled(cancel) && !isStale(generation, expectedGeneration)) {
         PacketPtr packet = demuxer.readPacket(&error);
         if (!packet) {
@@ -118,7 +134,8 @@ WaveformGenerator::Result WaveformGenerator::generate(
             if (result < 0) {
                 return makeFfmpegError(ErrorDomain::Decoder, result, QStringLiteral("音频解码失败"));
             }
-            if (!appendConverted(resampler, *frame, samples, &error)) {
+            if (!appendConvertedPeaks(
+                    resampler, *frame, peaks, pending, pendingCount, sampleCount, &error)) {
                 return error;
             }
         }
@@ -143,18 +160,25 @@ WaveformGenerator::Result WaveformGenerator::generate(
         if (result < 0) {
             return makeFfmpegError(ErrorDomain::Decoder, result, QStringLiteral("音频解码失败"));
         }
-        if (!appendConverted(resampler, *frame, samples, &error)) {
+        if (!appendConvertedPeaks(
+                resampler, *frame, peaks, pending, pendingCount, sampleCount, &error)) {
             return error;
         }
     }
-    if (samples.isEmpty()) {
+    if (sampleCount <= 0) {
         return AppError(ErrorDomain::Decoder, AVERROR_EOF, QStringLiteral("媒体中没有可解码的音频样本"));
     }
 
-    qCDebug(subcueWaveformLog) << "Built waveform pyramid" << path << "samples" << samples.size()
+    if (pendingCount > 0) {
+        const auto end = pending.cbegin() + pendingCount;
+        const auto [minimum, maximum] = std::minmax_element(pending.cbegin(), end);
+        peaks.push_back({*minimum, *maximum});
+    }
+
+    qCDebug(subcueWaveformLog) << "Built waveform pyramid" << path << "samples" << sampleCount
                                << "rate" << sampleRate;
     return std::make_shared<WaveformPyramid>(
-        WaveformPyramid::fromMonoFloat(samples.constData(), samples.size(), sampleRate));
+        WaveformPyramid::fromBasePeaks(std::move(peaks), sampleCount, sampleRate));
 }
 
 } // namespace subcue

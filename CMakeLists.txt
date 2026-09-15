@@ -11,11 +11,13 @@ set(CMAKE_AUTOGEN_PARALLEL 1)
 
 option(SUBCUE_BUILD_APP "Build the Qt Quick application" ON)
 option(SUBCUE_ENABLE_CUDA "Enable CUDA acceleration for local Whisper" OFF)
+set(SUBCUE_PYTHON_ROOT "C:/Users/baobao/AppData/Roaming/uv/python/cpython-3.11.16-windows-x86_64-none"
+    CACHE PATH "Python 3.11 runtime used only by SubCueInference")
 set(SUBCUE_WHISPER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/whisper.cpp"
     CACHE PATH "Path to the pinned whisper.cpp source tree")
 
 set(CMAKE_PREFIX_PATH "C:/Qt/6.10.3/msvc2022_64")
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Test)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Sql Test)
 
 set(SUBCUE_FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/x64-windows")
 find_path(SUBCUE_FFMPEG_INCLUDE_DIR libavformat/avformat.h
@@ -127,8 +129,12 @@ qt_add_library(SubCueCore STATIC
     src/core/common/logging.h
     src/core/common/media_time.h
     src/core/common/provider_types.h
+    src/core/inference/inference_manager.cpp
+    src/core/inference/inference_manager.h
     src/core/cache/cache_key.cpp
     src/core/cache/cache_key.h
+    src/core/cache/analysis_cache.cpp
+    src/core/cache/analysis_cache.h
     src/core/cache/lru_cache.cpp
     src/core/cache/lru_cache.h
     src/core/cache/preview_cache.cpp
@@ -178,6 +184,25 @@ qt_add_library(SubCueCore STATIC
     src/core/project/project.h
     src/core/project/project_serializer.cpp
     src/core/project/project_serializer.h
+    src/core/roughcut/rough_cut_types.h
+    src/core/roughcut/alignment_evidence.cpp
+    src/core/roughcut/alignment_evidence.h
+    src/core/roughcut/auxiliary_recognition.cpp
+    src/core/roughcut/auxiliary_recognition.h
+    src/core/roughcut/decision_engine.cpp
+    src/core/roughcut/decision_engine.h
+    src/core/roughcut/retake_detector.cpp
+    src/core/roughcut/retake_detector.h
+    src/core/roughcut/rough_cut_project.cpp
+    src/core/roughcut/rough_cut_project.h
+    src/core/roughcut/timeline_engine.cpp
+    src/core/roughcut/timeline_engine.h
+    src/core/roughcut/script_document.cpp
+    src/core/roughcut/script_document.h
+    src/core/roughcut/script_matcher.cpp
+    src/core/roughcut/script_matcher.h
+    src/core/roughcut/xmeml_exporter.cpp
+    src/core/roughcut/xmeml_exporter.h
     src/core/preview/preview_renderer.h
     src/core/preview/preview_renderer_factory.cpp
     src/core/preview/software_preview_renderer.cpp
@@ -220,10 +245,11 @@ target_include_directories(SubCueCore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
 )
-target_link_libraries(SubCueCore PUBLIC Qt6::Core Qt6::Gui Qt6::Network Qt6::Quick SubCue::FFmpeg)
+target_link_libraries(SubCueCore PUBLIC Qt6::Core Qt6::Gui Qt6::Network Qt6::Quick Qt6::Sql SubCue::FFmpeg)
 target_compile_definitions(SubCueCore PUBLIC
     SUBCUE_PROJECT_WHISPER_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models/whisper"
     SUBCUE_PROJECT_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models"
+    SUBCUE_PROJECT_INFERENCE_PYTHON="${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Scripts/python.exe"
 )
 if(SUBCUE_HAS_WHISPER)
     target_link_libraries(SubCueCore PRIVATE whisper)
@@ -238,6 +264,36 @@ endif()
 target_compile_definitions(SubCueCore PRIVATE QT_NO_CAST_FROM_ASCII QT_NO_CAST_TO_ASCII)
 add_library(SubCue::Core ALIAS SubCueCore)
 
+set(Python3_ROOT_DIR "${SUBCUE_PYTHON_ROOT}")
+set(Python3_FIND_STRATEGY LOCATION)
+find_package(Python3 3.11 EXACT COMPONENTS Development QUIET)
+if(Python3_Development_FOUND)
+    add_executable(SubCueInference src/inference/main.cpp)
+    target_link_libraries(SubCueInference PRIVATE Python3::Python)
+    target_compile_options(SubCueInference PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    target_compile_definitions(SubCueInference PRIVATE
+        SUBCUE_INFERENCE_PYTHON_HOME="${SUBCUE_PYTHON_ROOT}"
+        SUBCUE_INFERENCE_SITE_PACKAGES="${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Lib/site-packages"
+        SUBCUE_INFERENCE_WORKER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tools/asr_python_worker.py")
+    set_target_properties(SubCueInference PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/inference")
+    add_custom_command(TARGET SubCueInference POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SUBCUE_PYTHON_ROOT}/python311.dll"
+            "$<TARGET_FILE_DIR:SubCueInference>/python311.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SUBCUE_PYTHON_ROOT}/python3.dll"
+            "$<TARGET_FILE_DIR:SubCueInference>/python3.dll")
+endif()
+
+qt_add_executable(SubCueRoughCutXml
+    src/tools/roughcut_xml_main.cpp
+)
+target_link_libraries(SubCueRoughCutXml PRIVATE SubCue::Core Qt6::Core)
+target_include_directories(SubCueRoughCutXml PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
+
 if(SUBCUE_BUILD_APP)
     qt_add_executable(SubCue
         src/app/main.cpp
@@ -247,6 +303,12 @@ if(SUBCUE_BUILD_APP)
         src/app/application_context.h
         src/app/native_theme.cpp
         src/app/native_theme.h
+        src/app/rough_cut_controller.cpp
+        src/app/rough_cut_controller.h
+        src/app/rough_cut_result_model.cpp
+        src/app/rough_cut_result_model.h
+        src/app/workspace_router.cpp
+        src/app/workspace_router.h
         src/app/ui_theme.h
     )
     set_source_files_properties(src/app/qml/Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
@@ -256,6 +318,9 @@ if(SUBCUE_BUILD_APP)
         NO_IMPORT_SCAN
         QML_FILES
             src/app/qml/Main.qml
+            src/app/qml/AppRouter.qml
+            src/app/qml/SubtitleWorkspace.qml
+            src/app/qml/RoughCutWorkspace.qml
             src/app/qml/Theme.qml
             src/app/qml/SettingsWindow.qml
             src/app/qml/AboutWindow.qml
@@ -286,6 +351,9 @@ if(SUBCUE_BUILD_APP)
     )
     target_link_libraries(SubCue PRIVATE
         SubCue::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
+    if(TARGET SubCueInference)
+        add_dependencies(SubCue SubCueInference)
+    endif()
     add_custom_command(TARGET SubCue POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/asr_python_worker.py"
@@ -312,6 +380,9 @@ if(SUBCUE_BUILD_APP)
             OUTPUT "${SUBCUE_PACKAGE_DIR}/package.stamp"
             COMMAND ${CMAKE_COMMAND}
                 "-DSUBCUE_EXE=$<TARGET_FILE:SubCue>"
+                "-DSUBCUE_INFERENCE_EXE=$<TARGET_FILE:SubCueInference>"
+                "-DSUBCUE_PYTHON_ROOT=${SUBCUE_PYTHON_ROOT}"
+                "-DSUBCUE_INFERENCE_SITE_PACKAGES=${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Lib/site-packages"
                 "-DSUBCUE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
                 "-DSUBCUE_PACKAGE_DIR=${SUBCUE_PACKAGE_DIR}"
                 "-DQT_BIN_DIR=$<TARGET_FILE_DIR:Qt6::Core>"
@@ -336,6 +407,3 @@ endif()
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
-
-# TODO(temp): 临时诊断目标，定位完成后删除。
-add_subdirectory(.test_tmp/prime_probe)

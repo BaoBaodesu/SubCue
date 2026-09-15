@@ -24,6 +24,7 @@ struct SteppedFrame final {
 class FrameStepper final {
 public:
     static constexpr int kHistoryRingSize = 8;
+    static constexpr qsizetype kMaximumCacheBytes = 128 * 1024 * 1024;
 
     [[nodiscard]] bool open(const QString &path, AppError *error = nullptr);
     void close();
@@ -39,10 +40,12 @@ public:
     [[nodiscard]] int currentIndex() const noexcept { return current_.index; }
     [[nodiscard]] int gopSize() const noexcept { return gop_.size(); }
     [[nodiscard]] int historySize() const noexcept { return static_cast<int>(history_.size()); }
+    [[nodiscard]] qsizetype cachedBytes() const noexcept { return gopBytes_ + historyBytes_; }
 
 private:
     [[nodiscard]] bool decodeGopUntil(int targetIndex, AppError *error);
     void rememberCurrent();
+    void trimCache();
     [[nodiscard]] bool showIndex(int frameIndex, AppError *error);
 
     FrameIndex index_;
@@ -54,6 +57,8 @@ private:
     int gopStartIndex_ = -1;
     QVector<SteppedFrame> gop_;
     std::deque<SteppedFrame> history_;
+    qsizetype gopBytes_ = 0;
+    qsizetype historyBytes_ = 0;
     SteppedFrame current_;
 };
 

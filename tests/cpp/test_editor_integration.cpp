@@ -998,12 +998,12 @@ void EditorIntegrationTests::playbackRepeatedOpenCloseDoesNotGrowUnbounded()
 #ifdef Q_OS_WIN
     const SIZE_T baseline = workingSetBytes();
 #endif
-    for (int index = 0; index < 24; ++index) {
+    for (int index = 0; index < 50; ++index) {
         cycle();
     }
 #ifdef Q_OS_WIN
     const SIZE_T after = workingSetBytes();
-    QVERIFY2(after < baseline + 64ull * 1024ull * 1024ull,
+    QVERIFY2(after < baseline + 32ull * 1024ull * 1024ull,
         qPrintable(QStringLiteral("working set grew from %1 to %2")
                        .arg(static_cast<qulonglong>(baseline))
                        .arg(static_cast<qulonglong>(after))));

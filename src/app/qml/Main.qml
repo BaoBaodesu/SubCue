@@ -186,6 +186,11 @@ ApplicationWindow {
             MenuButton { text: qsTr("设置"); onClicked: window.openSettings() }
             MenuButton { text: qsTr("关于"); onClicked: window.openAbout() }
             Item { Layout.fillWidth: true }
+            MenuButton {
+                text: qsTr("自动粗剪工作区")
+                enabled: typeof appRouter !== "undefined" && appRouter.canSwitch
+                onClicked: if (typeof appRouter !== "undefined") appRouter.switchTo("roughcut")
+            }
             BusyIndicator {
                 running: editor.busy
                 visible: running

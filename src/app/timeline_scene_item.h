@@ -156,6 +156,8 @@ private:
     QColor waveformColor_{UiTheme::kWaveform};
     QColor playheadColor_{UiTheme::kPlayhead};
     QColor rangeColor_{UiTheme::kRange};
+    QColor selectedCueRangeColor_{UiTheme::kSelectedCueRange};
+    QColor selectedCueBoundaryColor_{UiTheme::kSelectedCueBoundary};
     QColor timeTextColor_{UiTheme::kTimeText};
 };
 

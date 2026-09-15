@@ -43,6 +43,6 @@ Alignment uses an in-tree Indel fuzz.ratio implementation that matches
 RapidFuzz 3.x golden fixtures. The RapidFuzz C++ library is not linked and
 is not shipped.
 
-No Python runtime
+Python and PyTorch runtime (in inference/ only)
 -----------------
 The package must not contain python*.dll, python.exe, PySide6, or Nuitka.

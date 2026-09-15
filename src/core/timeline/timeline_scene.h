@@ -69,6 +69,7 @@ struct TimelineSceneLayout final {
     QVector<TimelineCueVisual> cues;
     QVector<WaveformPeak> waveform;
     TimelineSceneRect inOutRange;
+    TimelineSceneRect selectedCueRange;
     double playheadX = 0.0;
     bool playheadVisible = false;
 };

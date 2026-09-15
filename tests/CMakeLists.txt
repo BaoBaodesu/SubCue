@@ -86,6 +86,46 @@ qt_add_executable(SubCueTimelineTests cpp/test_timeline.cpp)
 target_link_libraries(SubCueTimelineTests PRIVATE SubCue::Core Qt6::Test)
 subcue_register_test(SubCueTimelineTests)
 
+qt_add_executable(SubCueRoughCutXmlTests cpp/test_roughcut_xml.cpp)
+target_link_libraries(SubCueRoughCutXmlTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutXmlTests)
+
+qt_add_executable(SubCueRoughCutScriptTests cpp/test_roughcut_script.cpp)
+target_link_libraries(SubCueRoughCutScriptTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutScriptTests)
+
+qt_add_executable(SubCueRoughCutAlignmentTests cpp/test_roughcut_alignment.cpp)
+target_link_libraries(SubCueRoughCutAlignmentTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutAlignmentTests)
+
+qt_add_executable(SubCueRetakeDetectorTests cpp/test_retake_detector.cpp)
+target_link_libraries(SubCueRetakeDetectorTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRetakeDetectorTests)
+
+qt_add_executable(SubCueRoughCutDecisionTests cpp/test_roughcut_decision.cpp)
+target_link_libraries(SubCueRoughCutDecisionTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutDecisionTests)
+
+qt_add_executable(SubCueRoughCutTimelineTests cpp/test_roughcut_timeline.cpp)
+target_link_libraries(SubCueRoughCutTimelineTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutTimelineTests)
+
+qt_add_executable(SubCueRoughCutResultModelTests
+    cpp/test_rough_cut_result_model.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.h)
+target_include_directories(SubCueRoughCutResultModelTests PRIVATE ${CMAKE_SOURCE_DIR}/src/app)
+target_link_libraries(SubCueRoughCutResultModelTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutResultModelTests)
+
+qt_add_executable(SubCueRoughCutProjectTests cpp/test_roughcut_project.cpp)
+target_link_libraries(SubCueRoughCutProjectTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutProjectTests)
+
+qt_add_executable(SubCueRoughCutAuxiliaryTests cpp/test_roughcut_auxiliary.cpp)
+target_link_libraries(SubCueRoughCutAuxiliaryTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutAuxiliaryTests)
+
 qt_add_executable(SubCueAlignmentTests cpp/test_alignment.cpp)
 target_compile_definitions(SubCueAlignmentTests PRIVATE
     SUBCUE_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden"
@@ -150,6 +190,12 @@ endif()
 if(SUBCUE_BUILD_APP)
     add_test(NAME SubCueStartupTest COMMAND SubCue --smoke-test)
     set_tests_properties(SubCueStartupTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        ENVIRONMENT_MODIFICATION "${SUBCUE_TEST_PATH_MODIFICATION}"
+        TIMEOUT 10
+    )
+    add_test(NAME SubCueRoughCutStartupTest COMMAND SubCue --roughcut-workspace --smoke-test)
+    set_tests_properties(SubCueRoughCutStartupTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         ENVIRONMENT_MODIFICATION "${SUBCUE_TEST_PATH_MODIFICATION}"
         TIMEOUT 10

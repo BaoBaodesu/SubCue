@@ -36,13 +36,15 @@ QML 位于 `src/app/qml/`，与 `qt_add_qml_module` 的 `SubCue` 模块同源。
 | `media/` | FFmpeg 解封装、解码、重采样、硬件加速、缩略图 |
 | `playback/` | 音频时钟、音频输出、帧索引、逐帧步进、Seek 调度 |
 | `waveform/` | 波形金字塔生成与降采样 |
-| `cache/` | 缓存键、LRU、预览帧缓存 |
+| `cache/` | 缓存键、LRU、预览帧缓存与完整内容哈希分析缓存 |
+| `inference/` | GPU 推理互斥、Worker 生命周期、取消与崩溃隔离 |
 | `timeline/` | 时间轴视口、吸附引擎、编辑命令场景 |
 | `subtitle/` | 时间码、TXT/SRT/ASS 解析与写出、字幕模型与撤销栈 |
 | `alignment/` | 文本与音频词级时间戳对齐、强制对齐、模糊匹配 |
 | `asr/` | ASR Provider 工厂、DashScope、whisper.cpp、分块与下载 |
 | `ai/` | OpenAI-compatible Provider 与复核工厂 |
 | `project/` | 工程文件序列化 |
+| `roughcut/` | 自动粗剪的采样区间模型与 Premiere xmeml 导出 |
 | `settings/` | 设置持久化与凭据存储接口 |
 
 ## 平台层 `src/platform/windows`
@@ -59,8 +61,9 @@ QML 位于 `src/app/qml/`，与 `qt_add_qml_module` 的 `SubCue` 模块同源。
 | `SubCueSubtitleProjectTests` | `test_subtitle_project.cpp` | 时间码、TXT/SRT/ASS、字幕模型、撤销栈、工程与设置持久化、凭据存储 |
 | `SubCueMediaTests` | `test_media.cpp` | 探针、解码、重采样、有界队列、FFmpeg 错误与损坏样本 |
 | `SubCuePlaybackTests` | `test_playback.cpp` | 音频时钟、输出代次、帧索引、逐帧步进、Seek、硬件加速回退 |
-| `SubCueCacheWaveformTests` | `test_cache_waveform.cpp` | 缓存键、LRU 淘汰、波形金字塔、缩略图与预览缓存 |
+| `SubCueCacheWaveformTests` | `test_cache_waveform.cpp` | 缓存键、完整内容分析缓存、LRU 淘汰、波形金字塔、缩略图与预览缓存 |
 | `SubCueTimelineTests` | `test_timeline.cpp` | 视口换算与缩放、吸附、拖动/修剪/切分/合并与 Undo、场景布局与命中测试 |
+| `SubCueRoughCutXmlTests` | `test_roughcut_xml.cpp` | 非破坏性源区间、帧量化、声道轨和完整 WAV 引用 |
 | `SubCueAlignmentTests` | `test_alignment.cpp` | 对齐 golden、模糊比、归一化、强制对齐、转写排序与置信度阈值 |
 | `SubCueAsrTests` | `test_asr.cpp` | 分块计划、DashScope 解析、模型清单与下载校验、whisper 服务、HTTP 客户端 |
 | `SubCueAiReviewTests` | `test_ai_review.cpp` | 复核窗口、载荷脱敏、低置信度跳过、模型发现与错误处理 |

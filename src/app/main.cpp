@@ -2,11 +2,12 @@
 #include "application_context.h"
 #include "common/logging.h"
 #include "native_theme.h"
+#include "rough_cut_controller.h"
 #include "ui_theme.h"
+#include "workspace_router.h"
 
 #include <QtCore/QTimer>
 #include <QtCore/QElapsedTimer>
-#include <QtCore/QFile>
 #include <QtGui/QFont>
 #include <QtGui/QFontInfo>
 #include <QtGui/QGuiApplication>
@@ -16,21 +17,9 @@
 #include <QtQml/QQmlContext>
 #include <QtQuickControls2/QQuickStyle>
 
-// TODO(temp): 临时启动阶段埋点，定位 Debug 版启动卡死，定位后删除。
-static void traceStartup(const char *stage)
-{
-    QFile file(QStringLiteral("D:/DSH/SubCue/startup-trace.log"));
-    if (file.open(QIODevice::Append)) {
-        file.write(stage);
-        file.write("\n");
-    }
-}
-
 int main(int argc, char *argv[])
 {
-    traceStartup("enter-main");
     QGuiApplication application(argc, argv);
-    traceStartup("gui-app-created");
     QCoreApplication::setOrganizationName(QStringLiteral("SubCue"));
     QCoreApplication::setApplicationName(QStringLiteral("SubCue"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.1"));
@@ -64,9 +53,11 @@ int main(int argc, char *argv[])
     application.setPalette(palette);
 
     subcue::ApplicationContext context;
-    traceStartup("context-created");
     subcue::AppController controller(&context);
-    traceStartup("controller-created");
+    subcue::RoughCutController roughCutController(&context);
+    subcue::WorkspaceRouter workspaceRouter(&controller, &roughCutController);
+    if (application.arguments().contains(QStringLiteral("--roughcut-workspace")))
+        workspaceRouter.switchTo(QStringLiteral("roughcut"));
     QElapsedTimer heartbeat;
     heartbeat.start();
     QTimer responsivenessTimer;
@@ -79,6 +70,8 @@ int main(int argc, char *argv[])
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("editor"), &controller);
+    engine.rootContext()->setContextProperty(QStringLiteral("roughCut"), &roughCutController);
+    engine.rootContext()->setContextProperty(QStringLiteral("appRouter"), &workspaceRouter);
     engine.rootContext()->setContextProperty(QStringLiteral("nativeTheme"), &nativeTheme);
     QObject::connect(
         &engine,
@@ -95,8 +88,7 @@ int main(int argc, char *argv[])
                 nativeTheme.applyDarkTitleBar(window);
             }
         });
-    engine.loadFromModule(QStringLiteral("SubCue"), QStringLiteral("Main"));
-    traceStartup("qml-loaded");
+    engine.loadFromModule(QStringLiteral("SubCue"), QStringLiteral("AppRouter"));
 
     if (application.arguments().contains(QStringLiteral("--smoke-test"))) {
         QTimer::singleShot(0, &application, &QCoreApplication::quit);
@@ -104,6 +96,5 @@ int main(int argc, char *argv[])
 
     qCInfo(subcueLog) << "SubCue native application started" << QCoreApplication::applicationVersion()
         << QCoreApplication::applicationFilePath() << "built=" << __DATE__ << __TIME__;
-    traceStartup("entering-event-loop");
     return application.exec();
 }

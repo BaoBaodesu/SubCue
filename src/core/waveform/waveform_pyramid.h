@@ -26,6 +26,11 @@ public:
         qsizetype count,
         int sampleRate);
 
+    [[nodiscard]] static WaveformPyramid fromBasePeaks(
+        QVector<WaveformPeak> peaks,
+        qint64 sampleCount,
+        int sampleRate);
+
     [[nodiscard]] int sampleRate() const noexcept { return sampleRate_; }
     [[nodiscard]] qint64 sampleCount() const noexcept { return sampleCount_; }
     [[nodiscard]] MediaTime duration() const;

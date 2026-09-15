@@ -127,6 +127,7 @@ AppController::AppController(ApplicationContext *context, QObject *parent)
       editor_(&document_, &commands_, &viewport_, &snap_)
 {
     Q_ASSERT(context_ != nullptr);
+    backgroundTasks_.setMaxThreadCount(3);
     tickTimer_.setInterval(10);
     tickTimer_.setTimerType(Qt::PreciseTimer);
     connect(commands_.stack(), &QUndoStack::indexChanged, this, [this] {
@@ -1270,17 +1271,18 @@ void AppController::testAiConnection(const QVariantMap &values, const QString &a
             {QStringLiteral("error"), QStringLiteral("请先输入当前 Provider 的 API Key")}});
         return;
     }
+    if (shuttingDown_) return;
     QPointer<AppController> self(this);
-    std::thread([self, id, key, url, bearer, qwen] {
+    backgroundTasks_.start([self, id, key, url, bearer, qwen, cancel = &backgroundCancel_] {
         OpenAICompatibleProvider service(key, QString(), url, bearer,
             qwen ? OpenAICompatibleProvider::qwenModelsEndpoint(url) : QUrl{}, nullptr);
-        const QVariantMap result = providerResult(service.testConnection());
-        if (self) {
+        const QVariantMap result = providerResult(service.testConnection(cancel));
+        if (self && !cancel->load()) {
             QMetaObject::invokeMethod(self, [self, id, result] {
                 if (self) emit self->aiConnectionTestFinished(id, result);
             }, Qt::QueuedConnection);
         }
-    }).detach();
+    });
 }
 
 void AppController::testAsrConnection(const QVariantMap &values, const QString &apiKey)
@@ -1298,16 +1300,17 @@ void AppController::testAsrConnection(const QVariantMap &values, const QString &
             {QStringLiteral("error"), QStringLiteral("请先输入云端 ASR API Key")}});
         return;
     }
+    if (shuttingDown_) return;
     QPointer<AppController> self(this);
-    std::thread([self, settings, key] {
+    backgroundTasks_.start([self, settings, key, cancel = &backgroundCancel_] {
         std::unique_ptr<IAsrService> service = AsrProviderFactory().create(settings, key);
-        const QVariantMap result = providerResult(service->testConnection());
-        if (self) {
+        const QVariantMap result = providerResult(service->testConnection(cancel));
+        if (self && !cancel->load()) {
             QMetaObject::invokeMethod(self, [self, result] {
                 if (self) emit self->asrConnectionTestFinished(result);
             }, Qt::QueuedConnection);
         }
-    }).detach();
+    });
 }
 
 void AppController::downloadWhisperModel(const QString &modelId, const QString &directory)
@@ -1321,11 +1324,14 @@ void AppController::downloadWhisperModel(const QString &modelId, const QString &
     }
     const QString targetDirectory = directory.trimmed().isEmpty()
         ? AsrProviderFactory::defaultWhisperModelsDirectory() : directory.trimmed();
+    if (shuttingDown_) return;
     QPointer<AppController> self(this);
-    std::thread([self, modelId, model = *model, targetDirectory] {
+    backgroundTasks_.start([self, modelId, model = *model, targetDirectory,
+                            cancel = &backgroundCancel_] {
         QtNetworkHttpClient http;
         ModelDownloader downloader(&http);
-        const std::variant<QString, AppError> downloaded = downloader.ensure(model, targetDirectory);
+        const std::variant<QString, AppError> downloaded = downloader.ensure(
+            model, targetDirectory, cancel);
         QVariantMap result;
         if (std::holds_alternative<AppError>(downloaded)) {
             result = {{QStringLiteral("success"), false},
@@ -1334,12 +1340,12 @@ void AppController::downloadWhisperModel(const QString &modelId, const QString &
             result = {{QStringLiteral("success"), true},
                       {QStringLiteral("path"), std::get<QString>(downloaded)}};
         }
-        if (self) {
+        if (self && !cancel->load()) {
             QMetaObject::invokeMethod(self, [self, modelId, result] {
                 if (self) emit self->whisperDownloadFinished(modelId, result);
             }, Qt::QueuedConnection);
         }
-    }).detach();
+    });
 }
 
 bool AppController::saveSettings(
@@ -1472,12 +1478,19 @@ QString AppController::verificationStatus(const QString &section, const QString 
 
 void AppController::shutdown()
 {
+    if (shuttingDown_) return;
+    shuttingDown_ = true;
+    backgroundCancel_ = true;
+    backgroundTasks_.clear();
     alignmentCancel_ = true;
     stopAlignmentWorker();
     stopWaveformWorker();
+    backgroundTasks_.waitForDone();
     stop();
     tickTimer_.stop();
     playback_.close();
+    waveform_.reset();
+    if (timelineItem_) timelineItem_->setWaveform({});
     if (context_ && context_->audioDevice) {
         context_->audioDevice->stop();
     }
@@ -1692,6 +1705,7 @@ void AppController::startWaveformWorker(const QString &path)
 {
     stopWaveformWorker();
     waveform_.reset();
+    if (timelineItem_) timelineItem_->setWaveform({});
     const quint64 generation = ++waveformGeneration_;
     waveformThread_ = std::thread([this, path, generation] {
         WaveformGenerator generator;

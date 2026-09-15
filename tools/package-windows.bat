@@ -44,5 +44,8 @@ mkdir "%DIST_DIR%" 2>nul
 xcopy /e /i /y "%PACKAGE_DIR%" "%DIST_DIR%" >nul
 if errorlevel 1 exit /b 1
 
+rem dist 已保存最终包，清掉构建目录中的重复暂存副本。
+rmdir /s /q "%PACKAGE_DIR%"
+
 echo Packed to %DIST_DIR%
 endlocal

@@ -3,10 +3,12 @@
 #include "asr/audio_chunk_plan.h"
 #include "asr/dashscope_asr_service.h"
 #include "asr/http_client.h"
+#include "asr/local_python_asr_service.h"
 #include "asr/model_downloader.h"
 #include "asr/whisper_cpp_service.h"
 #include "asr/whisper_model_catalog.h"
 #include "settings/settings_manager.h"
+#include "inference/inference_manager.h"
 
 #include <QtCore/QCryptographicHash>
 #include <QtCore/QDir>
@@ -155,6 +157,8 @@ private slots:
     void modelDownloadResumeChecksumAndAtomic();
     void factoryKeepsDashScopeDefault();
     void whisperDeviceDefaultFollowsBuild();
+    void localModelRejectsIncompleteWeight();
+    void inferenceManagerContainsWorkerFailure();
     void extractorWritesFlacAndPcm();
     void whisperServiceUsesEngine();
     void whisperServiceMergesChunks();
@@ -457,6 +461,40 @@ void AsrTests::whisperDeviceDefaultFollowsBuild()
     QCOMPARE(device, QStringLiteral("cuda"));
 #else
     QCOMPARE(device, QStringLiteral("cpu"));
+#endif
+}
+
+void AsrTests::localModelRejectsIncompleteWeight()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QFile config(directory.filePath(QStringLiteral("config.json")));
+    QFile incomplete(directory.filePath(QStringLiteral("model.pt.incomplete")));
+    QVERIFY(config.open(QIODevice::WriteOnly));
+    QVERIFY(incomplete.open(QIODevice::WriteOnly));
+    config.write("{}");
+    incomplete.write("partial");
+    config.close();
+    incomplete.close();
+    QVERIFY(!LocalPythonAsrService::modelReady(directory.path()));
+
+    QFile weight(directory.filePath(QStringLiteral("model.pt")));
+    QVERIFY(weight.open(QIODevice::WriteOnly));
+    weight.write("complete");
+    weight.close();
+    QVERIFY(LocalPythonAsrService::modelReady(directory.path()));
+}
+
+void AsrTests::inferenceManagerContainsWorkerFailure()
+{
+#ifdef Q_OS_WIN
+    const InferenceProcessResult result = InferenceManager::instance().run(
+        QStringLiteral("cmd.exe"),
+        {QStringLiteral("/d"), QStringLiteral("/c"), QStringLiteral("exit 7")});
+    QVERIFY(result.started);
+    QCOMPARE(result.exitCode, 7);
+#else
+    QSKIP("Worker crash containment smoke test is Windows-only");
 #endif
 }
 
