@@ -11,6 +11,7 @@ struct RoughCutSourceClip final {
     QString name;
     qint64 sourceStartSample = 0;
     qint64 sourceEndSample = 0;
+    qint64 timelineStartSample = -1;
 };
 
 struct RoughCutExportRequest final {

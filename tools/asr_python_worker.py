@@ -8,6 +8,8 @@ from xml.etree import ElementTree
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
@@ -33,7 +35,7 @@ def qwen(model_dir, aligner_dir, chunks, progress=None):
     if progress:
         progress("load-asr", 0, 1, "正在加载 Qwen3-ASR 模型")
     model = Qwen3ASRModel.from_pretrained(model_dir, dtype=torch.float16,
-        device_map="cuda:0", max_inference_batch_size=1, max_new_tokens=256)
+        device_map="cuda:0", max_inference_batch_size=1, max_new_tokens=512)
     if progress:
         progress("load-asr", 1, 1, "Qwen3-ASR 模型已加载")
     recognized = []

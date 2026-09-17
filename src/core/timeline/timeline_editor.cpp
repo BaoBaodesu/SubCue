@@ -151,7 +151,8 @@ bool TimelineEditor::updateDrag(MediaTime delta)
                 ? snapStart
                 : snapEndAsStart;
         }
-        start = clampUs(start, bounds.previousEnd.microseconds(), bounds.nextStart.microseconds() - duration);
+        // 移动字幕时允许预览跨过其他字幕；只在提交时检查最终位置是否重叠。
+        start = clampUs(start, 0, viewport_->timelineDuration().microseconds() - duration);
         drag.previewStart = MediaTime::fromMicroseconds(start);
         drag.previewEnd = MediaTime::fromMicroseconds(start + duration);
     }
@@ -190,12 +191,15 @@ bool TimelineEditor::setTiming(const QString &id, MediaTime start, MediaTime end
     if (end.microseconds() - start.microseconds() < kMinCueUs) {
         return false;
     }
-    const NeighborBounds bounds = neighborBounds(id);
-    if (start.microseconds() < bounds.previousEnd.microseconds()
-        || end.microseconds() > bounds.nextStart.microseconds()
-        || start.microseconds() < 0
+    if (start.microseconds() < 0
         || end.microseconds() > viewport_->timelineDuration().microseconds()) {
         return false;
+    }
+    for (const Subtitle &subtitle : document_->subtitles()) {
+        if (subtitle.id != id && subtitle.isTimed()
+            && start < subtitle.end && end > subtitle.start) {
+            return false;
+        }
     }
     return commands_->setTiming(id, start, end);
 }

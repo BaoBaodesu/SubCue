@@ -35,6 +35,9 @@ QVariant RoughCutResultModel::data(const QModelIndex &index, int role) const
     case StartMsRole: return sampleRate_ > 0 ? passage.startSample * 1000 / sampleRate_ : 0;
     case EndMsRole: return sampleRate_ > 0 ? passage.endSample * 1000 / sampleRate_ : 0;
     case UserOverrideRole: return decision.userDecision.has_value();
+    case TakeGroupRole: return decision.takeGroupId;
+    case BestTakeRole: return decision.bestTake;
+    case ScoreRole: return decision.ruleScore;
     default: return {};
     }
 }
@@ -43,7 +46,8 @@ QHash<int, QByteArray> RoughCutResultModel::roleNames() const
 {
     return {{StatusRole, "status"}, {TextRole, "text"}, {ReasonRole, "reason"},
             {EvidenceRole, "evidence"}, {StartMsRole, "startMs"}, {EndMsRole, "endMs"},
-            {UserOverrideRole, "userOverride"}};
+            {UserOverrideRole, "userOverride"}, {TakeGroupRole, "takeGroup"},
+            {BestTakeRole, "bestTake"}, {ScoreRole, "score"}};
 }
 
 void RoughCutResultModel::reset(QVector<RecognizedPassage> recording,
@@ -64,12 +68,13 @@ bool RoughCutResultModel::setUserDecision(int row, std::optional<RoughCutDecisio
     return true;
 }
 
-void RoughCutResultModel::applyAuxiliaryResult(RoughCutAuxiliaryResult result)
+void RoughCutResultModel::applyAuxiliaryResult(
+    RoughCutAuxiliaryResult result, const QString &providerName)
 {
     if (result.recordingIndex < 0 || result.recordingIndex >= decisions_.size()) return;
     RoughCutSegmentDecision &decision = decisions_[result.recordingIndex];
     decision.autoDecision = RoughCutAuxiliaryRecognition::reconcile(decision.autoDecision, &result);
-    decision.evidence.append(QStringLiteral("Fun-ASR：%1").arg(
+    decision.evidence.append(QStringLiteral("%1：%2").arg(providerName,
         result.funAsrFailed ? QStringLiteral("失败") : result.funAsrText));
     if (result.conflict) decision.reason = QStringLiteral("辅助识别冲突或失败，保留复核");
     const QModelIndex changed = index(result.recordingIndex);

@@ -12,6 +12,7 @@
 #include "asr/local_python_asr_service.h"
 #include "common/logging.h"
 #include "media/media_probe.h"
+#include "roughcut/script_document.h"
 #include "subtitle/srt_parser.h"
 #include "subtitle/txt_importer.h"
 #include "waveform/waveform_generator.h"
@@ -209,6 +210,10 @@ void AppController::setScriptText(const QString &value)
         return;
     }
     scriptText_ = value;
+    if (alignmentCompleted_) {
+        alignmentCompleted_ = false;
+        emit canReviewChanged();
+    }
     emit scriptTextChanged();
 }
 
@@ -378,6 +383,10 @@ void AppController::loadMediaPath(const QString &path)
     ++alignmentGeneration_;
     stopAlignmentWorker();
     setBusy(false);
+    if (alignmentCompleted_) {
+        alignmentCompleted_ = false;
+        emit canReviewChanged();
+    }
     setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
                             [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
 
@@ -433,18 +442,30 @@ void AppController::importScript(const QUrl &url)
 
 void AppController::importScriptPath(const QString &path)
 {
-    QString error;
-    const QString content = readTextFile(path, &error);
-    if (!error.isEmpty() && content.isEmpty()) {
-        setStatus(QStringLiteral("文稿导入失败：%1").arg(error));
-        return;
-    }
     const QString suffix = QFileInfo(path).suffix().toLower();
     QStringList lines;
-    if (suffix == QLatin1String("srt")) {
-        lines = SrtParser::parseTextOnly(content);
+    if (suffix == QLatin1String("docx")) {
+        const ScriptDocumentResult result = ScriptDocumentImporter::loadDocx(path);
+        if (std::holds_alternative<AppError>(result)) {
+            setStatus(QStringLiteral("文稿导入失败：%1").arg(std::get<AppError>(result).userMessage()));
+            return;
+        }
+        for (const ScriptLine &line : std::get<ScriptDocument>(result).lines) {
+            lines.append(line.text);
+        }
+        lines = TxtImporter::parse(lines.join(QLatin1Char('\n')));
     } else {
-        lines = TxtImporter::parse(content);
+        QString error;
+        const QString content = readTextFile(path, &error);
+        if (!error.isEmpty() && content.isEmpty()) {
+            setStatus(QStringLiteral("文稿导入失败：%1").arg(error));
+            return;
+        }
+        if (suffix == QLatin1String("srt")) {
+            lines = SrtParser::parseTextOnly(content);
+        } else {
+            lines = TxtImporter::parse(content);
+        }
     }
     QStringList escaped;
     escaped.reserve(lines.size());
@@ -467,7 +488,8 @@ bool AppController::canImportFiles(const QList<QUrl> &urls) const
         const QString path = localPath(url);
         const QString suffix = QFileInfo(path).suffix().toLower();
         return QFileInfo(path).isFile()
-            && (isMediaPath(path) || suffix == QLatin1String("txt") || suffix == QLatin1String("srt"));
+            && (isMediaPath(path) || suffix == QLatin1String("txt")
+                || suffix == QLatin1String("srt") || suffix == QLatin1String("docx"));
     });
 }
 
@@ -561,8 +583,26 @@ void AppController::setAlignmentOverrides(IAsrService *asr, IAiProvider *ai)
 
 void AppController::startAlignment()
 {
+    startAlignmentRun(false);
+}
+
+void AppController::startReview()
+{
+    if (!alignmentCompleted_) {
+        setStatus(QStringLiteral("请先完成自动打轴。"));
+        return;
+    }
+    startAlignmentRun(true);
+}
+
+void AppController::startAlignmentRun(bool review)
+{
     if (busy_) {
         return;
+    }
+    if (!review && alignmentCompleted_) {
+        alignmentCompleted_ = false;
+        emit canReviewChanged();
     }
     const QStringList lines = TxtImporter::parse(QString(scriptText_).replace(QStringLiteral("\\n"), QStringLiteral("\n")));
     if (mediaPath_.isEmpty() || lines.isEmpty()) {
@@ -589,7 +629,14 @@ void AppController::startAlignment()
     const quint64 generation = ++alignmentGeneration_;
     const QString mediaPath = mediaPath_;
     const MediaInfo mediaInfo = mediaInfo_;
-    const QJsonObject settings = context_->settings;
+    QJsonObject settings = context_->settings;
+    if (review && !settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)) {
+        settings.insert(QStringLiteral("asrProvider"),
+                        settings.value(QStringLiteral("reviewAsrProvider")).toString(QStringLiteral("funasr")));
+        settings.insert(QStringLiteral("asrModel"),
+                        settings.value(QStringLiteral("reviewAsrModel")).toString(QStringLiteral("Fun-ASR-Nano-2512")));
+    }
+    reviewRun_ = review;
     IAsrService *asr = asrOverride_;
     IAiProvider *ai = aiOverride_;
     setBusy(true);
@@ -703,7 +750,7 @@ void AppController::cancelAlignment()
     setStatus(alignmentProgressText_);
 }
 
-void AppController::exportSubtitles()
+void AppController::exportSubtitles(const QString &outputDirectory)
 {
     AlignmentResult current;
     current.subtitles.reserve(document_.count());
@@ -712,18 +759,25 @@ void AppController::exportSubtitles()
     }
     if (current.exportableSubtitles().isEmpty()) {
         setStatus(QStringLiteral("没有可导出的字幕。"));
+        emit exportFinished(false, statusText_, {});
         return;
     }
 
+    QJsonObject settings = context_->settings;
+    if (!outputDirectory.trimmed().isEmpty()) {
+        settings.insert(QStringLiteral("outputDirectory"), outputDirectory.trimmed());
+    }
     const std::variant<QStringList, AppError> exported = AlignmentPipeline::exportResult(
-        mediaPath_, current, mediaInfo_, context_->settings);
+        mediaPath_, current, mediaInfo_, settings);
     if (std::holds_alternative<AppError>(exported)) {
         setStatus(std::get<AppError>(exported).userMessage());
+        emit exportFinished(false, statusText_, {});
         return;
     }
     lastOutputPaths_ = std::get<QStringList>(exported);
     setCanExport(true);
     setStatus(QStringLiteral("导出完成：%1").arg(lastOutputPaths_.join(QStringLiteral("；"))));
+    emit exportFinished(true, statusText_, lastOutputPaths_);
 }
 
 void AppController::togglePlay()
@@ -847,6 +901,12 @@ void AppController::selectCue(int row, bool seekToCue)
     const Subtitle &subtitle = document_.subtitles().at(row);
     if (seekToCue && subtitle.isTimed()) {
         seekUs(subtitle.start.microseconds());
+        if (timelineItem_) {
+            viewport_.setScrollOffset(std::max(0.0, subtitle.start.milliseconds()
+                * viewport_.pixelsPerMs() - timelineItem_->width() * 0.25), timelineItem_->width());
+            timelineItem_->setView(viewport_.pixelsPerMs(), viewport_.scrollOffset());
+            emit timelineViewChanged();
+        }
     }
     syncTimelineItem();
 }
@@ -1572,6 +1632,7 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
     }
 
     AlignmentTaskOutput output = std::get<AlignmentTaskOutput>(std::move(result));
+    const bool completedReview = reviewRun_;
     QList<Subtitle> cues;
     cues.reserve(output.result.subtitles.size());
     for (const Subtitle &subtitle : output.result.subtitles) {
@@ -1582,10 +1643,19 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
     mediaInfo_ = output.mediaInfo;
     setBusy(false);
     setCanExport(!output.result.exportableSubtitles().isEmpty());
-    setStatus(QStringLiteral("打轴完成：已定位 %1 条，低置信 %2 条，音频未检出 %3 条")
+    if (!alignmentCompleted_) {
+        alignmentCompleted_ = true;
+        emit canReviewChanged();
+    }
+    setStatus(QStringLiteral("%1完成：已定位 %2 条，低置信 %3 条，音频未检出 %4 条")
+                  .arg(completedReview ? QStringLiteral("复核") : QStringLiteral("打轴"))
                   .arg(output.result.exportableSubtitles().size())
                   .arg(output.result.lowCount())
                   .arg(output.result.skippedCount()));
+    reviewRun_ = false;
+    if (!completedReview && context_->settings.value(QStringLiteral("autoReviewEnabled")).toBool()) {
+        QMetaObject::invokeMethod(this, &AppController::startReview, Qt::QueuedConnection);
+    }
 }
 
 void AppController::stopWaveformWorker()

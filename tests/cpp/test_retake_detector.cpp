@@ -46,8 +46,9 @@ void RetakeDetectorTests::keepsAmbiguousAndWorseLastForReview()
 
     QVector<ScriptMatch> tied = matches;
     tied[1].similarity = 100.0;
-    const auto ambiguous = RetakeDetector::detect(recording, tied, 48'000);
-    QVERIFY(ambiguous.first().needsReview);
+    const auto stillWorse = RetakeDetector::detect(recording, tied, 48'000);
+    QCOMPARE(stillWorse.first().recommendedRecordingIndex, 0);
+    QVERIFY(!stillWorse.first().needsReview);
 }
 
 void RetakeDetectorTests::limitsNeighbourWindow()

@@ -91,13 +91,14 @@ bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject 
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value BLOB)"))
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_versions(version INTEGER PRIMARY KEY,created_at TEXT NOT NULL)"))
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_segments(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,id TEXT NOT NULL,text TEXT NOT NULL,start_sample INTEGER NOT NULL,end_sample INTEGER NOT NULL,auto_decision TEXT NOT NULL,user_decision TEXT,rule_score REAL NOT NULL,reason TEXT NOT NULL,evidence_json TEXT NOT NULL,PRIMARY KEY(analysis_version,position))"))
+        || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_segment_details(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,silence_before INTEGER NOT NULL,silence_after INTEGER NOT NULL,vad_confidence REAL NOT NULL,audio_complete INTEGER NOT NULL,boundary_trustworthy INTEGER NOT NULL,script_line INTEGER NOT NULL,take_group INTEGER NOT NULL,best_take INTEGER NOT NULL,PRIMARY KEY(analysis_version,position))"))
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS auxiliary_results(analysis_version INTEGER NOT NULL,recording_index INTEGER NOT NULL,primary_text TEXT NOT NULL,funasr_text TEXT NOT NULL,whisper_text TEXT NOT NULL,funasr_failed INTEGER NOT NULL,whisper_failed INTEGER NOT NULL,conflict INTEGER NOT NULL,PRIMARY KEY(analysis_version,recording_index))"))
         || !query.exec(QStringLiteral("DELETE FROM metadata"))) {
         holder.db.rollback(); return setError(errorMessage, query.lastError().text());
     }
     query.prepare(QStringLiteral("INSERT INTO metadata VALUES(?,?)"));
     const QList<QPair<QString, QVariant>> values{
-        {QStringLiteral("schemaVersion"), 2}, {QStringLiteral("analysisVersion"), project.analysisVersion},
+        {QStringLiteral("schemaVersion"), 3}, {QStringLiteral("analysisVersion"), project.analysisVersion},
         {QStringLiteral("mediaPath"), relative(path, project.mediaPath)},
         {QStringLiteral("mediaSha256"), project.mediaSha256},
         {QStringLiteral("scriptPath"), relative(path, project.scriptPath)},
@@ -129,6 +130,20 @@ bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject 
         query.bindValue(10, QString::fromUtf8(QJsonDocument(evidence).toJson(QJsonDocument::Compact)));
         if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
     }
+    query.prepare(QStringLiteral("DELETE FROM analysis_segment_details WHERE analysis_version=?"));
+    query.bindValue(0, project.analysisVersion);
+    if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    query.prepare(QStringLiteral("INSERT INTO analysis_segment_details VALUES(?,?,?,?,?,?,?,?,?,?)"));
+    for (int index = 0; index < project.recording.size(); ++index) {
+        const auto &passage = project.recording.at(index);
+        const auto &result = project.decisions.at(index);
+        query.bindValue(0, project.analysisVersion); query.bindValue(1, index);
+        query.bindValue(2, passage.silenceBeforeSamples); query.bindValue(3, passage.silenceAfterSamples);
+        query.bindValue(4, passage.vadConfidence); query.bindValue(5, passage.audioComplete);
+        query.bindValue(6, passage.boundaryTrustworthy); query.bindValue(7, passage.scriptLineIndex);
+        query.bindValue(8, result.takeGroupId); query.bindValue(9, result.bestTake);
+        if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    }
     query.prepare(QStringLiteral("DELETE FROM auxiliary_results WHERE analysis_version=?"));
     query.bindValue(0, project.analysisVersion);
     if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
@@ -155,7 +170,7 @@ std::optional<RoughCutProject> RoughCutProjectSerializer::load(const QString &pa
     QHash<QString, QVariant> values;
     while (query.next()) values.insert(query.value(0).toString(), query.value(1));
     const int schemaVersion = values.value(QStringLiteral("schemaVersion")).toInt();
-    if (schemaVersion != 1 && schemaVersion != 2) {
+    if (schemaVersion < 1 || schemaVersion > 3) {
         setError(errorMessage, QStringLiteral("不支持的粗剪工程版本")); return std::nullopt;
     }
     RoughCutProject project;
@@ -191,7 +206,22 @@ std::optional<RoughCutProject> RoughCutProjectSerializer::load(const QString &pa
             result.evidence.append(value.toString());
         project.recording.append(std::move(passage)); project.decisions.append(std::move(result));
     }
-    if (schemaVersion == 2 && query.exec(QStringLiteral("SELECT recording_index,primary_text,funasr_text,whisper_text,funasr_failed,whisper_failed,conflict FROM auxiliary_results WHERE analysis_version=%1 ORDER BY recording_index").arg(project.analysisVersion))) {
+    if (schemaVersion >= 3 && query.exec(QStringLiteral("SELECT position,silence_before,silence_after,vad_confidence,audio_complete,boundary_trustworthy,script_line,take_group,best_take FROM analysis_segment_details WHERE analysis_version=%1 ORDER BY position").arg(project.analysisVersion))) {
+        while (query.next()) {
+            const int position = query.value(0).toInt();
+            if (position < 0 || position >= project.recording.size()) continue;
+            project.recording[position].silenceBeforeSamples = query.value(1).toLongLong();
+            project.recording[position].silenceAfterSamples = query.value(2).toLongLong();
+            project.recording[position].vadConfidence = query.value(3).toDouble();
+            project.recording[position].audioComplete = query.value(4).toBool();
+            project.recording[position].boundaryTrustworthy = query.value(5).toBool();
+            project.recording[position].scriptLineIndex = query.value(6).toInt();
+            project.recording[position].takeGroupId = query.value(7).toInt();
+            project.decisions[position].takeGroupId = query.value(7).toInt();
+            project.decisions[position].bestTake = query.value(8).toBool();
+        }
+    }
+    if (schemaVersion >= 2 && query.exec(QStringLiteral("SELECT recording_index,primary_text,funasr_text,whisper_text,funasr_failed,whisper_failed,conflict FROM auxiliary_results WHERE analysis_version=%1 ORDER BY recording_index").arg(project.analysisVersion))) {
         while (query.next()) project.auxiliaryResults.append({query.value(0).toInt(),
             query.value(1).toString(), query.value(2).toString(), query.value(3).toString(),
             query.value(4).toBool(), query.value(5).toBool(), query.value(6).toBool()});

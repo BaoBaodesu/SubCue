@@ -59,7 +59,9 @@ public:
     [[nodiscard]] double scrollOffset() const noexcept;
     void setScrollOffset(double value);
     void setView(double pixelsPerMs, double scrollOffset);
+    Q_INVOKABLE void adjustZoomPercent(int delta);
     Q_INVOKABLE void setVisibleRange(double startRatio, double endRatio);
+    Q_INVOKABLE void ensureTimeVisible(qint64 timeUs);
 
     [[nodiscard]] QString selectedCueId() const;
     void setSelectedCueId(const QString &id);

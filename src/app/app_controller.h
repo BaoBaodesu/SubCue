@@ -58,6 +58,7 @@ class AppController : public QObject {
     Q_PROPERTY(int alignmentTotal READ alignmentTotal NOTIFY alignmentProgressChanged)
     Q_PROPERTY(bool alignmentIndeterminate READ alignmentIndeterminate NOTIFY alignmentProgressChanged)
     Q_PROPERTY(bool canExport READ canExport NOTIFY canExportChanged)
+    Q_PROPERTY(bool canReview READ canReview NOTIFY canReviewChanged)
     Q_PROPERTY(int selectedCue READ selectedCue NOTIFY selectedCueChanged)
     Q_PROPERTY(QString scriptText READ scriptText WRITE setScriptText NOTIFY scriptTextChanged)
     Q_PROPERTY(bool snapEnabled READ snapEnabled NOTIFY snapEnabledChanged)
@@ -111,6 +112,7 @@ public:
     [[nodiscard]] int alignmentTotal() const { return alignmentState_.total; }
     [[nodiscard]] bool alignmentIndeterminate() const { return alignmentState_.indeterminate(); }
     [[nodiscard]] bool canExport() const;
+    [[nodiscard]] bool canReview() const { return alignmentCompleted_; }
     [[nodiscard]] int selectedCue() const;
     [[nodiscard]] QString scriptText() const;
     void setScriptText(const QString &value);
@@ -146,8 +148,9 @@ public:
     Q_INVOKABLE void showProjectFileFolder(int row);
     Q_INVOKABLE QString localPath(const QUrl &url) const;
     Q_INVOKABLE void startAlignment();
+    Q_INVOKABLE void startReview();
     Q_INVOKABLE void cancelAlignment();
-    Q_INVOKABLE void exportSubtitles();
+    Q_INVOKABLE void exportSubtitles(const QString &outputDirectory = {});
     Q_INVOKABLE void createNextScriptCue();
     void setAlignmentOverrides(IAsrService *asr, IAiProvider *ai = nullptr);
     Q_INVOKABLE void togglePlay();
@@ -215,6 +218,7 @@ signals:
     void busyChanged();
     void alignmentProgressChanged();
     void canExportChanged();
+    void canReviewChanged();
     void selectedCueChanged();
     void scriptTextChanged();
     void snapEnabledChanged();
@@ -227,6 +231,7 @@ signals:
     void alignmentPreflightFailed(const QVariantList &issues);
     void aiConnectionTestFinished(const QString &providerId, const QVariantMap &result);
     void asrConnectionTestFinished(const QVariantMap &result);
+    void exportFinished(bool success, const QString &message, const QStringList &paths);
 
 private:
     void rememberProjectFile(const QString &path, const QString &type, qint64 durationMs = 0);
@@ -242,6 +247,7 @@ private:
     void startWaveformWorker(const QString &path);
     void stopAlignmentWorker();
     void finishAlignment(quint64 generation, AlignmentRunResult result);
+    void startAlignmentRun(bool review);
     [[nodiscard]] bool isMediaPath(const QString &path) const;
     [[nodiscard]] int activeRow() const;
     [[nodiscard]] bool setTimingMs(int row, qint64 startMs, qint64 endMs);
@@ -294,6 +300,8 @@ private:
     int alignmentProgress_ = 0;
     AlignmentProgressState alignmentState_;
     bool canExport_ = false;
+    bool alignmentCompleted_ = false;
+    bool reviewRun_ = false;
     bool hasVideo_ = false;
     bool shuttingDown_ = false;
 };

@@ -25,6 +25,8 @@ void RoughCutTimelineTests::excludesCutAndKeepsSourceOrder()
     QCOMPARE(timeline.size(), 2);
     QCOMPARE(timeline.at(0).text, QStringLiteral("A"));
     QCOMPARE(timeline.at(1).text, QStringLiteral("C"));
+    QCOMPARE(timeline.at(0).recordingIndex, 0);
+    QCOMPARE(timeline.at(1).recordingIndex, 2);
     QCOMPARE(timeline.at(1).decision, RoughCutDecision::Review);
 }
 
@@ -42,7 +44,7 @@ void RoughCutTimelineTests::clampsGapsAndProtectsCuts()
     QCOMPARE(timeline.at(0).sourceEndSample, 50'000);
     QCOMPARE(timeline.at(1).sourceStartSample, 236'160);
     const qint64 firstDuration = timeline.at(0).sourceEndSample - timeline.at(0).sourceStartSample;
-    QCOMPARE(timeline.at(1).timelineStartSample - firstDuration, 21'600);
+    QCOMPARE(timeline.at(1).timelineStartSample - firstDuration, 12'000);
 }
 
 QTEST_MAIN(RoughCutTimelineTests)

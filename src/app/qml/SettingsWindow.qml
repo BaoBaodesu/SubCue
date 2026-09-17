@@ -122,6 +122,11 @@ Window {
                         ? controller.requestCredentialStatus("SubCue/ASR/dashscope", ++settingsHost.asrCredentialRequest) : "尚未配置"
                     asrStatus.text = controller.verificationStatus("asr")
 
+                    autoReview.checked = controller.setting("autoReviewEnabled") || false
+                    reviewUseSame.checked = controller.setting("reviewUseSameAsr") !== false
+                    reviewProvider.currentIndex = indexById(asrProviderData, controller.setting("reviewAsrProvider") || "funasr")
+                    reviewModel.text = controller.setting("reviewAsrModel") || "Fun-ASR-Nano-2512"
+
                     aiAssist.checked = controller.setting("aiAssistEnabled")
                     providers = clone(controller.aiProviders())
                     aiProvider.currentIndex = indexById(providers, controller.setting("aiProviderId") || "")
@@ -249,7 +254,7 @@ Window {
                                     textRole: "name"
                                     valueRole: "id"
                                     onActivated: {
-                                        refreshAsrModels("fun-asr-flash-2026-06-15")
+                                        refreshAsrModels("")
                                         invalidateAsr()
                                     }
                                 }
@@ -330,6 +335,21 @@ Window {
                                     }
                                 }
                                 Item { Layout.fillWidth: true }
+
+                                Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
+                                SectionTitle { text: "自动复核" }
+                                FieldLabel { text: "自动开启" }
+                                SubCheckBox { id: autoReview; text: "自动打轴后立即复核（默认关闭）"; Layout.fillWidth: true }
+                                Item { Layout.fillWidth: true }
+                                FieldLabel { text: "ASR 模型" }
+                                SubCheckBox { id: reviewUseSame; text: "使用与自动打轴相同的模型"; Layout.fillWidth: true }
+                                Item { Layout.fillWidth: true }
+                                FieldLabel { text: "复核 Provider"; visible: !reviewUseSame.checked }
+                                SubComboBox { id: reviewProvider; visible: !reviewUseSame.checked; model: asrProviderData; textRole: "name"; valueRole: "id"; Layout.fillWidth: true }
+                                Item { visible: !reviewUseSame.checked; Layout.fillWidth: true }
+                                FieldLabel { text: "复核模型"; visible: !reviewUseSame.checked }
+                                SubTextField { id: reviewModel; visible: !reviewUseSame.checked; Layout.fillWidth: true; placeholderText: "Fun-ASR-Nano-2512" }
+                                StatusLabel { visible: !reviewUseSame.checked; text: "复核会重点更新低置信度及时间位置" }
 
                                 Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
                                 SectionTitle { text: "AI 辅助" }
@@ -488,12 +508,16 @@ Window {
                                             provider.selectedModel = aiModel.currentText
                                         const ok = controller.saveSettings({
                                             "asrProvider": asrProvider.currentValue,
-                                            "asrModel": asrProvider.currentValue === "dashscope" ? asrModel.currentValue : controller.setting("asrModel"),
+                                            "asrModel": asrModel.currentValue,
                                             "region": region.currentText,
                                             "asrApiHost": asrApiHost.text,
                                             "asrVerification": asrVerification,
                                             "asrConfigRevision": asrConfigRevision,
                                             "asrCredentialRevision": asrCredentialRevision,
+                                            "autoReviewEnabled": autoReview.checked,
+                                            "reviewUseSameAsr": reviewUseSame.checked,
+                                            "reviewAsrProvider": reviewProvider.currentValue || "funasr",
+                                            "reviewAsrModel": reviewModel.text.trim() || "Fun-ASR-Nano-2512",
                                             "aiAssistEnabled": aiAssist.checked,
                                             "aiProviderId": provider ? provider.id : "",
                                             "aiProviders": providers,

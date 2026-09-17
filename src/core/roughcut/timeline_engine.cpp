@@ -8,13 +8,13 @@ namespace {
 QPair<int, int> gapRange(RoughCutGapKind kind)
 {
     switch (kind) {
-    case RoughCutGapKind::WithinSentence: return {100, 180};
-    case RoughCutGapKind::Comma: return {180, 280};
-    case RoughCutGapKind::Paragraph: return {450, 700};
-    case RoughCutGapKind::Topic: return {600, 900};
-    case RoughCutGapKind::Sentence: return {300, 450};
+    case RoughCutGapKind::WithinSentence: return {120, 160};
+    case RoughCutGapKind::Comma: return {180, 220};
+    case RoughCutGapKind::Paragraph: return {300, 400};
+    case RoughCutGapKind::Topic: return {350, 400};
+    case RoughCutGapKind::Sentence: return {180, 250};
     }
-    return {300, 450};
+    return {180, 250};
 }
 
 qint64 millisecondsToSamples(int milliseconds, int sampleRate)
@@ -54,7 +54,7 @@ QVector<RoughCutTimelineClip> RoughCutTimelineEngine::build(
                 millisecondsToSamples(range.first, sampleRate),
                 millisecondsToSamples(range.second, sampleRate));
         }
-        result.append({start, end, timelineEnd, effective, -1, -1, recording.at(index).text});
+        result.append({start, end, timelineEnd, effective, -1, -1, index, recording.at(index).text});
         timelineEnd += end - start;
         previousIncluded = index;
     }

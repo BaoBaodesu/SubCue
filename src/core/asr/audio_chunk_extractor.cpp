@@ -19,6 +19,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -27,13 +28,33 @@ namespace {
 
 struct AvioBuffer final {
     QByteArray data;
+    qint64 position = 0;
 };
 
 int writeAvio(void *opaque, const uint8_t *buffer, int size)
 {
     auto *out = static_cast<AvioBuffer *>(opaque);
-    out->data.append(reinterpret_cast<const char *>(buffer), size);
+    if (out->position + size > out->data.size()) {
+        out->data.resize(out->position + size);
+    }
+    std::memcpy(out->data.data() + out->position, buffer, size);
+    out->position += size;
     return size;
+}
+
+int64_t seekAvio(void *opaque, int64_t offset, int whence)
+{
+    auto *out = static_cast<AvioBuffer *>(opaque);
+    if (whence == AVSEEK_SIZE) return out->data.size();
+    whence &= ~AVSEEK_FORCE;
+    const int64_t base = whence == SEEK_SET ? 0
+        : whence == SEEK_CUR ? out->position
+        : whence == SEEK_END ? out->data.size() : -1;
+    if (base < 0 || offset < -base || base + offset > out->data.size()) {
+        return AVERROR(EINVAL);
+    }
+    out->position = base + offset;
+    return out->position;
 }
 
 AppError cancelError()
@@ -244,7 +265,7 @@ MediaResult<QByteArray> AudioChunkExtractor::encodeFlac(const QVector<float> &pc
         avformat_free_context(format);
         return AppError(ErrorDomain::Asr, AVERROR(ENOMEM), QStringLiteral("无法分配 FLAC 缓冲"));
     }
-    AVIOContext *avio = avio_alloc_context(avioMemory, 4096, 1, &buffer, nullptr, writeAvio, nullptr);
+    AVIOContext *avio = avio_alloc_context(avioMemory, 4096, 1, &buffer, nullptr, writeAvio, seekAvio);
     if (!avio) {
         av_free(avioMemory);
         avformat_free_context(format);

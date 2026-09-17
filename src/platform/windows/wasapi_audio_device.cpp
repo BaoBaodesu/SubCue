@@ -26,6 +26,7 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace subcue {
 namespace {
@@ -181,6 +182,11 @@ struct WasapiAudioDevice::Impl {
     std::atomic<bool> stopRequested{false};
     std::atomic<double> playbackRate{1.0};
     AudioSampleProvider provider;
+    QVector<float> stretchInput;
+    QVector<float> stretchOutput;
+    QVector<float> previousGrain;
+    qint64 stretchBase = 0;
+    double stretchNext = 0.0;
 
     ~Impl()
     {
@@ -487,9 +493,13 @@ bool WasapiAudioDevice::isHardware() const
 void WasapiAudioDevice::resetResampler()
 {
     resampler_.reset();
+    impl_->stretchInput.clear();
+    impl_->stretchOutput.clear();
+    impl_->previousGrain.clear();
+    impl_->stretchBase = 0;
+    impl_->stretchNext = 0.0;
     impl_->fadeInFrames = std::max(1, impl_->mixRate / 200);
-    const int effectiveRate = std::max(1, static_cast<int>(
-        std::lround(impl_->sourceRate * impl_->playbackRate.load())));
+    const int effectiveRate = impl_->sourceRate;
     if (impl_->mixRate == effectiveRate) {
         return;
     }
@@ -607,7 +617,9 @@ qint64 WasapiAudioDevice::fillBufferDirect(unsigned char *destination, unsigned 
         return 0;
     }
     QVector<float> samples(static_cast<qsizetype>(sourceFrames) * impl_->sourceChannels);
-    const qint64 pulled = impl_->provider(samples.data(), sourceFrames);
+    const qint64 pulled = impl_->playbackRate.load() == 1.0
+        ? impl_->provider(samples.data(), sourceFrames)
+        : stretchFrames(samples.data(), sourceFrames);
     const qint64 frames = std::clamp<qint64>(pulled, 0, sourceFrames);
     applyFadeIn(samples, frames, impl_->sourceChannels);
     convertFrames(samples.constData(), impl_->sourceChannels, frames, destination,
@@ -620,12 +632,13 @@ qint64 WasapiAudioDevice::fillBufferResampled(unsigned char *destination, unsign
 {
     // 按本次设备请求反算输入量。不能只取固定余量，否则 44.1kHz -> 48kHz 时
     // 每个周期只会生成很少的有效样本，其余部分被静音填充并形成持续爆音。
-    const int effectiveRate = std::max(1, static_cast<int>(
-        std::lround(impl_->sourceRate * impl_->playbackRate.load())));
+    const int effectiveRate = impl_->sourceRate;
     const int maximumInput = static_cast<int>(av_rescale_rnd(
         available, effectiveRate, std::max(1, impl_->mixRate), AV_ROUND_UP));
     QVector<float> samples(static_cast<qsizetype>(maximumInput) * impl_->sourceChannels);
-    const qint64 pulled = impl_->provider(samples.data(), maximumInput);
+    const qint64 pulled = impl_->playbackRate.load() == 1.0
+        ? impl_->provider(samples.data(), maximumInput)
+        : stretchFrames(samples.data(), maximumInput);
     const int inputFrames = static_cast<int>(std::clamp<qint64>(pulled, 0, maximumInput));
     if (inputFrames <= 0) {
         return 0;
@@ -643,6 +656,70 @@ qint64 WasapiAudioDevice::fillBufferResampled(unsigned char *destination, unsign
                   static_cast<UINT32>(produced), impl_->mixChannels, impl_->mixBits,
                   impl_->mixValidBits, impl_->bytesPerFrame, impl_->ieeeFloat);
     return produced;
+}
+
+qint64 WasapiAudioDevice::stretchFrames(float *destination, qint64 frames)
+{
+    // 固定采样率下重叠拼接相邻音频片段：倍率只改变片段间距，不改变片段内的音高。
+    const int channels = impl_->sourceChannels;
+    const int grain = std::max(64, (impl_->sourceRate / 50) & ~1);
+    const int hop = grain / 2;
+    const int search = std::max(1, impl_->sourceRate / 250);
+    while (impl_->stretchOutput.size() / channels < frames) {
+        const qint64 expected = static_cast<qint64>(std::llround(impl_->stretchNext));
+        const qint64 earliest = impl_->previousGrain.isEmpty()
+            ? expected : std::max(impl_->stretchBase, expected - search);
+        const qint64 latest = impl_->previousGrain.isEmpty() ? expected : expected + search;
+        while (impl_->stretchBase + impl_->stretchInput.size() / channels < latest + grain) {
+            QVector<float> input(static_cast<qsizetype>(grain) * channels);
+            const qint64 pulled = impl_->provider(input.data(), grain);
+            if (pulled <= 0) break;
+            impl_->stretchInput.append(input.constBegin(),
+                                        input.constBegin() + static_cast<qsizetype>(pulled) * channels);
+        }
+        const qint64 last = impl_->stretchBase + impl_->stretchInput.size() / channels - grain;
+        if (last < earliest) break;
+        qint64 position = std::clamp(expected, earliest, last);
+        if (!impl_->previousGrain.isEmpty()) {
+            double best = -std::numeric_limits<double>::infinity();
+            for (qint64 candidate = earliest; candidate <= std::min(latest, last); candidate += 4) {
+                double similarity = 0.0;
+                for (int frame = 0; frame < hop; frame += 4) {
+                    similarity += impl_->previousGrain[(frame + hop) * channels]
+                        * impl_->stretchInput[(candidate - impl_->stretchBase + frame) * channels];
+                }
+                if (similarity > best) {
+                    best = similarity;
+                    position = candidate;
+                }
+            }
+        }
+        const float *current = impl_->stretchInput.constData()
+            + (position - impl_->stretchBase) * channels;
+        for (int frame = 0; frame < hop; ++frame) {
+            for (int channel = 0; channel < channels; ++channel) {
+                const float sample = impl_->previousGrain.isEmpty() ? current[frame * channels + channel]
+                    : (impl_->previousGrain[(frame + hop) * channels + channel]
+                       * static_cast<float>(hop - frame)
+                       + current[frame * channels + channel] * static_cast<float>(frame)) / hop;
+                impl_->stretchOutput.append(sample);
+            }
+        }
+        impl_->previousGrain = QVector<float>(current, current + grain * channels);
+        impl_->stretchNext = position + hop * impl_->playbackRate.load();
+        const qint64 discard = std::max<qint64>(0, position - search - impl_->stretchBase);
+        if (discard > 0) {
+            impl_->stretchInput.remove(0, static_cast<qsizetype>(discard) * channels);
+            impl_->stretchBase += discard;
+        }
+    }
+    const qint64 ready = std::min<qint64>(frames, impl_->stretchOutput.size() / channels);
+    if (ready > 0) {
+        std::memcpy(destination, impl_->stretchOutput.constData(),
+                    static_cast<size_t>(ready) * channels * sizeof(float));
+        impl_->stretchOutput.remove(0, static_cast<qsizetype>(ready) * channels);
+    }
+    return ready;
 }
 
 void WasapiAudioDevice::applyFadeIn(QVector<float> &samples, qint64 frames, int channels)

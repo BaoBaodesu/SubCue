@@ -49,6 +49,7 @@ private slots:
     void visibleCuesCullOutsideViewport();
     void dragPreviewDoesNotMutateDocument();
     void dragMoveSnapsAndCommitsViaCommand();
+    void dragMoveCanCrossAnotherCue();
     void dragTrimRespectsMinDurationAndNeighbors();
     void dragUndoRestoresOriginalTiming();
     void splitAtPlayheadAndUndo();
@@ -373,6 +374,33 @@ void TimelineTests::dragMoveSnapsAndCommitsViaCommand()
     QCOMPARE(document.subtitle(QStringLiteral("a"))->source, QStringLiteral("manual"));
     QCOMPARE(document.subtitle(QStringLiteral("a"))->status, QStringLiteral("MANUAL"));
     QVERIFY(commands.canUndo());
+}
+
+void TimelineTests::dragMoveCanCrossAnotherCue()
+{
+    SubtitleDocument document;
+    document.setSubtitles({
+        makeCue(QStringLiteral("a"), 0, 500),
+        makeCue(QStringLiteral("b"), 700, 1'200),
+        makeCue(QStringLiteral("c"), 2'000, 2'500),
+    });
+    SubtitleCommandManager commands(&document);
+    TimelineViewport viewport;
+    viewport.setDuration(MediaTime::fromMilliseconds(5'000));
+    SnapEngine snap;
+    snap.setEnabled(false);
+    TimelineEditor editor(&document, &commands, &viewport, &snap);
+
+    QVERIFY(editor.beginDrag(QStringLiteral("a"), CueDragMode::Move));
+    QVERIFY(editor.updateDrag(MediaTime::fromMilliseconds(1'400)));
+    QCOMPARE(editor.previewCue()->start.milliseconds(), 1'400);
+    QVERIFY(editor.endDrag());
+    QCOMPARE(document.subtitle(QStringLiteral("a"))->start.milliseconds(), 1'400);
+
+    QVERIFY(editor.beginDrag(QStringLiteral("a"), CueDragMode::Move));
+    QVERIFY(editor.updateDrag(MediaTime::fromMilliseconds(-500)));
+    QVERIFY(!editor.endDrag());
+    QCOMPARE(document.subtitle(QStringLiteral("a"))->start.milliseconds(), 1'400);
 }
 
 void TimelineTests::dragTrimRespectsMinDurationAndNeighbors()

@@ -94,6 +94,13 @@ qt_add_executable(SubCueRoughCutAlignmentTests cpp/test_roughcut_alignment.cpp)
 target_link_libraries(SubCueRoughCutAlignmentTests PRIVATE SubCue::Core Qt6::Test)
 subcue_register_test(SubCueRoughCutAlignmentTests)
 
+qt_add_executable(SubCueRoughCutAudioTests cpp/test_roughcut_audio.cpp)
+target_compile_definitions(SubCueRoughCutAudioTests PRIVATE
+    SUBCUE_TEST_MEDIA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/media"
+)
+target_link_libraries(SubCueRoughCutAudioTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueRoughCutAudioTests)
+
 qt_add_executable(SubCueRetakeDetectorTests cpp/test_retake_detector.cpp)
 target_link_libraries(SubCueRetakeDetectorTests PRIVATE SubCue::Core Qt6::Test)
 subcue_register_test(SubCueRetakeDetectorTests)

@@ -4,6 +4,8 @@
 #include "asr/dashscope_asr_service.h"
 #include "asr/http_client.h"
 #include "asr/local_python_asr_service.h"
+#include "alignment/alignment_pipeline.h"
+#include "roughcut/script_document.h"
 #include "settings/settings_manager.h"
 #include "inference/inference_manager.h"
 
@@ -119,6 +121,7 @@ private slots:
     void localModelRejectsIncompleteWeight();
     void inferenceManagerContainsWorkerFailure();
     void extractorWritesFlacAndPcm();
+    void realQwenFixtureAlignsWhenRequested();
     void qtNetworkClientDownloadsAndPosts();
 };
 
@@ -142,6 +145,17 @@ void AsrTests::chunkPlanMatchesPython()
     QCOMPARE(overflow.at(1).endMs, 270'001);
 
     const QVector<AudioChunkWindow> three = AudioChunkPlanner::plan(540.001);
+    const QVector<AudioChunkWindow> local = AudioChunkPlanner::plan(240.0, 20.0);
+    QCOMPARE(local.size(), 12);
+    QCOMPARE(local.at(0).startMs, 0);
+    QCOMPARE(local.at(0).endMs, 21'000);
+    QCOMPARE(local.at(1).startMs, 19'000);
+    QCOMPARE(local.last().endMs, 240'000);
+    const QVector<AudioChunkWindow> longMedia = AudioChunkPlanner::plan(1'200.0, 20.0);
+    QCOMPARE(longMedia.size(), 60);
+    QCOMPARE(longMedia.at(20).startMs, 399'000);
+    QCOMPARE(longMedia.at(20).endMs, 421'000);
+    QCOMPARE(longMedia.last().endMs, 1'200'000);
     QCOMPARE(three.size(), 3);
     QCOMPARE(three.at(0).endMs, 271'000);
     QCOMPARE(three.at(1).startMs, 269'000);
@@ -303,9 +317,9 @@ void AsrTests::dashscopeHttpErrorAndCancel()
 void AsrTests::factoryKeepsDashScopeDefault()
 {
     const QJsonObject defaults = SettingsManager::defaults();
-    QCOMPARE(defaults.value(QStringLiteral("asrProvider")).toString(), QStringLiteral("dashscope"));
+    QCOMPARE(defaults.value(QStringLiteral("asrProvider")).toString(), QStringLiteral("funasr"));
     QCOMPARE(defaults.value(QStringLiteral("asrModel")).toString(),
-        QStringLiteral("fun-asr-flash-2026-06-15"));
+        QStringLiteral("Fun-ASR-Nano-2512"));
     QVERIFY(!defaults.contains(QStringLiteral("whisperModel")));
     QVERIFY(!defaults.contains(QStringLiteral("whisperModelsDirectory")));
 
@@ -365,6 +379,16 @@ void AsrTests::localModelRejectsIncompleteWeight()
 void AsrTests::inferenceManagerContainsWorkerFailure()
 {
 #ifdef Q_OS_WIN
+    const InferenceProcessResult verbose = InferenceManager::instance().run(
+        QStringLiteral("powershell.exe"),
+        {QStringLiteral("-NoProfile"), QStringLiteral("-Command"),
+         QStringLiteral("[Console]::Error.Write('x' * 65536)")},
+        {}, nullptr, 10'000);
+    QVERIFY(verbose.started);
+    QVERIFY(!verbose.timedOut);
+    QCOMPARE(verbose.exitCode, 0);
+    QCOMPARE(verbose.standardError.size(), 65'536);
+
     const InferenceProcessResult result = InferenceManager::instance().run(
         QStringLiteral("cmd.exe"),
         {QStringLiteral("/d"), QStringLiteral("/c"), QStringLiteral("exit 7")});
@@ -394,6 +418,15 @@ void AsrTests::extractorWritesFlacAndPcm()
                 + std::get<AppError>(flac).technicalDetails()
             : QString()));
     QVERIFY(std::get<QByteArray>(flac).startsWith("fLaC"));
+    const QByteArray &encoded = std::get<QByteArray>(flac);
+    QVERIFY(encoded.size() >= 26);
+    quint64 declaredSamples = 0;
+    for (int index = 18; index < 26; ++index) {
+        declaredSamples = (declaredSamples << 8)
+            | static_cast<unsigned char>(encoded.at(index));
+    }
+    QCOMPARE(declaredSamples & ((1ULL << 36) - 1),
+        static_cast<quint64>(std::get<QVector<float>>(pcm).size()));
 }
 
 void AsrTests::qtNetworkClientDownloadsAndPosts()
@@ -472,6 +505,36 @@ void AsrTests::qtNetworkClientDownloadsAndPosts()
     QVERIFY(std::holds_alternative<HttpResponse>(posted));
     QCOMPARE(std::get<HttpResponse>(posted).status, 200);
     QVERIFY(std::get<HttpResponse>(posted).body.contains("Hello"));
+}
+
+void AsrTests::realQwenFixtureAlignsWhenRequested()
+{
+    if (qEnvironmentVariableIsEmpty("SUBCUE_RUN_REAL_QWEN_FIXTURE")) {
+        QSKIP("Real Qwen fixture requires an installed CUDA model");
+    }
+    const QString testDir = QDir(QString::fromUtf8(SUBCUE_TEST_MEDIA_DIR)).absoluteFilePath(
+        QStringLiteral(".."));
+    const QString documentPath = QDir(testDir).filePath(QStringLiteral("测试文案1.docx"));
+    const QString media = QDir(testDir).filePath(QStringLiteral("测试音频1.mp4"));
+    const ScriptDocumentResult parsed = ScriptDocumentImporter::loadDocx(documentPath);
+    QVERIFY2(std::holds_alternative<ScriptDocument>(parsed),
+        qPrintable(std::holds_alternative<AppError>(parsed)
+            ? std::get<AppError>(parsed).technicalDetails() : QString()));
+    QStringList lines;
+    for (const ScriptLine &line : std::get<ScriptDocument>(parsed).lines) {
+        if (!line.text.trimmed().isEmpty()) lines.append(line.text.trimmed());
+    }
+    QJsonObject settings{{QStringLiteral("asrProvider"), QStringLiteral("qwen3")},
+        {QStringLiteral("aiAssistEnabled"), false}};
+    AlignmentPipeline pipeline(settings, {});
+    const AlignmentRunResult result = pipeline.run(media, lines);
+    QVERIFY2(std::holds_alternative<AlignmentTaskOutput>(result),
+        qPrintable(std::holds_alternative<AppError>(result)
+            ? std::get<AppError>(result).userMessage() + QLatin1Char(' ')
+                + std::get<AppError>(result).technicalDetails() : QString()));
+    const AlignmentTaskOutput &output = std::get<AlignmentTaskOutput>(result);
+    QCOMPARE(output.result.subtitles.size(), lines.size());
+    QVERIFY(output.result.exportableSubtitles().size() > 100);
 }
 
 QTEST_GUILESS_MAIN(AsrTests)

@@ -212,10 +212,25 @@ void TimelineSceneItem::setView(double pixelsPerMs, double scrollOffset)
     refresh();
 }
 
+void TimelineSceneItem::adjustZoomPercent(int delta)
+{
+    viewport_.adjustZoomPercent(delta, width());
+    emit viewChanged();
+    refresh();
+}
+
 void TimelineSceneItem::setVisibleRange(double startRatio, double endRatio)
 {
     viewport_.setVisibleRange(startRatio, endRatio, width());
     emit viewChanged();
+    refresh();
+}
+
+void TimelineSceneItem::ensureTimeVisible(qint64 timeUs)
+{
+    const double previous = viewport_.scrollOffset();
+    viewport_.ensureTimeVisible(MediaTime::fromMicroseconds(std::max<qint64>(0, timeUs)), width());
+    if (!qFuzzyCompare(previous + 1.0, viewport_.scrollOffset() + 1.0)) emit viewChanged();
     refresh();
 }
 
@@ -418,13 +433,14 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
         const double right = left + layout.selectedCueRange.width;
         const double top = layout.selectedCueRange.y;
         const double bottom = top + layout.selectedCueRange.height;
-        QVector<QPointF> boundaries;
-        boundaries.reserve(4);
-        boundaries.append(QPointF(left, top));
-        boundaries.append(QPointF(left, bottom));
-        boundaries.append(QPointF(right, top));
-        boundaries.append(QPointF(right, bottom));
-        geometry->appendChildNode(makeLines(boundaries, selectedCueBoundaryColor_));
+        geometry->appendChildNode(makeRect(QRectF(left - 1.0, top, 2.0, bottom - top),
+                                           selectedCueBoundaryColor_));
+        geometry->appendChildNode(makeRect(QRectF(right - 1.0, top, 2.0, bottom - top),
+                                           selectedCueBoundaryColor_));
+        geometry->appendChildNode(makeRect(QRectF(left - 4.0, top, 8.0, 3.0), trimHandleColor_));
+        geometry->appendChildNode(makeRect(QRectF(right - 4.0, top, 8.0, 3.0), trimHandleColor_));
+        geometry->appendChildNode(makeRect(QRectF(left - 2.0, bottom - 4.0, 4.0, 4.0), trimHandleColor_));
+        geometry->appendChildNode(makeRect(QRectF(right - 2.0, bottom - 4.0, 4.0, 4.0), trimHandleColor_));
     }
 
     if (layout.subtitleTrack.height > 0.0) {

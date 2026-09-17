@@ -37,6 +37,8 @@ private slots:
     void d3d11AdapterFallsBackWithoutWindow();
     void videoPreviewItemPresentsWithoutWindow();
     void appControllerLoadsMediaAndScript();
+    void appControllerImportsDocxFixture();
+    void realFixtureCompletesAutomaticAlignmentWhenRequested();
     void unicodeMediaOpensFromDialogAndDrop();
     void projectFilesImportReopenAndRemove();
     void invalidImportPreservesCurrentMedia();
@@ -208,6 +210,47 @@ void AppControllerTests::appControllerLoadsMediaAndScript()
     controller.startAlignment();
     QTRY_VERIFY(!controller.busy());
     QVERIFY(controller.statusText().contains(QStringLiteral("前检查")));
+}
+
+void AppControllerTests::appControllerImportsDocxFixture()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    const QString path = QDir(mediaPath(QStringLiteral(".."))).filePath(
+        QStringLiteral("测试文案1.docx"));
+    QVERIFY(controller.canImportFiles({QUrl::fromLocalFile(path)}));
+    controller.importScriptPath(path);
+    QVERIFY2(controller.scriptText().startsWith(QStringLiteral("Hello 各位观众朋友们好")),
+        qPrintable(controller.statusText()));
+    QCOMPARE(controller.scriptText().split(QLatin1Char('\n')).size(), 138);
+}
+
+void AppControllerTests::realFixtureCompletesAutomaticAlignmentWhenRequested()
+{
+    if (qEnvironmentVariableIsEmpty("SUBCUE_RUN_REAL_QWEN_FIXTURE")) {
+        QSKIP("Real Qwen fixture requires an installed CUDA model");
+    }
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("asrProvider"), QStringLiteral("qwen3"));
+    context->settings.insert(QStringLiteral("aiAssistEnabled"), false);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    AppController controller(context.get());
+    const QDir testDir(mediaPath(QStringLiteral("..")));
+    controller.loadMediaPath(testDir.filePath(QStringLiteral("测试音频1.mp4")));
+    controller.importScriptPath(testDir.filePath(QStringLiteral("测试文案1.docx")));
+    QVERIFY2(controller.hasMedia(), qPrintable(controller.statusText()));
+    QVERIFY(controller.scriptText().startsWith(QStringLiteral("Hello 各位观众朋友们好")));
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 180'000);
+    QVERIFY2(controller.statusText().startsWith(QStringLiteral("打轴完成")),
+        qPrintable(controller.statusText()));
+    QCOMPARE(controller.document()->count(), 138);
+    QVERIFY(controller.canExport());
 }
 
 void AppControllerTests::unicodeMediaOpensFromDialogAndDrop()

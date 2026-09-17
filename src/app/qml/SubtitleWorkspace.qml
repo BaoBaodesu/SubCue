@@ -37,10 +37,10 @@ Item {
             if (!cue.timed) ++unlocated
             else if (cue.status === "LOW_CONFIDENCE") ++pending
         }
-        if (pending || unlocated) {
-            exportNotice.text = "待确认 " + pending + " 条，将保留导出；未定位 " + unlocated + " 条，不导出。"
-            exportNotice.open()
-        } else editor.exportSubtitles()
+        exportNotice.text = "可导出 " + (editor.subtitleModel.count - unlocated) + " 条；待确认 " + pending
+                + " 条将保留导出；未定位 " + unlocated + " 条不导出。"
+        exportDirectory.text = editor.setting("outputDirectory") || ""
+        exportNotice.open()
     }
     Dialog {
         id: exportNotice
@@ -49,8 +49,30 @@ Item {
         modal: true
         title: qsTr("导出字幕")
         standardButtons: Dialog.Ok | Dialog.Cancel
-        Label { text: exportNotice.text; color: Theme.text }
-        onAccepted: editor.exportSubtitles()
+        contentItem: ColumnLayout {
+            spacing: 10
+            Label { text: exportNotice.text; color: Theme.text; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Label { text: qsTr("导出文件夹"); color: Theme.muted }
+            RowLayout {
+                Layout.fillWidth: true
+                SubTextField { id: exportDirectory; Layout.fillWidth: true; placeholderText: qsTr("留空使用媒体所在文件夹") }
+                SubButton { text: qsTr("浏览…"); onClicked: exportFolderDialog.open() }
+            }
+        }
+        onAccepted: editor.exportSubtitles(exportDirectory.text)
+    }
+    FolderDialog {
+        id: exportFolderDialog
+        title: qsTr("选择导出文件夹")
+        onAccepted: exportDirectory.text = editor.localPath(selectedFolder)
+    }
+    Dialog {
+        id: exportResultDialog
+        property string text: ""
+        anchors.centerIn: parent
+        modal: true
+        standardButtons: Dialog.Ok
+        Label { text: exportResultDialog.text; color: Theme.text; wrapMode: Text.WrapAnywhere }
     }
 
     Connections {
@@ -58,6 +80,11 @@ Item {
         function onAlignmentPreflightFailed(issues) {
             window.preflightIssues = issues
             preflightDialog.open()
+        }
+        function onExportFinished(success, message, paths) {
+            exportResultDialog.title = success ? qsTr("导出成功") : qsTr("导出失败")
+            exportResultDialog.text = message
+            exportResultDialog.open()
         }
 
     }
@@ -144,6 +171,7 @@ Item {
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("自动打轴"); enabled: !editor.busy; onClicked: editor.startAlignment() }
             MenuButton { text: qsTr("取消"); enabled: editor.busy; onClicked: editor.cancelAlignment() }
+            MenuButton { text: qsTr("复核"); enabled: editor.canReview && !editor.busy; onClicked: editor.startReview() }
             MenuButton { text: qsTr("导出"); enabled: editor.canExport && !editor.busy; onClicked: window.requestExport() }
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("设置"); onClicked: window.openSettings() }
@@ -515,7 +543,7 @@ Item {
                         model: editor.subtitleModel
                         currentIndex: editor.selectedCue
                         onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
-                        ScrollBar.vertical: SubScrollBar { }
+                        ScrollBar.vertical: SubScrollBar { anchors.left: parent.left }
 
                         delegate: Rectangle {
                             id: rowItem
@@ -590,7 +618,7 @@ Item {
                                 }
                                 preventStealing: !rowItem.timed
                                 cursorShape: placing ? Qt.ClosedHandCursor : Qt.ArrowCursor
-                                onClicked: editor.selectCue(index, mouseX > width - 140)
+                                onClicked: editor.selectCue(index)
                                 onDoubleClicked: {
                                     editor.selectCue(index, false)
                                     editor.createOrEditCue()
@@ -883,9 +911,9 @@ Item {
         }
     }
 
-    Shortcut { sequence: "Ctrl+O"; onActivated: window.openMediaDialog() }
-    Shortcut { sequence: "Ctrl+I"; onActivated: window.openMediaDialog() }
-    Shortcut { sequence: "Space"; enabled: !window.textEditing; onActivated: editor.togglePlay() }
+    Shortcut { sequence: "Ctrl+O"; enabled: window.visible; onActivated: window.openMediaDialog() }
+    Shortcut { sequence: "Ctrl+I"; enabled: window.visible; onActivated: window.openMediaDialog() }
+    Shortcut { sequence: "Space"; enabled: window.visible && !window.textEditing; onActivated: editor.togglePlay() }
     Shortcut { sequence: "Ctrl+Z"; enabled: !window.textEditing; onActivated: editor.undo() }
     Shortcut { sequence: "Ctrl+Y"; enabled: !window.textEditing; onActivated: editor.redo() }
     Shortcut { sequence: "Delete"; enabled: !window.textEditing; onActivated: editor.deleteCue() }

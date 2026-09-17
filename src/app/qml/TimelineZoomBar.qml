@@ -6,13 +6,17 @@ Rectangle {
     height: 24
     color: Theme.scrollTrack
     border.color: Theme.border
+    LayoutMirroring.enabled: false
+    LayoutMirroring.childrenInherit: true
     readonly property bool interacting: mouse.pressed
     readonly property real totalMs: Math.max(1, timeline.durationUs / 1000)
-    readonly property real startRatio: Math.max(0, timeline.scrollOffset / timeline.pixelsPerMs / totalMs)
-    readonly property real endRatio: Math.min(1, (timeline.scrollOffset + timeline.width) / timeline.pixelsPerMs / totalMs)
+    readonly property real startRatio: Math.max(0, Math.min(1, timeline.scrollOffset / timeline.pixelsPerMs / totalMs))
+    readonly property real endRatio: Math.max(startRatio, Math.min(1, (timeline.scrollOffset + timeline.width) / timeline.pixelsPerMs / totalMs))
+    readonly property real spanRatio: Math.max(0, Math.min(1, endRatio - startRatio))
     readonly property real minimumRatio: Math.min(1, timeline.width / (10 * totalMs))
-    readonly property real rangeWidth: Math.min(width, Math.max(40, width * (endRatio - startRatio)))
-    readonly property real rangeX: Math.min(width - rangeWidth, width * startRatio)
+    readonly property real rangeWidth: Math.min(width, Math.max(40, width * spanRatio))
+    readonly property real rangeX: spanRatio >= 1 ? 0 : Math.max(0, Math.min(width - rangeWidth,
+        (width - rangeWidth) * startRatio / Math.max(0.000001, 1 - spanRatio)))
 
     Rectangle {
         x: bar.rangeX
@@ -45,7 +49,14 @@ Rectangle {
                      : (pressed ? mode : hitMode(mouseX)) > 0 ? Qt.SizeHorCursor : Qt.ArrowCursor
         onPressed: function(event) {
             mode = hitMode(event.x)
-            if (!mode) { event.accepted = false; return }
+            if (!mode) {
+                const span = bar.endRatio - bar.startRatio
+                const travel = Math.max(1, bar.width - bar.rangeWidth)
+                const start = Math.max(0, Math.min(1 - span,
+                    (event.x - bar.rangeWidth / 2) / travel * (1 - span)))
+                bar.timeline.scrollOffset = start * bar.totalMs * bar.timeline.pixelsPerMs
+                mode = 3
+            }
             pressX = event.x
             initialStart = bar.startRatio
             initialEnd = bar.endRatio
@@ -58,7 +69,10 @@ Rectangle {
             } else if (mode === 2) {
                 bar.timeline.setVisibleRange(initialStart, Math.min(1, Math.max(initialStart + bar.minimumRatio, initialEnd + delta)))
             } else if (mode === 3) {
-                const start = Math.max(0, Math.min(1 - (initialEnd - initialStart), initialStart + delta))
+                const span = initialEnd - initialStart
+                const travel = Math.max(1, bar.width - bar.rangeWidth)
+                const start = Math.max(0, Math.min(1 - span,
+                    initialStart + (event.x - pressX) / travel * (1 - span)))
                 bar.timeline.scrollOffset = start * bar.totalMs * bar.timeline.pixelsPerMs
             }
         }

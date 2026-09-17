@@ -28,7 +28,11 @@ class RoughCutController final : public QObject {
     Q_PROPERTY(QString projectPath READ projectPath NOTIFY projectChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    Q_PROPERTY(int progressPercent READ progressPercent NOTIFY progressChanged)
     Q_PROPERTY(bool playing READ playing NOTIFY playbackChanged)
+    Q_PROPERTY(bool timelineActive READ timelineActive NOTIFY playbackChanged)
+    Q_PROPERTY(bool timelinePaused READ timelinePaused NOTIFY playbackChanged)
+    Q_PROPERTY(bool continuousAudition READ continuousAudition WRITE setContinuousAudition NOTIFY playbackChanged)
     Q_PROPERTY(double playbackRate READ playbackRate NOTIFY playbackChanged)
     Q_PROPERTY(bool canUndo READ canUndo NOTIFY historyChanged)
     Q_PROPERTY(bool canRedo READ canRedo NOTIFY historyChanged)
@@ -47,7 +51,11 @@ public:
     [[nodiscard]] QString projectPath() const { return projectPath_; }
     [[nodiscard]] QString statusText() const { return statusText_; }
     [[nodiscard]] bool busy() const noexcept { return busy_; }
+    [[nodiscard]] int progressPercent() const noexcept { return progressPercent_; }
     [[nodiscard]] bool playing() const noexcept { return !playback_.isPaused(); }
+    [[nodiscard]] bool timelineActive() const noexcept { return timelinePlaybackIndex_ >= 0; }
+    [[nodiscard]] bool timelinePaused() const noexcept { return timelinePaused_; }
+    [[nodiscard]] bool continuousAudition() const noexcept { return continuousAudition_; }
     [[nodiscard]] double playbackRate() const noexcept { return playbackRate_; }
     [[nodiscard]] bool canUndo() const noexcept { return historyIndex_ > 0; }
     [[nodiscard]] bool canRedo() const noexcept { return historyIndex_ < history_.size(); }
@@ -68,14 +76,19 @@ public:
     Q_INVOKABLE void togglePlay();
     Q_INVOKABLE void setPlaybackRate(double rate);
     Q_INVOKABLE void seek(qint64 positionMs);
+    Q_INVOKABLE void seekTimeline(qint64 positionMs);
+    Q_INVOKABLE void locateResult(int row);
     Q_INVOKABLE void audition(int row);
     Q_INVOKABLE void playTimeline();
+    Q_INVOKABLE void toggleTimelinePlay();
+    Q_INVOKABLE void setContinuousAudition(bool enabled);
     Q_INVOKABLE void stopTimeline();
     Q_INVOKABLE void setDecision(int row, const QString &decision);
     Q_INVOKABLE void restoreAutoDecision(int row);
     Q_INVOKABLE void undo();
     Q_INVOKABLE void redo();
     Q_INVOKABLE void exportXml(const QUrl &url);
+    Q_INVOKABLE void exportWav(const QUrl &url);
 
 signals:
     void mediaChanged();
@@ -83,6 +96,7 @@ signals:
     void projectChanged();
     void statusChanged();
     void busyChanged();
+    void progressChanged();
     void playbackChanged();
     void historyChanged();
     void positionChanged();
@@ -119,6 +133,8 @@ private:
     qint64 auditionEndSample_ = -1;
     int timelinePlaybackIndex_ = -1;
     qint64 timelineGapDeadlineMs_ = -1;
+    bool timelinePaused_ = false;
+    bool continuousAudition_ = true;
     QElapsedTimer timelinePlaybackClock_;
     QVector<RoughCutTimelineClip> timeline_;
     QVector<Edit> history_;
@@ -126,6 +142,7 @@ private:
     int analysisVersion_ = 0;
     QVector<RoughCutAuxiliaryResult> auxiliaryResults_;
     bool busy_ = false;
+    int progressPercent_ = 0;
     double playbackRate_ = 1.0;
     std::atomic<bool> cancel_{false};
     std::atomic<quint64> workerGeneration_{0};

@@ -19,7 +19,10 @@ public:
         EvidenceRole,
         StartMsRole,
         EndMsRole,
-        UserOverrideRole
+        UserOverrideRole,
+        TakeGroupRole,
+        BestTakeRole,
+        ScoreRole
     };
 
     explicit RoughCutResultModel(QObject *parent = nullptr);
@@ -32,7 +35,7 @@ public:
     [[nodiscard]] const QVector<RecognizedPassage> &recording() const noexcept { return recording_; }
     [[nodiscard]] const QVector<RoughCutSegmentDecision> &decisions() const noexcept { return decisions_; }
     [[nodiscard]] bool setUserDecision(int row, std::optional<RoughCutDecision> decision);
-    void applyAuxiliaryResult(RoughCutAuxiliaryResult result);
+    void applyAuxiliaryResult(RoughCutAuxiliaryResult result, const QString &providerName);
 
 private:
     QVector<RecognizedPassage> recording_;

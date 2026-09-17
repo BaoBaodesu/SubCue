@@ -116,14 +116,14 @@ ApplicationWindow {
         title: qsTr("导入素材")
         parentWindow: window
         fileMode: FileDialog.OpenFiles
-        nameFilters: [qsTr("支持的素材 (*.wav *.mp3 *.m4a *.flac *.aac *.mp4 *.mov *.mkv *.webm *.avi *.m4v *.wmv *.mpg *.mpeg *.mts *.m2ts *.ts *.mxf *.ogg *.opus *.wma *.aif *.aiff *.txt *.srt)"), qsTr("所有文件 (*)")]
+        nameFilters: [qsTr("支持的素材 (*.wav *.mp3 *.m4a *.flac *.aac *.mp4 *.mov *.mkv *.webm *.avi *.m4v *.wmv *.mpg *.mpeg *.mts *.m2ts *.ts *.mxf *.ogg *.opus *.wma *.aif *.aiff *.txt *.srt *.docx)"), qsTr("所有文件 (*)")]
         onAccepted: editor.importFiles(selectedFiles)
     }
     FileDialog {
         id: scriptDialog
         title: qsTr("导入字幕文稿")
         parentWindow: window
-        nameFilters: [qsTr("字幕文稿 (*.txt *.srt)"), qsTr("所有文件 (*)")]
+        nameFilters: [qsTr("字幕文稿 (*.txt *.srt *.docx)"), qsTr("所有文件 (*)")]
         onAccepted: editor.importScript(selectedFile)
     }
     function openMediaDialog() { mediaDialog.open() }
@@ -564,7 +564,7 @@ ApplicationWindow {
                         model: editor.subtitleModel
                         currentIndex: editor.selectedCue
                         onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
-                        ScrollBar.vertical: SubScrollBar { }
+                        ScrollBar.vertical: SubScrollBar { anchors.left: parent.left }
 
                         delegate: Rectangle {
                             id: rowItem
@@ -639,7 +639,7 @@ ApplicationWindow {
                                 }
                                 preventStealing: !rowItem.timed
                                 cursorShape: placing ? Qt.ClosedHandCursor : Qt.ArrowCursor
-                                onClicked: editor.selectCue(index, mouseX > width - 140)
+                                onClicked: editor.selectCue(index)
                                 onDoubleClicked: {
                                     editor.selectCue(index, false)
                                     editor.createOrEditCue()

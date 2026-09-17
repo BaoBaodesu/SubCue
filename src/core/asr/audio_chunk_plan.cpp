@@ -9,17 +9,23 @@ namespace subcue {
 
 QVector<AudioChunkWindow> AudioChunkPlanner::plan(double durationSeconds)
 {
+    return plan(durationSeconds, kAsrChunkDurationSeconds);
+}
+
+QVector<AudioChunkWindow> AudioChunkPlanner::plan(double durationSeconds, double chunkDurationSeconds)
+{
     durationSeconds = std::max(0.0, durationSeconds);
     const int count = std::max(1,
-        static_cast<int>(std::floor((durationSeconds + 269.999) / kAsrChunkDurationSeconds)));
+        static_cast<int>(std::floor((durationSeconds + chunkDurationSeconds - 0.001)
+            / chunkDurationSeconds)));
     QVector<AudioChunkWindow> windows;
     windows.reserve(count);
     for (int index = 0; index < count; ++index) {
         const double start = std::max(0.0,
-            static_cast<double>(index) * kAsrChunkDurationSeconds
+            static_cast<double>(index) * chunkDurationSeconds
                 - (index == 0 ? 0.0 : kAsrChunkOverlapSeconds));
         const double end = std::min(durationSeconds,
-            (static_cast<double>(index) + 1.0) * kAsrChunkDurationSeconds + kAsrChunkOverlapSeconds);
+            (static_cast<double>(index) + 1.0) * chunkDurationSeconds + kAsrChunkOverlapSeconds);
         windows.push_back(AudioChunkWindow{
             start,
             end,

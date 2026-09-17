@@ -5,6 +5,8 @@
 #include <QtCore/QUrl>
 #include <QtCore/QXmlStreamWriter>
 
+#include <algorithm>
+
 namespace subcue {
 namespace {
 
@@ -134,8 +136,15 @@ QByteArray XmemlExporter::build(const RoughCutExportRequest &request)
     xml.writeAttribute(QStringLiteral("id"), QStringLiteral("sequence-1"));
     writeTextElement(xml, QStringLiteral("name"), request.sequenceName);
     qint64 timelineDuration = 0;
-    for (const RoughCutSourceClip &clip : request.clips)
-        timelineDuration += ceilFrame(clip.sourceEndSample, request) - floorFrame(clip.sourceStartSample, request);
+    qint64 sequentialStart = 0;
+    for (const RoughCutSourceClip &clip : request.clips) {
+        const qint64 start = clip.timelineStartSample >= 0
+            ? floorFrame(clip.timelineStartSample, request) : sequentialStart;
+        const qint64 duration = ceilFrame(clip.sourceEndSample, request)
+            - floorFrame(clip.sourceStartSample, request);
+        timelineDuration = std::max(timelineDuration, start + duration);
+        sequentialStart = start + duration;
+    }
     writeTextElement(xml, QStringLiteral("duration"), QString::number(timelineDuration));
     writeRate(xml, request);
     xml.writeStartElement(QStringLiteral("media"));
@@ -154,12 +163,14 @@ QByteArray XmemlExporter::build(const RoughCutExportRequest &request)
         qint64 timelineStart = 0;
         for (qsizetype index = 0; index < request.clips.size(); ++index) {
             const RoughCutSourceClip &clip = request.clips.at(index);
+            const qint64 clipTimelineStart = clip.timelineStartSample >= 0
+                ? floorFrame(clip.timelineStartSample, request) : timelineStart;
             writeClipItem(xml, request, clip,
                 QStringLiteral("rough-%1-%2").arg(channel + 1).arg(index + 1), channel,
-                timelineStart, sourceDurationFrames, true, includeFileDetails,
+                clipTimelineStart, sourceDurationFrames, true, includeFileDetails,
                 static_cast<int>(index), false);
             includeFileDetails = false;
-            timelineStart += ceilFrame(clip.sourceEndSample, request)
+            timelineStart = clipTimelineStart + ceilFrame(clip.sourceEndSample, request)
                 - floorFrame(clip.sourceStartSample, request);
         }
         writeTextElement(xml, QStringLiteral("enabled"), QStringLiteral("TRUE"));

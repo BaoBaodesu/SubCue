@@ -171,10 +171,14 @@ qt_add_library(SubCueCore STATIC
     src/core/roughcut/rough_cut_project.h
     src/core/roughcut/timeline_engine.cpp
     src/core/roughcut/timeline_engine.h
+    src/core/roughcut/wav_exporter.cpp
+    src/core/roughcut/wav_exporter.h
     src/core/roughcut/script_document.cpp
     src/core/roughcut/script_document.h
     src/core/roughcut/script_matcher.cpp
     src/core/roughcut/script_matcher.h
+    src/core/roughcut/speech_segment_analyzer.cpp
+    src/core/roughcut/speech_segment_analyzer.h
     src/core/roughcut/xmeml_exporter.cpp
     src/core/roughcut/xmeml_exporter.h
     src/core/preview/preview_renderer.h
@@ -305,6 +309,7 @@ if(SUBCUE_BUILD_APP)
         RESOURCES
             src/app/qml/icons/play.svg
             src/app/qml/icons/pause.svg
+            src/app/qml/icons/stop.svg
             src/app/qml/icons/step-back.svg
             src/app/qml/icons/step-forward.svg
             src/app/qml/icons/minus.svg

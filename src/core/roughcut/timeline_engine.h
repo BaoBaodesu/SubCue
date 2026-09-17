@@ -13,6 +13,7 @@ struct RoughCutTimelineClip final {
     RoughCutDecision decision = RoughCutDecision::Review;
     int scriptLineId = -1;
     int retakeGroupId = -1;
+    int recordingIndex = -1;
     QString text;
 };
 
@@ -23,7 +24,7 @@ public:
         const QVector<RoughCutSegmentDecision> &decisions,
         int sampleRate, qint64 sourceSampleCount,
         const QVector<RoughCutGapKind> &gaps = {},
-        int preRollMs = 80, int postRollMs = 120);
+        int preRollMs = 80, int postRollMs = 100);
 };
 
 } // namespace subcue

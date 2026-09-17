@@ -42,6 +42,7 @@ private:
     [[nodiscard]] qint64 fillBufferResampled(unsigned char *destination, unsigned int available);
     void applyFadeIn(QVector<float> &samples, qint64 frames, int channels);
     void resetResampler();
+    [[nodiscard]] qint64 stretchFrames(float *destination, qint64 frames);
     void joinWorker();
 
     std::unique_ptr<Impl> impl_;

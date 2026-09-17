@@ -34,14 +34,18 @@ QJsonObject SettingsManager::defaults()
         {QStringLiteral("outputSrt"), true},
         {QStringLiteral("outputAss"), true},
         {QStringLiteral("outputDirectory"), QString()},
+        {QStringLiteral("autoReviewEnabled"), false},
+        {QStringLiteral("reviewUseSameAsr"), true},
+        {QStringLiteral("reviewAsrProvider"), QStringLiteral("funasr")},
+        {QStringLiteral("reviewAsrModel"), QStringLiteral("Fun-ASR-Nano-2512")},
         {QStringLiteral("aiAssistEnabled"), false},
         {QStringLiteral("aiProviderId"), QString()},
         {QStringLiteral("aiProviders"), QJsonArray{}},
         {QStringLiteral("asrVerification"), QJsonObject{}},
         {QStringLiteral("asrConfigRevision"), 0},
         {QStringLiteral("asrCredentialRevision"), 0},
-        {QStringLiteral("asrModel"), QStringLiteral("fun-asr-flash-2026-06-15")},
-        {QStringLiteral("asrProvider"), QStringLiteral("dashscope")},
+        {QStringLiteral("asrModel"), QStringLiteral("Fun-ASR-Nano-2512")},
+        {QStringLiteral("asrProvider"), QStringLiteral("funasr")},
         {QStringLiteral("qwen3AsrModelsDirectory"),
          QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("qwen3-asr-0.6b"))},
         {QStringLiteral("qwen3ForcedAlignerModelsDirectory"),
@@ -88,6 +92,10 @@ QJsonObject SettingsManager::load() const
         && loaded.value(QStringLiteral("aiProviders")).toArray().isEmpty()) {
         // 旧版 Qwen 配置不再隐式创建云 Provider，等待用户显式配置兼容端点。
         result.insert(QStringLiteral("aiAssistEnabled"), false);
+    }
+    if (!loaded.contains(QStringLiteral("asrProvider"))) {
+        // 旧配置中的模型名来自云端，不将其误认为本地 Fun-ASR 模型。
+        result.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));
     }
     if (result.value(QStringLiteral("asrProvider")).toString() == QLatin1String("whisper")) {
         result.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));

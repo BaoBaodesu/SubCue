@@ -31,12 +31,20 @@ void RoughCutProjectTests::roundTripPreservesManualDecision()
     project.channels = 2;
     project.sourceSampleCount = 96'000;
     project.recording = {{QStringLiteral("p1"), QStringLiteral("第一句。"), 100, 10'000}};
+    project.recording[0].silenceBeforeSamples = 100;
+    project.recording[0].silenceAfterSamples = 500;
+    project.recording[0].vadConfidence = 0.92;
+    project.recording[0].boundaryTrustworthy = true;
+    project.recording[0].scriptLineIndex = 3;
+    project.recording[0].takeGroupId = 2;
     RoughCutSegmentDecision decision;
     decision.recordingIndex = 0;
     decision.autoDecision = RoughCutDecision::Review;
     decision.userDecision = RoughCutDecision::Keep;
     decision.reason = QStringLiteral("人工确认");
     decision.evidence = {QStringLiteral("边界可信")};
+    decision.takeGroupId = 2;
+    decision.bestTake = true;
     project.decisions = {decision};
     project.auxiliaryResults = {{0, QStringLiteral("第一句。"), QStringLiteral("第一句"),
         QStringLiteral("第一句"), false, false, false}};
@@ -49,6 +57,12 @@ void RoughCutProjectTests::roundTripPreservesManualDecision()
     QCOMPARE(loaded->mediaPath, mediaPath);
     QCOMPARE(loaded->mediaSha256, project.mediaSha256);
     QCOMPARE(loaded->recording.constFirst().text, QStringLiteral("第一句。"));
+    QCOMPARE(loaded->recording.constFirst().silenceBeforeSamples, 100);
+    QCOMPARE(loaded->recording.constFirst().silenceAfterSamples, 500);
+    QCOMPARE(loaded->recording.constFirst().vadConfidence, 0.92);
+    QVERIFY(loaded->recording.constFirst().boundaryTrustworthy);
+    QCOMPARE(loaded->recording.constFirst().takeGroupId, 2);
+    QVERIFY(loaded->decisions.constFirst().bestTake);
     QCOMPARE(loaded->decisions.constFirst().userDecision, std::optional(RoughCutDecision::Keep));
     QCOMPARE(loaded->decisions.constFirst().evidence, QStringList{QStringLiteral("边界可信")});
     QCOMPARE(loaded->auxiliaryResults.constFirst().whisperText, QStringLiteral("第一句"));

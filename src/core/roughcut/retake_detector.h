@@ -10,6 +10,9 @@ struct RoughCutTake final {
     int recordingIndex = -1;
     double score = 0.0;
     QStringList reasons;
+    bool complete = false;
+    bool interruption = false;
+    bool restartMarker = false;
 };
 
 struct RoughCutRetakeGroup final {
@@ -17,6 +20,9 @@ struct RoughCutRetakeGroup final {
     int recommendedRecordingIndex = -1;
     bool needsReview = true;
     QString reason;
+    int id = -1;
+    int scriptLineIndex = -1;
+    double confidence = 0.0;
 };
 
 class RetakeDetector final {

@@ -122,7 +122,8 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
     AnalysisCache cache;
     const QFileInfo modelWeight(QDir(modelDirectory_).filePath(QStringLiteral("model.safetensors")));
     const QJsonObject cacheParameters{
-        {QStringLiteral("chunkSeconds"), kAsrChunkDurationSeconds},
+        {QStringLiteral("chunkSeconds"), providerId_ == QLatin1String("qwen3")
+            ? 20.0 : kAsrChunkDurationSeconds},
         {QStringLiteral("overlapSeconds"), kAsrChunkOverlapSeconds},
         {QStringLiteral("forcedAligner"), forcedAlignerDirectory_},
         {QStringLiteral("modelBytes"), modelWeight.size()},
@@ -139,7 +140,8 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
     const ProbeResult probed = MediaProbe::probe(request.mediaPath);
     if (std::holds_alternative<AppError>(probed)) return std::get<AppError>(probed);
     const QVector<AudioChunkWindow> windows = AudioChunkPlanner::plan(
-        std::get<MediaInfo>(probed).duration.seconds());
+        std::get<MediaInfo>(probed).duration.seconds(),
+        providerId_ == QLatin1String("qwen3") ? 20.0 : kAsrChunkDurationSeconds);
     QTemporaryDir temporary;
     if (!temporary.isValid()) return AppError(ErrorDomain::Asr,
         static_cast<int>(AsrErrorCode::InvalidRequest), QStringLiteral("无法创建本地 ASR 临时目录。"));

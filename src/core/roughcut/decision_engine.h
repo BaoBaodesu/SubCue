@@ -16,6 +16,8 @@ struct RoughCutSegmentDecision final {
     double ruleScore = 0.0;
     QString reason;
     QStringList evidence;
+    int takeGroupId = -1;
+    bool bestTake = false;
 
     [[nodiscard]] RoughCutDecision effectiveDecision() const
     {

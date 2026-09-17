@@ -42,6 +42,7 @@ InferenceProcessResult InferenceManager::run(
     timer.start();
     QByteArray pendingOutput;
     const auto readOutput = [&] {
+        result.standardError.append(process.readAllStandardError());
         const QByteArray output = process.readAllStandardOutput();
         result.standardOutput.append(output);
         pendingOutput.append(output);
@@ -70,7 +71,7 @@ InferenceProcessResult InferenceManager::run(
     readOutput();
     if (event && !pendingOutput.trimmed().isEmpty()) event(pendingOutput.trimmed());
     result.exitCode = process.exitCode();
-    result.standardError = process.readAllStandardError();
+    result.standardError.append(process.readAllStandardError());
     return result;
 }
 
