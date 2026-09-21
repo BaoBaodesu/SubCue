@@ -327,6 +327,7 @@ if(SUBCUE_BUILD_APP)
             src/app/qml/icons/step-forward.svg
             src/app/qml/icons/minus.svg
             src/app/qml/icons/plus.svg
+            src/app/qml/icons/app-icon.png
         SOURCES
             src/app/timeline_scene_item.cpp
             src/app/timeline_scene_item.h
@@ -351,6 +352,7 @@ if(SUBCUE_BUILD_APP)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
     set_target_properties(SubCue PROPERTIES WIN32_EXECUTABLE TRUE OUTPUT_NAME "SubCue")
     if(WIN32)
+        target_sources(SubCue PRIVATE src/app/resources/app.rc)
         # VS 调试（F5）时补齐运行时目录：Qt 的调试 DLL 与发行版同目录，FFmpeg 的
         # 调试 DLL 单独位于 debug/bin，二者都不在默认 PATH 上。
         set_target_properties(SubCue PROPERTIES

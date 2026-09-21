@@ -3,6 +3,7 @@
 #include "subtitle/subtitle_document.h"
 
 #include <QtCore/QObject>
+#include <QtCore/QVector>
 #include <QtGui/QUndoStack>
 
 namespace subcue {
@@ -27,6 +28,7 @@ public:
     bool split(const QString &id, MediaTime splitTime, QString firstText, QString secondText);
     bool merge(const QString &firstId, const QString &secondId, QString text);
     bool editText(const QString &id, QString text);
+    bool replaceMany(QVector<Subtitle> updated, const QString &commandText);
 
     Q_INVOKABLE void undo();
     Q_INVOKABLE void redo();

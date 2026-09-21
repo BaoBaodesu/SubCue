@@ -72,6 +72,11 @@ void RoughCutXmlTests::exportsNonDestructiveTimeline()
     QCOMPARE(fileReferences, 5);
     QCOMPARE(roughItems, 4);
     QCOMPARE(referenceItems, 2);
+    QCOMPARE(data.count("premiereTrackType=\"Stereo\""), 4);
+    QCOMPARE(data.count("premiereChannelType=\"stereo\""), 6);
+    QCOMPARE(data.count("totalExplodedTrackCount=\"2\""), 4);
+    QCOMPARE(data.count("<outputchannelindex>1</outputchannelindex>"), 2);
+    QCOMPARE(data.count("<outputchannelindex>2</outputchannelindex>"), 2);
     QCOMPARE(data.count(QUrl::fromLocalFile(QFileInfo(media.fileName()).absoluteFilePath()).toEncoded()), 1);
     QCOMPARE(data.count("<enabled>FALSE</enabled>"), 4);
 }

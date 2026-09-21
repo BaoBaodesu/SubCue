@@ -10,6 +10,7 @@ class RoughCutTimelineTests final : public QObject {
 private slots:
     void excludesCutAndKeepsSourceOrder();
     void clampsGapsAndProtectsCuts();
+    void retainsSentenceEndingAfterAlignedWord();
 };
 
 void RoughCutTimelineTests::excludesCutAndKeepsSourceOrder()
@@ -45,6 +46,16 @@ void RoughCutTimelineTests::clampsGapsAndProtectsCuts()
     QCOMPARE(timeline.at(1).sourceStartSample, 236'160);
     const qint64 firstDuration = timeline.at(0).sourceEndSample - timeline.at(0).sourceStartSample;
     QCOMPARE(timeline.at(1).timelineStartSample - firstDuration, 12'000);
+}
+
+void RoughCutTimelineTests::retainsSentenceEndingAfterAlignedWord()
+{
+    const QVector<RecognizedPassage> recording{
+        {QStringLiteral("a"), QStringLiteral("一句话"), 48'000, 96'000}};
+    const QVector<RoughCutSegmentDecision> decisions{{0, RoughCutDecision::Keep}};
+    const auto timeline = RoughCutTimelineEngine::build(recording, decisions, 48'000, 144'000);
+    QCOMPARE(timeline.size(), 1);
+    QCOMPARE(timeline.constFirst().sourceEndSample, 108'000);
 }
 
 QTEST_MAIN(RoughCutTimelineTests)

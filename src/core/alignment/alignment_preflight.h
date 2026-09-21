@@ -11,10 +11,7 @@ namespace subcue {
 
 struct PreflightState final {
     bool asrCredentialExists = false;
-    bool aiCredentialExists = false;
     bool asrVerified = false;
-    bool aiVerified = false;
-    bool aiProviderOverride = false;
 };
 
 class AlignmentPreflight final {

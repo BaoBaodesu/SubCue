@@ -21,7 +21,7 @@ SettingsManager::SettingsManager(QString path)
 QJsonObject SettingsManager::defaults()
 {
     return {
-        {QStringLiteral("version"), 2},
+        {QStringLiteral("version"), 3},
         {QStringLiteral("appearanceMode"), QStringLiteral("dark")},
         {QStringLiteral("fontFamily"), QStringLiteral("Microsoft YaHei")},
         {QStringLiteral("fontSize1080p"), 52},
@@ -38,9 +38,18 @@ QJsonObject SettingsManager::defaults()
         {QStringLiteral("reviewUseSameAsr"), true},
         {QStringLiteral("reviewAsrProvider"), QStringLiteral("funasr")},
         {QStringLiteral("reviewAsrModel"), QStringLiteral("Fun-ASR-Nano-2512")},
-        {QStringLiteral("aiAssistEnabled"), false},
-        {QStringLiteral("aiProviderId"), QString()},
-        {QStringLiteral("aiProviders"), QJsonArray{}},
+        {QStringLiteral("legacyAiCredentialIds"), QJsonArray{}},
+        {QStringLiteral("omniReviewTimeoutMs"), 120000},
+        {QStringLiteral("omniReviewCutConfidence"), 0.90},
+        {QStringLiteral("omniReviewReviewConfidence"), 0.65},
+        {QStringLiteral("omniReviewMinTailMs"), 150},
+        {QStringLiteral("omniReviewPreferredTailMs"), 250},
+        {QStringLiteral("omniReviewMaxTailMs"), 500},
+        {QStringLiteral("omniReviewHandleMs"), 150},
+        {QStringLiteral("omniReviewWindowMs"), 90000},
+        {QStringLiteral("omniReviewOverlapMs"), 15000},
+        {QStringLiteral("omniReviewCandidatePreMs"), 8000},
+        {QStringLiteral("omniReviewCandidatePostMs"), 15000},
         {QStringLiteral("asrVerification"), QJsonObject{}},
         {QStringLiteral("asrConfigRevision"), 0},
         {QStringLiteral("asrCredentialRevision"), 0},
@@ -85,13 +94,36 @@ QJsonObject SettingsManager::load() const
     const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &error);
     if (error.error != QJsonParseError::NoError || !document.isObject()) return result;
     const QJsonObject loaded = document.object();
+    const int loadedVersion = loaded.value(QStringLiteral("version")).toInt(1);
+    const QStringList droppedAiKeys = {
+        QStringLiteral("aiAssistEnabled"),
+        QStringLiteral("aiProviderId"),
+        QStringLiteral("aiProviders"),
+        QStringLiteral("omniReviewEnabled"),
+        QStringLiteral("omniReviewProvider"),
+        QStringLiteral("omniReviewModel"),
+        QStringLiteral("omniReviewBaseUrl"),
+        QStringLiteral("omniReviewReasoningEffort"),
+    };
     for (auto iterator = result.begin(); iterator != result.end(); ++iterator) {
+        if (droppedAiKeys.contains(iterator.key())) continue;
         if (loaded.contains(iterator.key())) iterator.value() = loaded.value(iterator.key());
     }
-    if (loaded.value(QStringLiteral("version")).toInt(1) < 2
-        && loaded.value(QStringLiteral("aiProviders")).toArray().isEmpty()) {
-        // 旧版 Qwen 配置不再隐式创建云 Provider，等待用户显式配置兼容端点。
-        result.insert(QStringLiteral("aiAssistEnabled"), false);
+    if (loadedVersion < 3) {
+        QJsonArray leftoverIds = result.value(QStringLiteral("legacyAiCredentialIds")).toArray();
+        for (const QJsonValue &value : loaded.value(QStringLiteral("aiProviders")).toArray()) {
+            const QString id = value.toObject().value(QStringLiteral("id")).toString();
+            if (id.isEmpty()) continue;
+            bool exists = false;
+            for (const QJsonValue &known : leftoverIds) {
+                if (known.toString() == id) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) leftoverIds.append(id);
+        }
+        result.insert(QStringLiteral("legacyAiCredentialIds"), leftoverIds);
     }
     if (!loaded.contains(QStringLiteral("asrProvider"))) {
         // 旧配置中的模型名来自云端，不将其误认为本地 Fun-ASR 模型。
@@ -101,7 +133,7 @@ QJsonObject SettingsManager::load() const
         result.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));
         result.insert(QStringLiteral("asrVerification"), QJsonObject{});
     }
-    result.insert(QStringLiteral("version"), 2);
+    result.insert(QStringLiteral("version"), 3);
     return result;
 }
 
@@ -111,7 +143,7 @@ bool SettingsManager::save(const QJsonObject &settings, QString *errorMessage) c
     for (auto iterator = safe.begin(); iterator != safe.end(); ++iterator) {
         if (settings.contains(iterator.key())) iterator.value() = settings.value(iterator.key());
     }
-    safe.insert(QStringLiteral("version"), 2);
+    safe.insert(QStringLiteral("version"), 3);
     if (!QDir().mkpath(QFileInfo(path_).absolutePath())) {
         if (errorMessage) *errorMessage = QStringLiteral("无法创建设置目录");
         return false;

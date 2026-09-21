@@ -10,6 +10,7 @@ class RoughCutAuxiliaryTests final : public QObject {
 private slots:
     void plansOnlyReviewAndMergesOverlap();
     void conflictCannotBecomeCut();
+    void agreementCanResolveReview();
 };
 
 void RoughCutAuxiliaryTests::plansOnlyReviewAndMergesOverlap()
@@ -41,6 +42,15 @@ void RoughCutAuxiliaryTests::conflictCannotBecomeCut()
     RoughCutAuxiliaryResult agreement{0, QStringLiteral("正确，版本。"), QStringLiteral("正确版本")};
     QCOMPARE(RoughCutAuxiliaryRecognition::reconcile(RoughCutDecision::Keep, &agreement),
         RoughCutDecision::Keep);
+    QVERIFY(!agreement.conflict);
+}
+
+void RoughCutAuxiliaryTests::agreementCanResolveReview()
+{
+    RoughCutAuxiliaryResult agreement{0, QStringLiteral("重来"), QStringLiteral("重来")};
+    agreement.agreementDecision = RoughCutDecision::Cut;
+    QCOMPARE(RoughCutAuxiliaryRecognition::reconcile(RoughCutDecision::Review, &agreement),
+        RoughCutDecision::Cut);
     QVERIFY(!agreement.conflict);
 }
 

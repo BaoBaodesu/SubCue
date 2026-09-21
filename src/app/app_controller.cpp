@@ -616,6 +616,7 @@ void AppController::startOmniSubtitleReview()
     }
     stopOmniReviewWorker();
     omniReviewCancel_ = false;
+    resetProgress(QStringLiteral("正在复核字幕内容"), QStringLiteral("正在准备 AI 复核…"));
     setBusy(true);
     setStatus(QStringLiteral("正在复核字幕内容…"));
     SubtitleOmniRequest request;
@@ -644,12 +645,21 @@ void AppController::startOmniSubtitleReview()
     omniReviewThread_ = std::thread([self, request, settings, apiKey, generation,
                                      mediaGeneration, scriptGeneration, evidenceGeneration, http, cancel] {
         AiReviewService service(settings, apiKey, http);
-        SubtitleOmniResult result = service.reviewSubtitles(request, cancel);
+        const OmniReviewProgress progress = [self, generation](int completed, int total, const QString &message) {
+            if (!self) return;
+            QMetaObject::invokeMethod(self, [self, generation, completed, total, message] {
+                if (self) self->reportOmniProgress(generation, completed, total, message);
+            }, Qt::QueuedConnection);
+        };
+        SubtitleOmniResult result = service.reviewSubtitles(request, cancel, progress);
+        const QString model = service.lastModel();
+        const OmniUsage usage = service.accumulatedUsage();
         if (self) {
             QMetaObject::invokeMethod(self, [self, generation, mediaGeneration, scriptGeneration,
-                                             evidenceGeneration, result = std::move(result)]() mutable {
+                                             evidenceGeneration, result = std::move(result), model, usage]() mutable {
                 if (self) self->finishOmniSubtitleReview(
-                    generation, std::move(result), mediaGeneration, scriptGeneration, evidenceGeneration);
+                    generation, std::move(result), mediaGeneration, scriptGeneration, evidenceGeneration,
+                    model, usage);
             }, Qt::QueuedConnection);
         }
     });
@@ -674,6 +684,7 @@ void AppController::startWordMappingReview()
     }
     stopOmniReviewWorker();
     omniReviewCancel_ = false;
+    resetProgress(QStringLiteral("正在复核时间映射"), QStringLiteral("正在准备时间映射复核…"));
     setBusy(true);
     setStatus(QStringLiteral("正在复核时间映射…"));
     WordMappingOmniRequest request;
@@ -689,12 +700,21 @@ void AppController::startWordMappingReview()
     omniReviewThread_ = std::thread([self, request, settings, apiKey, generation,
                                      mediaGeneration, scriptGeneration, evidenceGeneration, http, cancel] {
         AiReviewService service(settings, apiKey, http);
-        WordMappingOmniResult result = service.reviewWordMapping(request, cancel);
+        const OmniReviewProgress progress = [self, generation](int completed, int total, const QString &message) {
+            if (!self) return;
+            QMetaObject::invokeMethod(self, [self, generation, completed, total, message] {
+                if (self) self->reportOmniProgress(generation, completed, total, message);
+            }, Qt::QueuedConnection);
+        };
+        WordMappingOmniResult result = service.reviewWordMapping(request, cancel, progress);
+        const QString model = service.lastModel();
+        const OmniUsage usage = service.accumulatedUsage();
         if (self) {
             QMetaObject::invokeMethod(self, [self, generation, mediaGeneration, scriptGeneration,
-                                             evidenceGeneration, result = std::move(result)]() mutable {
+                                             evidenceGeneration, result = std::move(result), model, usage]() mutable {
                 if (self) self->finishWordMappingReview(
-                    generation, std::move(result), mediaGeneration, scriptGeneration, evidenceGeneration);
+                    generation, std::move(result), mediaGeneration, scriptGeneration, evidenceGeneration,
+                    model, usage);
             }, Qt::QueuedConnection);
         }
     });
@@ -770,11 +790,13 @@ void AppController::startAlignmentRun(bool review)
     reviewRun_ = review;
     IAsrService *asr = asrOverride_;
     Q_UNUSED(aiOverride_);
+    resetProgress(review ? QStringLiteral("正在 ASR 复核") : QStringLiteral("正在自动打轴"),
+                  QStringLiteral("正在检查配置与模型…"));
     setBusy(true);
     setCanExport(false);
-    alignmentProgress_ = 0;
     alignmentState_ = {QStringLiteral("Preflight"), QStringLiteral("正在检查配置与模型…")};
     alignmentProgressText_ = alignmentState_.message;
+    alignmentProgress_ = 0;
     emit alignmentProgressChanged();
 
     alignmentThread_ = std::thread([this, generation, mediaPath, mediaInfo, lines, settings, asr] {
@@ -1642,6 +1664,11 @@ void AppController::onTick()
     if (wasPriming && !playback_.isPriming() && playing_ && context_->audioDevice) {
         context_->audioDevice->resume();
     }
+    if (playing_ && direction_ > 0 && context_->audioDevice && !playback_.isPriming()
+        && !context_->audioDevice->isHardware()) {
+        (void)context_->audioDevice->renderFrame();
+        playback_.pump();
+    }
     updatePositionFromClock();
     pushPreviewFrame();
 }
@@ -1730,7 +1757,8 @@ void AppController::stopOmniReviewWorker()
 }
 
 void AppController::finishOmniSubtitleReview(quint64 generation, SubtitleOmniResult result,
-    quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration)
+    quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration,
+    const QString &model, const OmniUsage &usage)
 {
     if (generation != omniReviewGeneration_.load()) return;
     setBusy(false);
@@ -1765,11 +1793,14 @@ void AppController::finishOmniSubtitleReview(quint64 generation, SubtitleOmniRes
         commands_.replaceMany(updated, QStringLiteral("字幕内容复核标记"));
     }
     emit canOmniReviewChanged();
-    setStatus(QStringLiteral("字幕内容复核完成：%1 条建议待确认。").arg(changed));
+    setStatus(QStringLiteral("字幕内容复核完成：%1 条建议待确认。 %2")
+        .arg(changed)
+        .arg(formatOmniReviewSummary(model, usage)));
 }
 
 void AppController::finishWordMappingReview(quint64 generation, WordMappingOmniResult result,
-    quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration)
+    quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration,
+    const QString &model, const OmniUsage &usage)
 {
     if (generation != omniReviewGeneration_.load()) return;
     setBusy(false);
@@ -1807,20 +1838,39 @@ void AppController::finishWordMappingReview(quint64 generation, WordMappingOmniR
             changed.append(after);
         }
     }
+    const QString summary = formatOmniReviewSummary(model, usage);
     if (changed.isEmpty()) {
-        setStatus(QStringLiteral("时间映射复核完成：没有可应用的映射。"));
+        setStatus(QStringLiteral("时间映射复核完成：没有可应用的映射。 %1").arg(summary));
         return;
     }
     commands_.replaceMany(changed, QStringLiteral("复核时间映射"));
     setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
         [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
-    setStatus(QStringLiteral("时间映射复核完成：已更新 %1 条。").arg(changed.size()));
+    setStatus(QStringLiteral("时间映射复核完成：已更新 %1 条。 %2").arg(changed.size()).arg(summary));
 }
 
 void AppController::invalidateAlignmentEvidence()
 {
     alignmentWords_.clear();
     ++alignmentEvidenceGeneration_;
+}
+
+void AppController::resetProgress(const QString &title, const QString &message)
+{
+    busyTaskTitle_ = title;
+    alignmentProgress_ = 0;
+    alignmentState_ = {title, message, 0, 0};
+    alignmentProgressText_ = message;
+    emit alignmentProgressChanged();
+}
+
+void AppController::reportOmniProgress(quint64 generation, int completed, int total, const QString &message)
+{
+    if (generation != omniReviewGeneration_.load() || omniReviewCancel_) return;
+    alignmentState_ = {busyTaskTitle_, message, completed, total};
+    alignmentProgressText_ = message;
+    alignmentProgress_ = alignmentState_.percent();
+    emit alignmentProgressChanged();
 }
 
 void AppController::finishAlignment(quint64 generation, AlignmentRunResult result)

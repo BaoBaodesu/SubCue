@@ -85,8 +85,38 @@ ApplicationWindow {
         anchors.centerIn: parent
         modal: true
         title: qsTr("导出字幕")
-        standardButtons: Dialog.Ok | Dialog.Cancel
-        Label { text: exportNotice.text; color: Theme.text }
+        implicitWidth: 480
+        width: Math.min(520, Math.max(400, window.width - 48))
+        padding: 16
+        standardButtons: Dialog.NoButton
+        palette.window: Theme.panel
+        palette.windowText: Theme.text
+        background: Rectangle {
+            color: Theme.panel
+            border.color: Theme.border
+            radius: 2
+        }
+        contentItem: Label {
+            text: exportNotice.text
+            color: Theme.text
+            wrapMode: Text.WordWrap
+            width: exportNotice.availableWidth
+        }
+        footer: DialogButtonBox {
+            implicitHeight: 48
+            alignment: Qt.AlignRight
+            background: Rectangle { color: Theme.panelRaised }
+            SubButton {
+                text: qsTr("取消")
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+                onClicked: exportNotice.reject()
+            }
+            PrimaryButton {
+                text: qsTr("导出")
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+                onClicked: exportNotice.accept()
+            }
+        }
         onAccepted: editor.exportSubtitles()
     }
 
@@ -181,6 +211,27 @@ ApplicationWindow {
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("自动打轴"); enabled: !editor.busy; onClicked: editor.startAlignment() }
             MenuButton { text: qsTr("取消"); enabled: editor.busy; onClicked: editor.cancelAlignment() }
+            MenuButton { text: qsTr("ASR 复核"); enabled: editor.canReview && !editor.busy; onClicked: editor.startReview() }
+            MenuButton {
+                id: aiReviewButton
+                objectName: "aiReviewMenuButton"
+                text: qsTr("AI 复核")
+                enabled: editor.canOmniReview && !editor.busy
+                onClicked: aiReviewMenu.popup(aiReviewButton, 0, aiReviewButton.height)
+                SubMenu {
+                    id: aiReviewMenu
+                    MenuItem {
+                        objectName: "wordMappingReviewMenuItem"
+                        text: qsTr("复核时间映射")
+                        onTriggered: editor.startWordMappingReview()
+                    }
+                    MenuItem {
+                        objectName: "subtitleContentReviewMenuItem"
+                        text: qsTr("复核字幕内容")
+                        onTriggered: editor.startOmniSubtitleReview()
+                    }
+                }
+            }
             MenuButton { text: qsTr("导出"); enabled: editor.canExport && !editor.busy; onClicked: window.requestExport() }
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("设置"); onClicked: window.openSettings() }
@@ -552,7 +603,8 @@ ApplicationWindow {
                             anchors.leftMargin: 8
                             Label { text: "#"; color: Theme.muted; Layout.preferredWidth: 28 }
                             Label { text: qsTr("文本"); color: Theme.muted; Layout.fillWidth: true }
-                            Label { text: qsTr("时间 / 状态"); color: Theme.muted; Layout.preferredWidth: 125 }
+                            Label { text: qsTr("时间 / 状态"); color: Theme.muted; Layout.preferredWidth: 132 }
+                            Item { Layout.preferredWidth: 56; Layout.minimumWidth: 56 }
                         }
                     }
                     ListView {
@@ -564,7 +616,7 @@ ApplicationWindow {
                         model: editor.subtitleModel
                         currentIndex: editor.selectedCue
                         onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
-                        ScrollBar.vertical: SubScrollBar { anchors.left: parent.left }
+                        ScrollBar.vertical: SubScrollBar { }
 
                         delegate: Rectangle {
                             id: rowItem
@@ -606,21 +658,53 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                 }
                                 ColumnLayout {
-                                    Layout.preferredWidth: 125
+                                    Layout.preferredWidth: 132
+                                    Layout.minimumWidth: 132
+                                    Layout.maximumWidth: 132
                                     spacing: 1
+                                    clip: true
                                     Label {
                                         text: timed ? editor.formatTime(startMs).substring(3, 12) + " - " + editor.formatTime(endMs).substring(3, 12) : qsTr("音频未检出")
                                         color: timed ? (status === "LOW_CONFIDENCE" ? Theme.warning : Theme.listTime) : Theme.muted
                                         font.family: timed ? "Consolas" : Theme.fontFamily
                                         font.pixelSize: Theme.fontSizeTiny
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                        Layout.maximumWidth: 132
                                     }
-                                    Label { visible: !timed || status === "LOW_CONFIDENCE"; text: timed ? qsTr("对齐待确认 · ASR分数未知") : qsTr("可拖到时间轴"); color: Theme.warning; font.pixelSize: 9; elide: Text.ElideRight; Layout.fillWidth: true }
+                                    Label {
+                                        visible: !timed || status === "LOW_CONFIDENCE"
+                                        text: timed ? qsTr("待确认") : qsTr("未定位")
+                                        color: Theme.warning
+                                        font.pixelSize: Theme.fontSizeTiny
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                        Layout.maximumWidth: 132
+                                    }
+                                }
+                                SubButton {
+                                    objectName: "confirmCueButton"
+                                    Layout.preferredWidth: 56
+                                    Layout.minimumWidth: 56
+                                    Layout.maximumWidth: 56
+                                    Layout.preferredHeight: 24
+                                    Layout.alignment: Qt.AlignVCenter
+                                    visible: !rowItem.timed || rowItem.status === "LOW_CONFIDENCE"
+                                    leftPadding: 4
+                                    rightPadding: 4
+                                    font.pixelSize: 11
+                                    text: rowItem.timed ? qsTr("确认") : qsTr("定位")
+                                    onClicked: {
+                                        if (rowItem.timed) editor.confirmCue(rowItem.index)
+                                        else editor.locateCue(rowItem.index)
+                                    }
                                 }
                             }
                             MouseArea {
                                 id: rowMouse
                                 objectName: "subtitleRowMouse"
                                 anchors.fill: parent
+                                anchors.rightMargin: 62
                                 hoverEnabled: true
                                 property string cueId: ""
                                 property point pressPoint
@@ -643,17 +727,6 @@ ApplicationWindow {
                                 onDoubleClicked: {
                                     editor.selectCue(index, false)
                                     editor.createOrEditCue()
-                                }
-                            }
-                            SubButton {
-                                anchors.right: parent.right
-                                anchors.bottom: parent.bottom
-                                height: 20
-                                visible: !rowItem.timed || rowItem.status === "LOW_CONFIDENCE"
-                                text: rowItem.timed ? qsTr("确认") : qsTr("在播放头创建")
-                                onClicked: {
-                                    if (rowItem.timed) editor.confirmCue(rowItem.index)
-                                    else editor.locateCue(rowItem.index)
                                 }
                             }
                         }
@@ -795,11 +868,12 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.margins: 10
             spacing: 16
-            Label { text: qsTr("正在自动打轴") + " · " + parent.parent.elapsedSeconds + "s"; color: Theme.text }
+            Label { text: (editor.busyTaskTitle || qsTr("正在自动打轴")) + " · " + parent.parent.elapsedSeconds + "s"; color: Theme.text }
             ColumnLayout {
                 Layout.fillWidth: true
                 Label { text: editor.alignmentProgressText; color: Theme.secondaryText }
                 ProgressBar {
+                    id: alignmentProgressBar
                     objectName: "alignmentProgressBar"
                     Layout.fillWidth: true
                     Layout.preferredHeight: 16

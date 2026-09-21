@@ -168,6 +168,7 @@ private slots:
     void nativeSourcesDoNotLaunchPythonRuntime();
     void controllerDoesNotDetachBackgroundThreads();
     void applicationDoesNotImportPython();
+    void applicationIconResourcesExist();
 
 private:
     [[nodiscard]] QString sourcePath(const QString &relative) const;
@@ -255,7 +256,7 @@ void SourceHygieneTests::nativeSourcesDoNotLaunchPythonRuntime()
         QStringLiteral("PySide6"),
         QStringLiteral("Nuitka"),
         QStringLiteral("python.exe"),
-        QStringLiteral("python311.dll"),
+        QStringLiteral("python312.dll"),
         QStringLiteral("CreateProcess"),
         QStringLiteral("ffmpeg.exe"),
         QStringLiteral("ffprobe.exe"),
@@ -300,12 +301,12 @@ void SourceHygieneTests::nativeSourcesDoNotLaunchPythonRuntime()
                 if (text.contains(token, Qt::CaseSensitive)) {
                     const QString relative = sourceRoot.relativeFilePath(path);
                     if (relative.startsWith(QLatin1String("src/inference/"))
-                        && token == QLatin1String("python311.dll")) {
+                        && token == QLatin1String("python312.dll")) {
                         continue;
                     }
                     if (relative == QLatin1String("CMakeLists.txt")
                         && (token == QLatin1String("python.exe")
-                            || token == QLatin1String("python311.dll"))
+                            || token == QLatin1String("python312.dll"))
                         && text.contains(QStringLiteral("SUBCUE_PROJECT_INFERENCE_PYTHON"))) {
                         continue;
                     }
@@ -344,10 +345,28 @@ void SourceHygieneTests::applicationDoesNotImportPython()
 
 void SourceHygieneTests::controllerDoesNotDetachBackgroundThreads()
 {
+    const QStringList files{
+        QStringLiteral("src/app/app_controller.cpp"),
+        QStringLiteral("src/app/rough_cut_controller.cpp"),
+    };
+    for (const QString &relative : files) {
+        const QString text = readText(relative);
+        QVERIFY2(!text.isEmpty(), qPrintable(relative));
+        QVERIFY2(!text.contains(QStringLiteral(".detach()")), qPrintable(relative));
+        QVERIFY2(text.contains(QStringLiteral("QPointer")), qPrintable(relative));
+    }
     const QString controller = readText(QStringLiteral("src/app/app_controller.cpp"));
-    QVERIFY(!controller.isEmpty());
-    QVERIFY(!controller.contains(QStringLiteral(".detach()")));
     QVERIFY(controller.contains(QStringLiteral("backgroundTasks_.waitForDone()")));
+}
+
+void SourceHygieneTests::applicationIconResourcesExist()
+{
+    QVERIFY(QFileInfo::exists(sourcePath(QStringLiteral("src/app/qml/icons/app-icon.png"))));
+    QVERIFY(QFileInfo::exists(sourcePath(QStringLiteral("src/app/resources/app.ico"))));
+    QVERIFY(QFileInfo::exists(sourcePath(QStringLiteral("src/app/resources/app.rc"))));
+    QVERIFY(readText(QStringLiteral("CMakeLists.txt")).contains(QStringLiteral("src/app/resources/app.rc")));
+    QVERIFY(readText(QStringLiteral("src/app/qml/AboutWindow.qml")).contains(QStringLiteral("icons/app-icon.png")));
+    QVERIFY(readText(QStringLiteral("src/app/main.cpp")).contains(QStringLiteral("setWindowIcon")));
 }
 
 QTEST_MAIN(SourceHygieneTests)

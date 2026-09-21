@@ -196,6 +196,22 @@ void TimelineSceneItem::setScrollOffset(double value)
     refresh();
 }
 
+void TimelineSceneItem::setFollowDirection(int value)
+{
+    value = std::clamp(value, -1, 1);
+    if (followDirection_ == value) {
+        return;
+    }
+    followDirection_ = value;
+    emit followDirectionChanged();
+    if (!viewportInteracting_ && !draggingCue_ && followDirection_ != 0
+        && (!wheelInteraction_.isValid() || wheelInteraction_.elapsed() >= 180)
+        && viewport_.followPlayback(followDirection_, width())) {
+        emit viewChanged();
+        refresh();
+    }
+}
+
 void TimelineSceneItem::setView(double pixelsPerMs, double scrollOffset)
 {
     if (qFuzzyCompare(viewport_.pixelsPerMs(), pixelsPerMs)

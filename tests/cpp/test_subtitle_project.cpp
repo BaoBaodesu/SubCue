@@ -10,6 +10,7 @@
 #include "platform/windows/dpapi_credential_store.h"
 
 #include <QtCore/QFile>
+#include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QTemporaryDir>
 #include <QtTest/QTest>
@@ -179,14 +180,40 @@ private slots:
 
         const SettingsManager manager(path);
         const QJsonObject loaded = manager.load();
-        QCOMPARE(loaded.value(QStringLiteral("version")).toInt(), 2);
+        QCOMPARE(loaded.value(QStringLiteral("version")).toInt(), 3);
         QCOMPARE(loaded.value(QStringLiteral("fontSize1080p")).toInt(), 64);
         QCOMPARE(loaded.value(QStringLiteral("appearanceMode")).toString(), QStringLiteral("light"));
         QVERIFY(!loaded.contains(QStringLiteral("apiKey")));
-        QVERIFY(!loaded.value(QStringLiteral("aiAssistEnabled")).toBool());
+        QVERIFY(!loaded.contains(QStringLiteral("aiAssistEnabled")));
+        QVERIFY(!loaded.contains(QStringLiteral("omniReviewEnabled")));
         QString error;
         QVERIFY2(manager.save(loaded, &error), qPrintable(error));
         QVERIFY(!readFile(path).contains("secret"));
+    }
+
+    void settingsVersionThreeDropsLegacyAiProviders()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = directory.filePath(QStringLiteral("settings.json"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(R"({"version":2,"aiAssistEnabled":true,"aiProviderId":"custom",)"
+                   R"("aiProviders":[{"id":"custom","name":"Custom"}],)"
+                   R"("omniReviewEnabled":true,"omniReviewModel":"qwen-plus",)"
+                   R"("omniReviewBaseUrl":"https://example.invalid/v1",)"
+                   R"("omniReviewReasoningEffort":"high"})");
+        file.close();
+        const SettingsManager manager(path);
+        const QJsonObject loaded = manager.load();
+        QCOMPARE(loaded.value(QStringLiteral("version")).toInt(), 3);
+        QVERIFY(!loaded.contains(QStringLiteral("aiAssistEnabled")));
+        QVERIFY(!loaded.contains(QStringLiteral("aiProviders")));
+        QVERIFY(!loaded.contains(QStringLiteral("omniReviewEnabled")));
+        QVERIFY(!loaded.contains(QStringLiteral("omniReviewModel")));
+        const QJsonArray leftover = loaded.value(QStringLiteral("legacyAiCredentialIds")).toArray();
+        QCOMPARE(leftover.size(), 1);
+        QCOMPARE(leftover.at(0).toString(), QStringLiteral("custom"));
     }
 
     void projectRoundTrip()

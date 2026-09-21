@@ -28,16 +28,33 @@ Window {
             anchors.margins: 16
             spacing: 10
 
-            Label {
-                text: qsTr("SubCue")
-                color: Theme.text
-                font.family: Theme.fontFamily
-                font.bold: true
-                font.pixelSize: 18
-            }
-            Label {
-                text: qsTr("版本 %1").arg(Qt.application.version)
-                color: Theme.muted
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+                Image {
+                    source: "icons/app-icon.png"
+                    sourceSize.width: 72
+                    sourceSize.height: 72
+                    Layout.preferredWidth: 72
+                    Layout.preferredHeight: 72
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                }
+                ColumnLayout {
+                    spacing: 4
+                    Label {
+                        text: qsTr("SubCue")
+                        color: Theme.text
+                        font.family: Theme.fontFamily
+                        font.bold: true
+                        font.pixelSize: 18
+                    }
+                    Label {
+                        text: qsTr("版本 %1").arg(Qt.application.version)
+                        color: Theme.muted
+                    }
+                }
+                Item { Layout.fillWidth: true }
             }
             Label {
                 Layout.fillWidth: true

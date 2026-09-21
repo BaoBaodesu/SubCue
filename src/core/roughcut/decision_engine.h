@@ -17,7 +17,12 @@ struct RoughCutSegmentDecision final {
     QString reason;
     QStringList evidence;
     int takeGroupId = -1;
+    int replacementRecordingIndex = -1;
     bool bestTake = false;
+    RoughCutFailureType failureType = RoughCutFailureType::None;
+    double modelProbability = -1.0;
+    QString modelVersion;
+    QString decisionSource = QStringLiteral("rule");
 
     [[nodiscard]] RoughCutDecision effectiveDecision() const
     {
@@ -31,7 +36,11 @@ public:
         const QVector<RecognizedPassage> &recording,
         const QVector<ScriptMatch> &matches,
         const QVector<RoughCutRetakeGroup> &groups,
-        const QVector<bool> &alignmentTrustworthy = {});
+        const QVector<bool> &alignmentTrustworthy = {},
+        const QString &scriptText = {});
+    static void protectCuts(const QVector<RecognizedPassage> &recording,
+                            QVector<RoughCutSegmentDecision> *decisions,
+                            const QString &scriptText = {});
 };
 
 } // namespace subcue

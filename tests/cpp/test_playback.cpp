@@ -33,6 +33,7 @@ private slots:
     void hwAccelFallbackOrderAndSoftwareDecode();
     void hwRuntimeFailureReopensSoftware();
     void playbackPauseResumeStaysSynced();
+    void playbackAudioOnlyAdvancesPosition();
     void playbackLatestWinsSeekDisplaysNewGeneration();
 
 private:
@@ -288,6 +289,27 @@ void PlaybackTests::playbackPauseResumeStaysSynced()
     engine.play();
     engine.consumeAudio(MediaTime::fromMilliseconds(40));
     QCOMPARE(engine.position().milliseconds(), pausedAt.milliseconds() + 40);
+}
+
+void PlaybackTests::playbackAudioOnlyAdvancesPosition()
+{
+    PlaybackEngine engine;
+    AppError error(ErrorDomain::Media, 0, QString());
+    QVERIFY(engine.open(mediaPath(QStringLiteral("audio.wav")), &error));
+    QVERIFY(engine.hasAudio());
+    QVERIFY(!engine.hasVideo());
+    engine.play();
+
+    QElapsedTimer timer;
+    timer.start();
+    qint64 consumed = 0;
+    while (timer.elapsed() < 3'000 && consumed < 2'400) {
+        consumed += engine.consumeAudio(MediaTime::fromMilliseconds(20));
+        QCoreApplication::processEvents();
+        QTest::qWait(10);
+    }
+    QVERIFY(consumed > 0);
+    QVERIFY(engine.position().milliseconds() > 0);
 }
 
 void PlaybackTests::playbackLatestWinsSeekDisplaysNewGeneration()

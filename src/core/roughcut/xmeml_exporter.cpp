@@ -71,6 +71,8 @@ void writeClipItem(QXmlStreamWriter &xml, const RoughCutExportRequest &request,
     const qint64 duration = sourceOut - sourceIn;
     xml.writeStartElement(QStringLiteral("clipitem"));
     xml.writeAttribute(QStringLiteral("id"), id);
+    if (request.channels == 2)
+        xml.writeAttribute(QStringLiteral("premiereChannelType"), QStringLiteral("stereo"));
     writeTextElement(xml, QStringLiteral("name"), clip.name);
     writeTextElement(xml, QStringLiteral("duration"), QString::number(sourceDurationFrames));
     writeRate(xml, request);
@@ -160,6 +162,11 @@ QByteArray XmemlExporter::build(const RoughCutExportRequest &request)
     bool includeFileDetails = true;
     for (int channel = 0; channel < request.channels; ++channel) {
         xml.writeStartElement(QStringLiteral("track"));
+        if (request.channels == 2) {
+            xml.writeAttribute(QStringLiteral("currentExplodedTrackIndex"), QString::number(channel));
+            xml.writeAttribute(QStringLiteral("totalExplodedTrackCount"), QStringLiteral("2"));
+            xml.writeAttribute(QStringLiteral("premiereTrackType"), QStringLiteral("Stereo"));
+        }
         qint64 timelineStart = 0;
         for (qsizetype index = 0; index < request.clips.size(); ++index) {
             const RoughCutSourceClip &clip = request.clips.at(index);
@@ -175,15 +182,24 @@ QByteArray XmemlExporter::build(const RoughCutExportRequest &request)
         }
         writeTextElement(xml, QStringLiteral("enabled"), QStringLiteral("TRUE"));
         writeTextElement(xml, QStringLiteral("locked"), QStringLiteral("FALSE"));
+        if (request.channels == 2)
+            writeTextElement(xml, QStringLiteral("outputchannelindex"), QString::number(channel + 1));
         xml.writeEndElement();
     }
     for (int channel = 0; channel < request.channels; ++channel) {
         xml.writeStartElement(QStringLiteral("track"));
+        if (request.channels == 2) {
+            xml.writeAttribute(QStringLiteral("currentExplodedTrackIndex"), QString::number(channel));
+            xml.writeAttribute(QStringLiteral("totalExplodedTrackCount"), QStringLiteral("2"));
+            xml.writeAttribute(QStringLiteral("premiereTrackType"), QStringLiteral("Stereo"));
+        }
         const RoughCutSourceClip reference{QStringLiteral("ORIGINAL REFERENCE"), 0, request.sourceSampleCount};
         writeClipItem(xml, request, reference, QStringLiteral("reference-%1").arg(channel + 1), channel,
                       0, sourceDurationFrames, false, false, 0, true);
         writeTextElement(xml, QStringLiteral("enabled"), QStringLiteral("FALSE"));
         writeTextElement(xml, QStringLiteral("locked"), QStringLiteral("FALSE"));
+        if (request.channels == 2)
+            writeTextElement(xml, QStringLiteral("outputchannelindex"), QString::number(channel + 1));
         xml.writeEndElement();
     }
     xml.writeEndElement();

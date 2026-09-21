@@ -1,6 +1,7 @@
 #pragma once
 
 #include "alignment/transcript.h"
+#include "roughcut/script_matcher.h"
 
 #include <QtCore/QString>
 #include <QtCore/QVector>
@@ -11,6 +12,7 @@ struct RoughCutAlignedWord final {
     QString text;
     qint64 startSample = 0;
     qint64 endSample = 0;
+    bool timingTrustworthy = true;
 };
 
 struct RoughCutAlignmentResult final {
@@ -30,6 +32,10 @@ public:
     [[nodiscard]] static RoughCutAlignmentResult validate(
         const Transcript &transcript, int sourceSampleRate, qint64 sourceSampleCount,
         bool preciseWordTiming);
+
+    [[nodiscard]] static QVector<RecognizedPassage> buildPassages(
+        QVector<RecognizedPassage> speech, const Transcript &transcript,
+        int sourceSampleRate, qint64 sourceSampleCount);
 
     // 这里只提供能量静音证据，不把静音区间解释为可靠的语音分类结果。
     [[nodiscard]] static QVector<RoughCutSilenceEvidence> detectSilence(

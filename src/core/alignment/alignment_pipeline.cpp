@@ -1,6 +1,5 @@
 #include "alignment/alignment_pipeline.h"
 
-#include "ai/ai_provider_factory.h"
 #include "alignment/alignment_engine.h"
 #include "alignment/forced_align.h"
 #include "asr/asr_provider_factory.h"
@@ -59,9 +58,9 @@ AlignmentPipeline::AlignmentPipeline(
     IAiProvider *aiOverride)
     : settings_(std::move(settings)),
       credentials_(std::move(credentials)),
-      asrOverride_(asrOverride),
-      aiOverride_(aiOverride)
+      asrOverride_(asrOverride)
 {
+    Q_UNUSED(aiOverride);
 }
 
 std::pair<int, int> AlignmentPipeline::videoSize(const MediaInfo &mediaInfo)
@@ -231,66 +230,21 @@ AlignmentRunResult AlignmentPipeline::run(
     }
     qCInfo(subcueAppLog) << "alignment elapsed_ms=" << timer.elapsed();
 
-    int aiCalls = 0;
-    if (!transcript.words.isEmpty() && settings_.value(QStringLiteral("aiAssistEnabled")).toBool(true)) {
-        bool needsReview = false;
-        for (const Subtitle &subtitle : result.subtitles) {
-            if (AlignmentEngine::needsAiReview(subtitle.confidence, subtitle.ambiguity)) {
-                needsReview = true;
-                break;
-            }
-        }
-        if (needsReview) {
-            std::unique_ptr<IAiProvider> ownedAi;
-            IAiProvider *ai = aiOverride_;
-            if (ai == nullptr) {
-                ownedAi = AiProviderFactory().create(settings_, credentials_.aiApiKey);
-                ai = ownedAi.get();
-            }
-            if (ai != nullptr) {
-                reportProgress(progress, QStringLiteral("AIReview"), QStringLiteral("正在复核低置信度字幕…"));
-                const AiReviewResult review = ai->review(
-                    result.subtitles,
-                    transcript.words,
-                    cancel,
-                    [&progress](int current, int total) {
-                        reportProgress(
-                            progress,
-                            QStringLiteral("AIReview"),
-                            QStringLiteral("正在检查 %1 / %2 条低置信度字幕…")
-                                .arg(current)
-                                .arg(total),
-                            current, total);
-                    });
-                if (std::holds_alternative<AppError>(review)) {
-                    const AppError error = std::get<AppError>(review);
-                    if (isAiCancelError(error) || cancelled(cancel)) {
-                        return cancelledError();
-                    }
-                    qCWarning(subcueAppLog) << "ai_review_failed" << error.userMessage();
-                } else {
-                    aiCalls = std::get<int>(review);
-                    for (const AppError &error : ai->errors()) {
-                        qCWarning(subcueAppLog) << "ai_review_item_failed" << error.userMessage();
-                    }
-                }
-            }
-        }
-    }
     AlignmentEngine::finalizeAudioFirst(result.subtitles);
     // ASR 是证据而非删稿依据：漏识别的原稿行保留为待复核的候选时间段。
-    const AlignmentResult recovered = ForcedAligner::forcedAlignSubtitleLines(
-        lines, transcript.words, mediaInfo.duration.milliseconds());
-    for (qsizetype index = 0; index < result.subtitles.size(); ++index) {
-        if (result.subtitles.at(index).status == QStringLiteral("SKIPPED_NO_AUDIO")
-            && index < recovered.subtitles.size() && recovered.subtitles.at(index).isTimed()) {
-            result.subtitles[index] = recovered.subtitles.at(index);
-            result.subtitles[index].status = QStringLiteral("REVIEW");
-            result.subtitles[index].source = QStringLiteral("forced-align-candidate");
-            result.subtitles[index].skipReason = QStringLiteral("ASR 未定位到原稿句，需复核候选时间段");
+    if (!transcript.words.isEmpty()) {
+        const AlignmentResult recovered = ForcedAligner::forcedAlignSubtitleLines(
+            lines, transcript.words, mediaInfo.duration.milliseconds());
+        for (qsizetype index = 0; index < result.subtitles.size(); ++index) {
+            if (result.subtitles.at(index).status == QStringLiteral("SKIPPED_NO_AUDIO")
+                && index < recovered.subtitles.size() && recovered.subtitles.at(index).isTimed()) {
+                result.subtitles[index] = recovered.subtitles.at(index);
+                result.subtitles[index].status = QStringLiteral("REVIEW");
+                result.subtitles[index].source = QStringLiteral("forced-align-candidate");
+                result.subtitles[index].skipReason = QStringLiteral("ASR 未定位到原稿句，需复核候选时间段");
+            }
         }
     }
-    qCInfo(subcueAppLog) << "ai calls=" << aiCalls;
     for (Subtitle &subtitle : result.subtitles) {
         subtitle.metadata.insert(QStringLiteral("diagnosticReason"), transcript.words.isEmpty()
             ? QStringLiteral("ASR_NO_WORDS") : !subtitle.isTimed()
@@ -309,6 +263,7 @@ AlignmentRunResult AlignmentPipeline::run(
     AlignmentTaskOutput output;
     output.result = std::move(result);
     output.mediaInfo = mediaInfo;
+    output.words = transcript.words;
     reportProgress(progress, QStringLiteral("Completed"), QStringLiteral("完成。"), 1, 1);
     return output;
 }

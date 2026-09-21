@@ -82,10 +82,24 @@ std::optional<QJsonObject> OmniReviewJson::structuredObject(const QJsonObject &m
 
 OmniUsage OmniReviewJson::usageFromObject(const QJsonObject &usage)
 {
+    auto readCount = [](const QJsonObject &object, const QString &key) -> qint64 {
+        const QJsonValue value = object.value(key);
+        if (value.isUndefined() || value.isNull()) return -1;
+        const qint64 count = value.toInteger(-1);
+        return count >= 0 ? count : -1;
+    };
     OmniUsage result;
-    result.promptTokens = usage.value(QStringLiteral("prompt_tokens")).toInt(-1);
-    result.completionTokens = usage.value(QStringLiteral("completion_tokens")).toInt(-1);
-    result.totalTokens = usage.value(QStringLiteral("total_tokens")).toInt(-1);
+    result.promptTokens = readCount(usage, QStringLiteral("prompt_tokens"));
+    if (result.promptTokens < 0) result.promptTokens = readCount(usage, QStringLiteral("input_tokens"));
+    result.completionTokens = readCount(usage, QStringLiteral("completion_tokens"));
+    if (result.completionTokens < 0)
+        result.completionTokens = readCount(usage, QStringLiteral("output_tokens"));
+    result.totalTokens = readCount(usage, QStringLiteral("total_tokens"));
+    const QJsonObject details = usage.value(QStringLiteral("prompt_tokens_details")).toObject();
+    if (!details.isEmpty()) {
+        result.promptTextTokens = readCount(details, QStringLiteral("text_tokens"));
+        result.promptAudioTokens = readCount(details, QStringLiteral("audio_tokens"));
+    }
     return result;
 }
 

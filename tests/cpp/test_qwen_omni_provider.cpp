@@ -45,22 +45,25 @@ QByteArray toolCallBody(const QJsonObject &arguments,
                         const QString &toolName = QStringLiteral("submit_subtitle_review"),
                         const QString &model = QStringLiteral("qwen3.8-omni-flash"))
 {
-    const QJsonObject function{
-        {QStringLiteral("name"), toolName},
-        {QStringLiteral("arguments"), QString::fromUtf8(QJsonDocument(arguments).toJson(QJsonDocument::Compact))},
-    };
-    const QJsonObject message{
-        {QStringLiteral("tool_calls"), QJsonArray{QJsonObject{
-            {QStringLiteral("function"), function}}}},
-    };
-    return QJsonDocument(QJsonObject{
-        {QStringLiteral("model"), model},
-        {QStringLiteral("choices"), QJsonArray{QJsonObject{{QStringLiteral("message"), message}}}},
-        {QStringLiteral("usage"), QJsonObject{
-            {QStringLiteral("prompt_tokens"), 12},
-            {QStringLiteral("completion_tokens"), 8},
-            {QStringLiteral("total_tokens"), 20}}},
-    }).toJson(QJsonDocument::Compact);
+    QJsonObject function;
+    function.insert(QStringLiteral("name"), toolName);
+    function.insert(QStringLiteral("arguments"),
+        QString::fromUtf8(QJsonDocument(arguments).toJson(QJsonDocument::Compact)));
+    QJsonObject toolCall;
+    toolCall.insert(QStringLiteral("function"), function);
+    QJsonObject message;
+    message.insert(QStringLiteral("tool_calls"), QJsonArray{toolCall});
+    QJsonObject choice;
+    choice.insert(QStringLiteral("message"), message);
+    QJsonObject usage;
+    usage.insert(QStringLiteral("prompt_tokens"), 12);
+    usage.insert(QStringLiteral("completion_tokens"), 8);
+    usage.insert(QStringLiteral("total_tokens"), 20);
+    QJsonObject root;
+    root.insert(QStringLiteral("model"), model);
+    root.insert(QStringLiteral("choices"), QJsonArray{choice});
+    root.insert(QStringLiteral("usage"), usage);
+    return QJsonDocument(root).toJson(QJsonDocument::Compact);
 }
 
 } // namespace
@@ -169,15 +172,16 @@ void OmniProviderTests::timeoutKeepsLocalMessage()
 
 void OmniProviderTests::parsesToolCallAndPlainJson()
 {
-    const QJsonObject payload{{QStringLiteral("results"), QJsonArray{QJsonObject{
-        {QStringLiteral("segment_id"), QStringLiteral("s1")},
-        {QStringLiteral("issue_type"), QStringLiteral("MISSING_TEXT")},
-        {QStringLiteral("confidence"), 0.93},
-        {QStringLiteral("original_text"), QStringLiteral("你好")},
-        {QStringLiteral("suggested_text"), QStringLiteral("你好世界")},
-        {QStringLiteral("reason"), QStringLiteral("漏字")},
-        {QStringLiteral("decision"), QStringLiteral("REPLACE_TEXT")},
-    }}}};
+    QJsonObject item;
+    item.insert(QStringLiteral("segment_id"), QStringLiteral("s1"));
+    item.insert(QStringLiteral("issue_type"), QStringLiteral("MISSING_TEXT"));
+    item.insert(QStringLiteral("confidence"), 0.93);
+    item.insert(QStringLiteral("original_text"), QStringLiteral("你好"));
+    item.insert(QStringLiteral("suggested_text"), QStringLiteral("你好世界"));
+    item.insert(QStringLiteral("reason"), QStringLiteral("漏字"));
+    item.insert(QStringLiteral("decision"), QStringLiteral("REPLACE_TEXT"));
+    QJsonObject payload;
+    payload.insert(QStringLiteral("results"), QJsonArray{item});
     FakeHttpClient http;
     http.response.status = 200;
     http.response.body = toolCallBody(payload);
@@ -194,8 +198,9 @@ void OmniProviderTests::parsesToolCallAndPlainJson()
     QCOMPARE(std::get<QVector<SubtitleOmniSuggestion>>(parsed).at(0).decision,
              SubtitleOmniDecision::ReplaceText);
 
-    const QJsonObject message{{QStringLiteral("content"), QString::fromUtf8(
-        QJsonDocument(payload).toJson(QJsonDocument::Compact))}};
+    QJsonObject message;
+    message.insert(QStringLiteral("content"),
+        QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
     const auto object = OmniReviewJson::structuredObject(message);
     QVERIFY(object.has_value());
 }

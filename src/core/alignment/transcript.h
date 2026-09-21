@@ -11,6 +11,7 @@ struct TranscriptWord final {
     QString text;
     qint64 startMs = 0;
     qint64 endMs = 0;
+    bool preciseTiming = true;
 };
 
 struct Transcript final {

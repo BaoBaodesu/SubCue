@@ -2,6 +2,7 @@
 
 #include "ai/ai_provider.h"
 #include "alignment/alignment_result.h"
+#include "alignment/transcript.h"
 #include "asr/asr_service.h"
 #include "common/app_error.h"
 #include "common/provider_types.h"
@@ -23,6 +24,7 @@ struct AlignmentTaskOutput final {
     AlignmentResult result;
     MediaInfo mediaInfo;
     QStringList outputPaths;
+    QVector<TranscriptWord> words;
 };
 
 struct AlignmentProgressState final {
@@ -62,7 +64,6 @@ private:
     QJsonObject settings_;
     AlignmentCredentials credentials_;
     IAsrService *asrOverride_ = nullptr;
-    IAiProvider *aiOverride_ = nullptr;
 };
 
 } // namespace subcue

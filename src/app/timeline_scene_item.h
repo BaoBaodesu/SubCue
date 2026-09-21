@@ -34,7 +34,7 @@ class TimelineSceneItem : public QQuickItem {
     Q_PROPERTY(int zoomPercent READ zoomPercent NOTIFY viewChanged)
     Q_PROPERTY(double scrollOffset READ scrollOffset WRITE setScrollOffset NOTIFY viewChanged)
     Q_PROPERTY(QString selectedCueId READ selectedCueId WRITE setSelectedCueId NOTIFY selectedCueIdChanged)
-    Q_PROPERTY(int followDirection MEMBER followDirection_)
+    Q_PROPERTY(int followDirection READ followDirection WRITE setFollowDirection NOTIFY followDirectionChanged)
     Q_PROPERTY(bool viewportInteracting MEMBER viewportInteracting_)
 
 public:
@@ -58,6 +58,8 @@ public:
     [[nodiscard]] int zoomPercent() const noexcept;
     [[nodiscard]] double scrollOffset() const noexcept;
     void setScrollOffset(double value);
+    [[nodiscard]] int followDirection() const noexcept { return followDirection_; }
+    void setFollowDirection(int value);
     void setView(double pixelsPerMs, double scrollOffset);
     Q_INVOKABLE void adjustZoomPercent(int delta);
     Q_INVOKABLE void setVisibleRange(double startRatio, double endRatio);
@@ -80,6 +82,7 @@ signals:
     void playheadUsChanged();
     void rangeChanged();
     void viewChanged();
+    void followDirectionChanged();
     void selectedCueIdChanged();
     void userSeeked(qint64 playheadUs);
     void cueDragStarted(const QString &id, int mode);

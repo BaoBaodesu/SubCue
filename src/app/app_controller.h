@@ -58,6 +58,7 @@ class AppController : public QObject {
     Q_PROPERTY(int alignmentCompleted READ alignmentCompleted NOTIFY alignmentProgressChanged)
     Q_PROPERTY(int alignmentTotal READ alignmentTotal NOTIFY alignmentProgressChanged)
     Q_PROPERTY(bool alignmentIndeterminate READ alignmentIndeterminate NOTIFY alignmentProgressChanged)
+    Q_PROPERTY(QString busyTaskTitle READ busyTaskTitle NOTIFY alignmentProgressChanged)
     Q_PROPERTY(bool canExport READ canExport NOTIFY canExportChanged)
     Q_PROPERTY(bool canReview READ canReview NOTIFY canReviewChanged)
     Q_PROPERTY(bool canOmniReview READ canOmniReview NOTIFY canOmniReviewChanged)
@@ -113,6 +114,7 @@ public:
     [[nodiscard]] int alignmentCompleted() const { return alignmentState_.completed; }
     [[nodiscard]] int alignmentTotal() const { return alignmentState_.total; }
     [[nodiscard]] bool alignmentIndeterminate() const { return alignmentState_.indeterminate(); }
+    [[nodiscard]] QString busyTaskTitle() const { return busyTaskTitle_; }
     [[nodiscard]] bool canExport() const;
     [[nodiscard]] bool canReview() const { return alignmentCompleted_; }
     [[nodiscard]] bool canOmniReview() const;
@@ -257,11 +259,15 @@ private:
     void stopOmniReviewWorker();
     void finishAlignment(quint64 generation, AlignmentRunResult result);
     void finishOmniSubtitleReview(quint64 generation, SubtitleOmniResult result,
-        quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration);
+        quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration,
+        const QString &model, const OmniUsage &usage);
     void finishWordMappingReview(quint64 generation, WordMappingOmniResult result,
-        quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration);
+        quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration,
+        const QString &model, const OmniUsage &usage);
     void startAlignmentRun(bool review);
     void invalidateAlignmentEvidence();
+    void resetProgress(const QString &title, const QString &message);
+    void reportOmniProgress(quint64 generation, int completed, int total, const QString &message);
     [[nodiscard]] bool isMediaPath(const QString &path) const;
     [[nodiscard]] int activeRow() const;
     [[nodiscard]] bool setTimingMs(int row, qint64 startMs, qint64 endMs);
@@ -314,6 +320,7 @@ private:
     bool playing_ = false;
     bool busy_ = false;
     QString alignmentProgressText_;
+    QString busyTaskTitle_;
     int alignmentProgress_ = 0;
     AlignmentProgressState alignmentState_;
     bool canExport_ = false;

@@ -65,7 +65,8 @@ Transcript transcriptFromResponse(const QJsonObject &response)
         const QString text = segment.value(QStringLiteral("text")).toString().trimmed();
         if (!text.isEmpty()) transcript.words.append({-1, text,
             qRound64(segment.value(QStringLiteral("start")).toDouble() * 1000),
-            qRound64(segment.value(QStringLiteral("end")).toDouble() * 1000)});
+            qRound64(segment.value(QStringLiteral("end")).toDouble() * 1000),
+            segment.value(QStringLiteral("timing")).toString() != QLatin1String("chunk")});
     }
     transcript.sortAndReindex();
     return transcript;
@@ -130,7 +131,7 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
         {QStringLiteral("modelModifiedMs"), modelWeight.lastModified().toMSecsSinceEpoch()}};
     const std::variant<QString, AppError> cacheKeyResult = cache.keyFor(
         request.mediaPath, providerId_ + QLatin1Char(':') + modelDirectory_,
-        QStringLiteral("Chinese"), cacheParameters, QStringLiteral("local-asr-v2"), request.cancel);
+        QStringLiteral("Chinese"), cacheParameters, QStringLiteral("local-asr-v3"), request.cancel);
     if (std::holds_alternative<AppError>(cacheKeyResult)) return std::get<AppError>(cacheKeyResult);
     const QString cacheKey = std::get<QString>(cacheKeyResult);
     if (const std::optional<QJsonObject> cached = cache.load(cacheKey)) {

@@ -101,6 +101,11 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
             && context_ && context_->audioDevice) {
             context_->audioDevice->resume();
         }
+        if (!playback_.isPaused() && context_ && context_->audioDevice
+            && !playback_.isPriming() && !context_->audioDevice->isHardware()) {
+            (void)context_->audioDevice->renderFrame();
+            playback_.pump();
+        }
         if (timelinePlaybackIndex_ >= 0 && timelineGapDeadlineMs_ >= 0
             && timelinePlaybackClock_.elapsed() >= timelineGapDeadlineMs_) {
             timelineGapDeadlineMs_ = -1;
@@ -717,8 +722,10 @@ void RoughCutController::startAiReview()
         };
         AiReviewService service(omniSettings, omniKey, http);
         RoughCutOmniResult reviewed = service.reviewCandidates(reviewRequest, cancel);
+        const QString model = service.lastModel();
+        const OmniUsage usage = service.accumulatedUsage();
         postUi([reviewed = std::move(reviewed), beforeBase, analysisVersion, omniSettings, words,
-                sampleRate, sourceSampleCount](RoughCutController *controller) mutable {
+                sampleRate, sourceSampleCount, model, usage](RoughCutController *controller) mutable {
             if (controller->cancel_) {
                 controller->finishJobWithoutResults(QStringLiteral("AI 复核已取消。"));
                 return;
@@ -774,7 +781,9 @@ void RoughCutController::startAiReview()
             controller->progressPercent_ = 100;
             emit controller->progressChanged();
             controller->refreshModified();
-            controller->setStatus(QStringLiteral("AI 复核完成：已更新 %1 个片段。").arg(changed));
+            controller->setStatus(QStringLiteral("AI 复核完成：已更新 %1 个片段。 %2")
+                .arg(changed)
+                .arg(formatOmniReviewSummary(model, usage)));
         });
     });
 }

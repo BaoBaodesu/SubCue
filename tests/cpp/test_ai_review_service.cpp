@@ -1,3 +1,4 @@
+#include "ai/ai_review_json.h"
 #include "ai/ai_review_service.h"
 #include "ai/ai_review_settings.h"
 #include "ai/ai_types.h"
@@ -12,6 +13,8 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
+#include <QtCore/QPair>
+#include <QtCore/QVector>
 #include <QtTest/QTest>
 
 #include <atomic>
@@ -89,6 +92,8 @@ private slots:
     void encodeWindowClampsRequestedSpan();
     void wordMappingAppliesValidRange();
     void wordMappingRejectsOutOfBounds();
+    void reviewAccumulatesUsageAndFormatsCost();
+    void usageDetailsPreferAudioAndTextSplit();
 };
 
 void AiReviewServiceTests::windowsKeepGlobalOffsetAndOverlap()
@@ -317,6 +322,77 @@ void AiReviewServiceTests::wordMappingRejectsOutOfBounds()
     QCOMPARE(mapped.end.milliseconds(), 20);
     QCOMPARE(mapped.metadata.value(QStringLiteral("aiReviewStatus")).toString(),
              QStringLiteral("rejectedLocally"));
+}
+
+void AiReviewServiceTests::reviewAccumulatesUsageAndFormatsCost()
+{
+    FakeHttpClient http;
+    QByteArray body = jsonBody(QJsonObject{{QStringLiteral("results"), QJsonArray{QJsonObject{
+        {QStringLiteral("segment_id"), QStringLiteral("a")},
+        {QStringLiteral("issue_type"), QStringLiteral("PUNCTUATION")},
+        {QStringLiteral("confidence"), 0.99},
+        {QStringLiteral("original_text"), QStringLiteral("你好")},
+        {QStringLiteral("suggested_text"), QStringLiteral("你好")},
+        {QStringLiteral("reason"), QStringLiteral("录音与字幕一致")},
+        {QStringLiteral("decision"), QStringLiteral("KEEP")},
+    }}}});
+    QJsonObject root = QJsonDocument::fromJson(body).object();
+    root.insert(QStringLiteral("model"), QStringLiteral("qwen3.8-omni-flash"));
+    QJsonObject usage{
+        {QStringLiteral("prompt_tokens"), 100},
+        {QStringLiteral("completion_tokens"), 20},
+        {QStringLiteral("total_tokens"), 120},
+    };
+    usage.insert(QStringLiteral("prompt_tokens_details"), QJsonObject{
+        {QStringLiteral("text_tokens"), 40},
+        {QStringLiteral("audio_tokens"), 60},
+    });
+    root.insert(QStringLiteral("usage"), usage);
+    http.responses.append({200, {}, QJsonDocument(root).toJson(QJsonDocument::Compact)});
+    AiReviewService service({}, QStringLiteral("key"), &http);
+    SubtitleOmniRequest request;
+    request.segments.append(segment(QStringLiteral("a"), QStringLiteral("你好"), 0, 1000));
+    QVector<QPair<int, int>> progressLog;
+    bool sawLegacyComplete = false;
+    const SubtitleOmniResult result = service.reviewSubtitles(
+        request, nullptr, [&](int completed, int total, const QString &message) {
+            progressLog.append({completed, total});
+            if (message.contains(QStringLiteral("完成。"))) sawLegacyComplete = true;
+        });
+    QVERIFY(std::holds_alternative<QVector<SubtitleOmniSuggestion>>(result));
+    QVERIFY(!progressLog.isEmpty());
+    QVERIFY(!sawLegacyComplete);
+    QCOMPARE(progressLog.first().first, 0);
+    QVERIFY(progressLog.first().second > 0);
+    QCOMPARE(service.lastModel(), QStringLiteral("qwen3.8-omni-flash"));
+    QCOMPARE(service.accumulatedUsage().promptTokens, 100);
+    QCOMPARE(service.accumulatedUsage().completionTokens, 20);
+    QCOMPARE(service.accumulatedUsage().totalTokens, 120);
+    const QString summary = formatOmniReviewSummary(service.lastModel(), service.accumulatedUsage());
+    QVERIFY(summary.contains(QStringLiteral("qwen3.8-omni-flash")));
+    QVERIFY(summary.contains(QStringLiteral("120 token")));
+    QVERIFY(summary.contains(QStringLiteral("¥")));
+}
+
+void AiReviewServiceTests::usageDetailsPreferAudioAndTextSplit()
+{
+    QJsonObject details{
+        {QStringLiteral("text_tokens"), 40},
+        {QStringLiteral("audio_tokens"), 60},
+    };
+    QJsonObject object{
+        {QStringLiteral("prompt_tokens"), 100},
+        {QStringLiteral("completion_tokens"), 20},
+        {QStringLiteral("total_tokens"), 120},
+    };
+    object.insert(QStringLiteral("prompt_tokens_details"), details);
+    const OmniUsage usage = OmniReviewJson::usageFromObject(object);
+    QCOMPARE(usage.promptTextTokens, 40);
+    QCOMPARE(usage.promptAudioTokens, 60);
+    const double yuan = estimateOmniCostYuan(usage);
+    QVERIFY(yuan > 0.0);
+    QVERIFY(formatOmniReviewSummary(QStringLiteral("qwen3.8-omni-flash"), usage)
+        .contains(QStringLiteral("输入 100")));
 }
 
 QTEST_MAIN(AiReviewServiceTests)

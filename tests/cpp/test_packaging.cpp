@@ -2,6 +2,8 @@
 #include <QtCore/QDirIterator>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonObject>
 #include <QtCore/QProcess>
 #include <QtCore/QProcessEnvironment>
 #include <QtTest/QTest>
@@ -140,6 +142,7 @@ private slots:
     void aboutWindowDocumentsFfmpegLgpl();
     void packagedBinaryImportsAreClean();
     void packagedAppStartsWithIsolatedPath();
+    void packagedInferenceLoadsRuntime();
 };
 
 void PackagingTests::packageLayoutContainsRuntime()
@@ -182,8 +185,8 @@ void PackagingTests::packageLayoutContainsRuntime()
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-manifest.txt"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-size.txt"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/SubCueInference.exe"))));
-    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/python311.dll"))));
-    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/runtime/python311.dll"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/python312.dll"))));
+    QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/runtime/python312.dll"))));
 }
 
 void PackagingTests::packageContainsOnlyBasicQuickControlsStyle()
@@ -191,6 +194,8 @@ void PackagingTests::packageContainsOnlyBasicQuickControlsStyle()
     QVERIFY(packageHasAny({QStringLiteral("Qt6QuickControls2Basic.dll"),
         QStringLiteral("Qt6QuickControls2Basicd.dll")}));
     QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("vc_redist.x64.exe"))));
+    QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("Qt6QuickControls2WindowsStyleImpl.dll"))));
+    QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("Qt6QuickControls2WindowsStyleImpld.dll"))));
     const QStringList unusedStyles = {
         QStringLiteral("FluentWinUI3"), QStringLiteral("Fusion"),
         QStringLiteral("Imagine"), QStringLiteral("Material"),
@@ -209,6 +214,17 @@ void PackagingTests::packageRestrictsPythonAndCliTools()
         const QString path = iterator.next();
         const QString name = QFileInfo(path).fileName().toLower();
         const QString relative = QDir::fromNativeSeparators(QDir(packageDir()).relativeFilePath(path));
+        const bool forbiddenSitePackage =
+            relative.startsWith(QLatin1String("inference/runtime/Lib/site-packages/"))
+            && (name.endsWith(QLatin1String(".lib"))
+                || name.endsWith(QLatin1String(".pdb"))
+                || relative.contains(QLatin1String("/site-packages/gradio/"))
+                || relative.contains(QLatin1String("/site-packages/gradio_client/"))
+                || relative.contains(QLatin1String("/site-packages/numba/"))
+                || relative.contains(QLatin1String("/site-packages/llvmlite/"))
+                || relative.contains(QLatin1String("/site-packages/xgboost/"))
+                || relative.contains(QLatin1String("/site-packages/sklearn/"))
+                || relative.contains(QLatin1String("/site-packages/scikit_learn")));
         if ((name.startsWith(QLatin1String("python")) && !relative.startsWith(QLatin1String("inference/")))
             || (name.contains(QLatin1String("avdevice")) && !relative.startsWith(QLatin1String("inference/")))
             || name.contains(QLatin1String("pyside"))
@@ -216,9 +232,7 @@ void PackagingTests::packageRestrictsPythonAndCliTools()
             || name == QLatin1String("ffmpeg.exe")
             || name == QLatin1String("ffprobe.exe")
             || name == QLatin1String("ffplay.exe")
-            || (relative.startsWith(QLatin1String("inference/runtime/Lib/site-packages/"))
-                && (name.endsWith(QLatin1String(".lib"))
-                    || name.endsWith(QLatin1String(".pdb"))))) {
+            || forbiddenSitePackage) {
             hits.append(QDir(packageDir()).relativeFilePath(path));
         }
     }
@@ -337,6 +351,55 @@ void PackagingTests::packagedAppStartsWithIsolatedPath()
             .arg(process.exitCode())
             .arg(QString::fromLocal8Bit(process.readAllStandardOutput()),
                 QString::fromLocal8Bit(process.readAllStandardError()))));
+}
+
+void PackagingTests::packagedInferenceLoadsRuntime()
+{
+#ifdef _DEBUG
+    QSKIP("Debug CRT is available from the development environment, not the portable package");
+#endif
+    const QString inferencePath = packageFile(QStringLiteral("inference/SubCueInference.exe"));
+    QVERIFY(QFileInfo::exists(inferencePath));
+
+    QProcess process;
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    const QString systemRoot = env.value(QStringLiteral("SystemRoot"), QStringLiteral("C:/Windows"));
+    env.insert(QStringLiteral("PATH"),
+        QDir::toNativeSeparators(QFileInfo(inferencePath).absolutePath())
+            + QLatin1Char(';')
+            + QDir::toNativeSeparators(QDir(systemRoot).filePath(QStringLiteral("System32"))));
+    env.remove(QStringLiteral("PYTHONPATH"));
+    env.remove(QStringLiteral("PYTHONHOME"));
+    env.remove(QStringLiteral("VIRTUAL_ENV"));
+    process.setProcessEnvironment(env);
+    process.setWorkingDirectory(QFileInfo(inferencePath).absolutePath());
+    process.start(inferencePath, QStringList{QStringLiteral("--stdio")});
+    QVERIFY2(process.waitForStarted(10000), qPrintable(process.errorString()));
+    process.write("{\"taskId\":\"package-runtime\",\"action\":\"runtime-check\"}\n");
+    process.closeWriteChannel();
+    QVERIFY2(process.waitForFinished(60000), qPrintable(process.errorString()));
+
+    const QByteArray output = process.readAllStandardOutput();
+    const QByteArray error = process.readAllStandardError();
+    QVERIFY2(process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0,
+        qPrintable(QStringLiteral("packaged inference exit %1:\n%2\n%3")
+            .arg(process.exitCode())
+            .arg(QString::fromUtf8(output), QString::fromUtf8(error))));
+
+    QJsonObject result;
+    for (const QByteArray &line : output.split('\n')) {
+        const QJsonDocument document = QJsonDocument::fromJson(line);
+        if (document.isObject()
+            && document.object().value(QStringLiteral("type")).toString() == QStringLiteral("result")) {
+            result = document.object();
+        }
+    }
+    QVERIFY2(!result.isEmpty(), qPrintable(QString::fromUtf8(output)));
+    QVERIFY(result.value(QStringLiteral("python")).toString().startsWith(QStringLiteral("3.12.")));
+    QVERIFY(result.value(QStringLiteral("torch")).toString().startsWith(QStringLiteral("2.6.0")));
+    QVERIFY(result.value(QStringLiteral("cuda")).toBool());
+    QCOMPARE(result.value(QStringLiteral("qwenAsr")).toString(), QStringLiteral("0.0.6"));
+    QVERIFY(!result.value(QStringLiteral("av")).toString().isEmpty());
 }
 
 QTEST_MAIN(PackagingTests)

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """独立本地 ASR Worker；进程退出后释放模型及 CUDA 显存。"""
-import json
 import sys
+sys.dont_write_bytecode = True
+
+import json
 from pathlib import Path
 from zipfile import ZipFile
 from xml.etree import ElementTree
@@ -14,6 +16,19 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 
+def _release_python_memory():
+    import gc
+    gc.collect()
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is None or getattr(torch_mod, "cuda", None) is None:
+        return
+    try:
+        if torch_mod.cuda.is_available():
+            torch_mod.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def check(provider):
     import torch
     if not torch.cuda.is_available():
@@ -24,6 +39,20 @@ def check(provider):
         import funasr  # noqa: F401
     else:
         raise ValueError("unknown provider")
+
+
+def keep_owned_segments(segments, chunks):
+    # 重叠分块只保留时间中点属于本块的字词，避免同一句被重复送入粗剪对齐。
+    kept = []
+    for segment in segments:
+        index = segment.pop("chunkIndex")
+        midpoint = (segment["start"] + segment["end"]) * 500
+        left = (chunks[index - 1]["endMs"] + chunks[index]["startMs"]) / 2 if index else -1
+        right = (chunks[index]["endMs"] + chunks[index + 1]["startMs"]) / 2 \
+            if index + 1 < len(chunks) else float("inf")
+        if left <= midpoint < right:
+            kept.append(segment)
+    return sorted(kept, key=lambda segment: (segment["start"], segment["end"]))
 
 
 def qwen(model_dir, aligner_dir, chunks, progress=None):
@@ -46,8 +75,7 @@ def qwen(model_dir, aligner_dir, chunks, progress=None):
             progress("recognize", index + 1, len(chunks), "正在识别音频分块")
     # 8GB 显存下不得同时常驻 ASR 和 Forced Aligner。
     del model
-    gc.collect()
-    torch.cuda.empty_cache()
+    _release_python_memory()
     segments = []
     if aligner_dir:
         from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
@@ -63,9 +91,10 @@ def qwen(model_dir, aligner_dir, chunks, progress=None):
             for item in aligned.items:
                 segments.append({"start": chunk["startMs"] / 1000 + item.start_time,
                                  "end": chunk["startMs"] / 1000 + item.end_time,
-                                 "text": item.text})
+                                 "text": item.text, "chunkIndex": index})
             if progress:
                 progress("align", index + 1, len(recognized), "正在生成字词时间")
+        return keep_owned_segments(segments, chunks)
     else:
         for chunk, text in recognized:
             # 没有 Forced Aligner 时只声明整个分块的粗范围，不能伪造 10ms 精确时间戳。
@@ -75,7 +104,7 @@ def qwen(model_dir, aligner_dir, chunks, progress=None):
             segments.append({"start": chunk["startMs"] / 1000,
                              "end": chunk["endMs"] / 1000,
                              "text": text, "timing": "chunk"})
-    return segments
+        return segments
 
 
 def funasr(model_dir, chunks):
@@ -86,12 +115,13 @@ def funasr(model_dir, chunks):
     # 不声明 VAD 模型，避免 Fun-ASR 在离线运行时隐式下载额外权重。
     model = AutoModel(model=model_dir, trust_remote_code=True, hub="ms", device="cuda:0")
     segments = []
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         result = model.generate(input=chunk["path"], language="中文", itn=True, batch_size=1)[0]
         segments.extend({"start": (chunk["startMs"] + item.get("start", 0)) / 1000,
                          "end": (chunk["startMs"] + item.get("end", 0)) / 1000,
-                         "text": item.get("sentence", "")} for item in result.get("sentence_info", []))
-    return segments
+                         "text": item.get("sentence", ""), "chunkIndex": index}
+                        for item in result.get("sentence_info", []))
+    return keep_owned_segments(segments, chunks)
 
 
 def parse_docx(path):
@@ -135,6 +165,13 @@ def parse_docx(path):
 def run_request(request, progress=None):
     if request.get("action") == "ping":
         return {"python": sys.version.split()[0]}
+    if request.get("action") == "runtime-check":
+        import av
+        import qwen_asr
+        import torch
+        return {"python": sys.version.split()[0], "torch": torch.__version__,
+                "cuda": torch.cuda.is_available(), "qwenAsr": "0.0.6",
+                "av": av.__version__}
     if request.get("action") == "parse-docx":
         return parse_docx(request["path"])
     if request.get("action") == "check":

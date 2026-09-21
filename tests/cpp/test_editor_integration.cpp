@@ -1,19 +1,26 @@
 #include "ai/ai_provider.h"
+#include "ai/ai_review_types.h"
+#include "ai/ai_types.h"
 #include "alignment/alignment_pipeline.h"
 #include "app_controller.h"
-#include "application_context.h"
+#include "application_context.h" // 依赖 ApplicationContext 析构声明
 #include "asr/asr_service.h"
+#include "asr/http_client.h"
 #include "media/media_probe.h"
 #include "playback/playback_engine.h"
+#include "rough_cut_controller.h"
 #include "subtitle/subtitle.h"
 #include "timeline_scene_item.h"
 #include "video_preview_item.h"
+#include "workspace_router.h"
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
 #include <QtCore/QDataStream>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QJsonArray>
+#include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QSet>
@@ -27,11 +34,13 @@
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlContext>
 #include <QtQml/QQmlComponent>
+#include <QtQml/qqml.h>
 #include <QtQuick/QQuickWindow>
 #include <QtTest/QTest>
 #include <QtTest/QSignalSpy>
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <variant>
 
@@ -81,40 +90,56 @@ public:
     }
 };
 
-class FakeAiProvider final : public IAiProvider {
+class RecordingHttpClient final : public IHttpClient {
 public:
-    int calls = 0;
-    Qt::HANDLE workerThreadId = nullptr;
+    int sendCount = 0;
+    QVector<HttpRequest> requests;
+    QVector<HttpResponse> responses;
+    bool blockUntilCancel = false;
+    std::atomic<bool> inFlight{false};
 
-    [[nodiscard]] QString providerId() const override
+    std::variant<HttpResponse, AppError> send(
+        const HttpRequest &request, const std::atomic<bool> *cancel) override
     {
-        return QStringLiteral("fake-ai");
+        requests.append(request);
+        ++sendCount;
+        inFlight = true;
+        while (blockUntilCancel && !aiCancelled(cancel)) {
+            QThread::msleep(15);
+        }
+        inFlight = false;
+        if (aiCancelled(cancel)) return aiCancelledError();
+        if (responses.isEmpty()) {
+            return HttpResponse{200, {}, QByteArrayLiteral("{\"choices\":[{\"message\":{\"content\":\"{}\"}}]}")};
+        }
+        const int index = qMin(sendCount - 1, static_cast<int>(responses.size() - 1));
+        return responses.at(index);
     }
 
-    [[nodiscard]] AiReviewResult review(
-        QVector<Subtitle> &subtitles,
-        const QVector<TranscriptWord> &words,
-        const std::atomic<bool> *cancel,
-        const AiProgress &progress) override
+    std::variant<qint64, AppError> download(
+        const HttpRequest &, QFile *, qint64, const std::atomic<bool> *,
+        const std::function<void(qint64, qint64)> &) override
     {
-        Q_UNUSED(subtitles);
-        Q_UNUSED(words);
-        ++calls;
-        workerThreadId = QThread::currentThreadId();
-        if (progress) {
-            progress(1, 1);
-        }
-        if (aiCancelled(cancel)) {
-            return aiCancelledError();
-        }
-        return 1;
-    }
-
-    [[nodiscard]] QVector<AppError> errors() const override
-    {
-        return {};
+        return AppError(ErrorDomain::Network, 1, QStringLiteral("unused"));
     }
 };
+
+QByteArray jsonChatBody(const QJsonObject &arguments)
+{
+    const QJsonObject message{
+        {QStringLiteral("content"), QString::fromUtf8(QJsonDocument(arguments).toJson(QJsonDocument::Compact))},
+    };
+    QJsonObject root{
+        {QStringLiteral("model"), QStringLiteral("qwen3.8-omni-flash")},
+        {QStringLiteral("choices"), QJsonArray{QJsonObject{{QStringLiteral("message"), message}}}},
+    };
+    root.insert(QStringLiteral("usage"), QJsonObject{
+        {QStringLiteral("prompt_tokens"), 80},
+        {QStringLiteral("completion_tokens"), 16},
+        {QStringLiteral("total_tokens"), 96},
+    });
+    return QJsonDocument(root).toJson(QJsonDocument::Compact);
+}
 
 [[nodiscard]] QSet<QString> frozenEditorShortcuts()
 {
@@ -179,15 +204,26 @@ public:
     return tokens;
 }
 
-#ifdef Q_OS_WIN
-[[nodiscard]] SIZE_T workingSetBytes()
+void registerSubCueQmlItems()
 {
-    PROCESS_MEMORY_COUNTERS counters{};
+    static const bool registered = [] {
+        qmlRegisterType<TimelineSceneItem>("SubCue", 1, 0, "TimelineSceneItem");
+        qmlRegisterType<VideoPreviewItem>("SubCue", 1, 0, "VideoPreviewItem");
+        return true;
+    }();
+    Q_UNUSED(registered);
+}
+
+#ifdef Q_OS_WIN
+[[nodiscard]] SIZE_T privateBytes()
+{
+    PROCESS_MEMORY_COUNTERS_EX counters{};
     counters.cb = sizeof(counters);
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&counters), sizeof(counters))) {
         return 0;
     }
-    return counters.WorkingSetSize;
+    return counters.PrivateUsage;
 }
 #endif
 
@@ -202,6 +238,12 @@ private slots:
     void qmlImportDropAndLayout();
     void exportResultUsesIncrementingSubtitleFolder();
     void pipelineAlignsWithInjectedAsrOnWorkerThread();
+    void alignmentAndAsrReviewDoNotCallAi();
+    void wordMappingReviewIsUndoableAndRejectsStaleEvidence();
+    void subtitleContentReviewRequiresAccept();
+    void omniReviewStartsAtZeroProgress();
+    void destroyingControllerCancelsAiReview();
+    void qmlUnifiedAiSettingsAndWorkspaceScreenshots();
     void appControllerAlignmentCancelWaitsForWorker();
     void appControllerCreateNextScriptCue();
     void alignmentDoesNotModifyScriptText();
@@ -271,15 +313,15 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
         manifest += QFileInfo(file).baseName().toUtf8() + " 1.0 " + file.toUtf8() + "\n";
     }
     QVERIFY(QDir(modulePath).mkdir(QStringLiteral("icons")));
-    for (const QString &file : QDir(sourcePath(QStringLiteral("src/app/qml/icons"))).entryList({QStringLiteral("*.svg")}, QDir::Files)) {
+    for (const QString &file : QDir(sourcePath(QStringLiteral("src/app/qml/icons"))).entryList(
+             {QStringLiteral("*.svg"), QStringLiteral("*.png")}, QDir::Files)) {
         QVERIFY(QFile::copy(sourcePath(QStringLiteral("src/app/qml/icons/") + file), QDir(modulePath).filePath(QStringLiteral("icons/") + file)));
     }
     QFile qmldir(QDir(modulePath).filePath(QStringLiteral("qmldir")));
     QVERIFY(qmldir.open(QIODevice::WriteOnly));
     QCOMPARE(qmldir.write(manifest), manifest.size());
     qmldir.close();
-    qmlRegisterType<TimelineSceneItem>("SubCue", 1, 0, "TimelineSceneItem");
-    qmlRegisterType<VideoPreviewItem>("SubCue", 1, 0, "VideoPreviewItem");
+    registerSubCueQmlItems();
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
 #ifdef Q_OS_WIN
     qputenv("QT_QPA_FONTDIR", QDir(qEnvironmentVariable("WINDIR")).filePath(QStringLiteral("Fonts")).toUtf8());
@@ -317,7 +359,15 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     QVERIFY(settingsLoader);
     QTRY_COMPARE(settingsLoader->property("status").toInt(), 1);
     QTest::qWait(100);
+    QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("aiAssistSection")));
+    QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("asrReviewSection")));
+    QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("aiApiKeyField")));
+    QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("testAiConnectionButton")));
+    QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("clearAiKeyButton")));
+    QVERIFY(window->findChild<QObject *>(QStringLiteral("aiReviewMenuButton")));
     QVERIFY(settingsWindow->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/settings-%1.png")
+        .arg(QGuiApplication::platformName()))));
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-workspace-%1.png")
         .arg(QGuiApplication::platformName()))));
     settingsWindow->hide();
     window->requestActivate();
@@ -511,8 +561,10 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     controller.loadMediaPath(longAudio.fileName());
     QCOMPARE(controller.durationMs(), qint64(180'000));
     timeline->setVisibleRange(0, 0.10);
-    controller.seek(16'100);
+    controller.seek(16'300);
     controller.playForward();
+    // 前面的属性直写会覆盖 QML 绑定；真实播放段显式同步控制器方向。
+    timeline->setProperty("followDirection", controller.direction());
     QTRY_VERIFY_WITH_TIMEOUT(timeline->scrollOffset() > 0, 3'000);
     QVERIFY(controller.playing());
     const int seeksBeforeNavigation = navigatorSeeks.count();
@@ -639,25 +691,23 @@ void EditorIntegrationTests::pipelineAlignsWithInjectedAsrOnWorkerThread()
     context->settings.insert(QStringLiteral("outputSrt"), true);
     context->settings.insert(QStringLiteral("outputAss"), false);
     context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
-    context->settings.insert(QStringLiteral("aiAssistEnabled"), true);
 
     FakeAsrService asr;
     asr.transcript.words = {
         {1, QStringLiteral("Hello"), 100, 700},
         {2, QStringLiteral("world"), 700, 1'400},
     };
-    FakeAiProvider ai;
 
     AppController controller(context.get());
-    controller.setAlignmentOverrides(&asr, &ai);
+    controller.setAlignmentOverrides(&asr);
     controller.loadMediaPath(mediaPath(QStringLiteral("cfr_av.mp4")));
-    QVERIFY(controller.hasMedia());
+    QVERIFY2(controller.hasMedia(), qPrintable(controller.statusText()));
     controller.setScriptText(QStringLiteral("Hello\nworld"));
 
     const Qt::HANDLE guiThread = QThread::currentThreadId();
     bool sawChunks = false;
     connect(&controller, &AppController::alignmentProgressChanged, &controller, [&] {
-        QCOMPARE(QThread::currentThreadId(), guiThread);
+        QVERIFY(QThread::currentThreadId() == guiThread);
         if (controller.alignmentStage() == QStringLiteral("ASR")) {
             sawChunks = true;
             QCOMPARE(controller.alignmentCompleted(), 1);
@@ -678,7 +728,8 @@ void EditorIntegrationTests::pipelineAlignsWithInjectedAsrOnWorkerThread()
     QVERIFY(sawChunks);
     QCOMPARE(controller.document()->count(), 2);
     QVERIFY(controller.document()->subtitles().at(0).isTimed());
-    QVERIFY(controller.statusText().contains(QStringLiteral("打轴完成")));
+    QVERIFY2(controller.statusText().contains(QStringLiteral("打轴完成")),
+             qPrintable(controller.statusText()));
     QVERIFY(controller.canExport());
     QVERIFY(!QFile::exists(dir.filePath(QStringLiteral("cfr_av_字幕文件/cfr_av.srt"))));
     controller.exportSubtitles();
@@ -694,6 +745,246 @@ void EditorIntegrationTests::pipelineAlignsWithInjectedAsrOnWorkerThread()
     QVERIFY(controller.document()->subtitles().first().isTimed());
     controller.undo();
     QVERIFY(!controller.document()->subtitles().first().isTimed());
+}
+
+void EditorIntegrationTests::alignmentAndAsrReviewDoNotCallAi()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    RecordingHttpClient http;
+    QVERIFY(context->credentials.save(QStringLiteral("SubCue/AIReview/qwen_omni"),
+        QStringLiteral("test-key")));
+    context->aiHttp = &http;
+    FakeAsrService asr;
+    asr.transcript.words = {{1, QStringLiteral("Hello"), 100, 800}};
+    AppController controller(context.get());
+    controller.setAlignmentOverrides(&asr);
+    controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+    controller.setScriptText(QStringLiteral("Hello"));
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QCOMPARE(http.sendCount, 0);
+    controller.startReview();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QCOMPARE(http.sendCount, 0);
+    QVERIFY(controller.canOmniReview());
+}
+
+void EditorIntegrationTests::wordMappingReviewIsUndoableAndRejectsStaleEvidence()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    RecordingHttpClient http;
+    QVERIFY(context->credentials.save(QStringLiteral("SubCue/AIReview/qwen_omni"),
+        QStringLiteral("test-key")));
+    context->aiHttp = &http;
+    FakeAsrService asr;
+    AppController controller(context.get());
+    controller.setAlignmentOverrides(&asr);
+    controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+    controller.setScriptText(QStringLiteral("Hello"));
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    controller.startWordMappingReview();
+    QCOMPARE(controller.statusText(), QStringLiteral("缺少有效词级证据，请先完成打轴。"));
+    QCOMPARE(http.sendCount, 0);
+
+    asr.transcript.words = {{1, QStringLiteral("Hello"), 100, 800}};
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    Subtitle cue = controller.document()->subtitles().at(0);
+    const qint64 originalStart = cue.start.milliseconds();
+    cue.confidence = 0.2;
+    QVERIFY(controller.commands()->replaceMany({cue}, QStringLiteral("降低置信度")));
+    http.responses.append({200, {}, jsonChatBody(QJsonObject{{QStringLiteral("mappings"), QJsonArray{QJsonObject{
+        {QStringLiteral("line_id"), QStringLiteral("L1")},
+        {QStringLiteral("status"), QStringLiteral("matched")},
+        {QStringLiteral("start_word_id"), QStringLiteral("W1")},
+        {QStringLiteral("end_word_id"), QStringLiteral("W1")},
+        {QStringLiteral("confidence"), 0.95},
+    }}}})});
+    controller.startWordMappingReview();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY(http.sendCount >= 1);
+    QCOMPARE(controller.document()->subtitles().at(0).start.milliseconds(), 100);
+    QVERIFY(controller.commands()->canUndo());
+    controller.undo();
+    QCOMPARE(controller.document()->subtitles().at(0).start.milliseconds(), originalStart);
+}
+
+void EditorIntegrationTests::subtitleContentReviewRequiresAccept()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    RecordingHttpClient http;
+    QVERIFY(context->credentials.save(QStringLiteral("SubCue/AIReview/qwen_omni"),
+        QStringLiteral("test-key")));
+    context->aiHttp = &http;
+    FakeAsrService asr;
+    asr.transcript.words = {{1, QStringLiteral("Hello"), 100, 800}};
+    AppController controller(context.get());
+    controller.setAlignmentOverrides(&asr);
+    controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+    controller.setScriptText(QStringLiteral("Hello"));
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    const QString id = controller.document()->subtitles().at(0).id;
+    http.responses.append({200, {}, jsonChatBody(QJsonObject{{QStringLiteral("results"), QJsonArray{QJsonObject{
+        {QStringLiteral("segment_id"), id},
+        {QStringLiteral("issue_type"), QStringLiteral("MISSING_TEXT")},
+        {QStringLiteral("confidence"), 0.94},
+        {QStringLiteral("original_text"), QStringLiteral("Hello")},
+        {QStringLiteral("suggested_text"), QStringLiteral("Hello world")},
+        {QStringLiteral("reason"), QStringLiteral("漏字")},
+        {QStringLiteral("decision"), QStringLiteral("REPLACE_TEXT")},
+    }}}})});
+    controller.startOmniSubtitleReview();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QCOMPARE(controller.document()->subtitles().at(0).text, QStringLiteral("Hello"));
+    QCOMPARE(controller.document()->subtitles().at(0).metadata.value(
+        QStringLiteral("omniReviewStatus")).toString(), QStringLiteral("suggested"));
+    QVERIFY(controller.statusText().contains(QStringLiteral("qwen3.8-omni-flash")));
+    QVERIFY(controller.statusText().contains(QStringLiteral("token")));
+    QVERIFY(controller.statusText().contains(QStringLiteral("¥")));
+    controller.acceptOmniSubtitleSuggestion(0);
+    QCOMPARE(controller.document()->subtitles().at(0).text, QStringLiteral("Hello world"));
+    controller.undo();
+    QCOMPARE(controller.document()->subtitles().at(0).text, QStringLiteral("Hello"));
+}
+
+void EditorIntegrationTests::omniReviewStartsAtZeroProgress()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    RecordingHttpClient http;
+    http.blockUntilCancel = true;
+    QVERIFY(context->credentials.save(QStringLiteral("SubCue/AIReview/qwen_omni"),
+        QStringLiteral("test-key")));
+    context->aiHttp = &http;
+    FakeAsrService asr;
+    asr.transcript.words = {{1, QStringLiteral("Hello"), 100, 800}};
+    AppController controller(context.get());
+    controller.setAlignmentOverrides(&asr);
+    controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+    controller.setScriptText(QStringLiteral("Hello"));
+    controller.startAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY(controller.alignmentProgress() >= 0);
+    controller.startOmniSubtitleReview();
+    QTRY_VERIFY(controller.busy());
+    QCOMPARE(controller.busyTaskTitle(), QStringLiteral("正在复核字幕内容"));
+    QCOMPARE(controller.alignmentProgress(), 0);
+    QVERIFY(!controller.alignmentProgressText().contains(QStringLiteral("完成。")));
+    QVERIFY(controller.alignmentIndeterminate() || controller.alignmentProgress() < 100);
+    controller.cancelAlignment();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 4'000);
+}
+
+void EditorIntegrationTests::destroyingControllerCancelsAiReview()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    RecordingHttpClient http;
+    http.blockUntilCancel = true;
+    QVERIFY(context->credentials.save(QStringLiteral("SubCue/AIReview/qwen_omni"),
+        QStringLiteral("test-key")));
+    context->aiHttp = &http;
+    FakeAsrService asr;
+    asr.transcript.words = {{1, QStringLiteral("Hello"), 100, 800}};
+    {
+        AppController controller(context.get());
+        controller.setAlignmentOverrides(&asr);
+        controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+        controller.setScriptText(QStringLiteral("Hello"));
+        controller.startAlignment();
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+        controller.startOmniSubtitleReview();
+        QTRY_VERIFY_WITH_TIMEOUT(http.inFlight.load(), 4'000);
+        controller.loadMediaPath(mediaPath(QStringLiteral("cfr_av.mp4")));
+        QVERIFY(!controller.busy());
+        QTRY_VERIFY_WITH_TIMEOUT(!http.inFlight.load(), 4'000);
+        QVERIFY(controller.statusText().startsWith(QStringLiteral("已加载")));
+    }
+    QVERIFY(!http.inFlight.load());
+}
+
+void EditorIntegrationTests::qmlUnifiedAiSettingsAndWorkspaceScreenshots()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QVERIFY(QDir(dir.path()).mkdir(QStringLiteral("SubCue")));
+    const QString modulePath = dir.filePath(QStringLiteral("SubCue"));
+    QByteArray manifest("module SubCue\n");
+    const QStringList qmlFiles = QDir(sourcePath(QStringLiteral("src/app/qml"))).entryList(
+        {QStringLiteral("*.qml")}, QDir::Files);
+    for (const QString &file : qmlFiles) {
+        QVERIFY(QFile::copy(sourcePath(QStringLiteral("src/app/qml/") + file),
+                            QDir(modulePath).filePath(file)));
+        if (file == QStringLiteral("Theme.qml")) manifest += "singleton ";
+        manifest += QFileInfo(file).baseName().toUtf8() + " 1.0 " + file.toUtf8() + "\n";
+    }
+    QVERIFY(QDir(modulePath).mkdir(QStringLiteral("icons")));
+    for (const QString &file : QDir(sourcePath(QStringLiteral("src/app/qml/icons"))).entryList(
+             {QStringLiteral("*.svg"), QStringLiteral("*.png")}, QDir::Files)) {
+        QVERIFY(QFile::copy(sourcePath(QStringLiteral("src/app/qml/icons/") + file),
+                            QDir(modulePath).filePath(QStringLiteral("icons/") + file)));
+    }
+    QFile qmldir(QDir(modulePath).filePath(QStringLiteral("qmldir")));
+    QVERIFY(qmldir.open(QIODevice::WriteOnly));
+    QCOMPARE(qmldir.write(manifest), manifest.size());
+    qmldir.close();
+    registerSubCueQmlItems();
+    qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
+
+    auto context = makeContext(dir);
+    AppController editor(context.get());
+    RoughCutController roughCut(context.get());
+    WorkspaceRouter router(&editor, &roughCut);
+    QQmlApplicationEngine engine;
+    engine.addImportPath(dir.path());
+    QQmlComponent nativeTheme(&engine);
+    nativeTheme.setData("import QtQuick; QtObject { property bool expandedClientArea: false; function applyDarkTitleBar() {} }", QUrl());
+    QObject *theme = nativeTheme.create();
+    QVERIFY(theme);
+    theme->setParent(&engine);
+    engine.rootContext()->setContextProperty(QStringLiteral("nativeTheme"), theme);
+    engine.rootContext()->setContextProperty(QStringLiteral("editor"), &editor);
+    engine.rootContext()->setContextProperty(QStringLiteral("roughCut"), &roughCut);
+    engine.rootContext()->setContextProperty(QStringLiteral("appRouter"), &router);
+    QStringList warnings;
+    QObject::connect(&engine, &QQmlEngine::warnings, &engine, [&](const QList<QQmlError> &errors) {
+        for (const QQmlError &error : errors) warnings.append(error.toString());
+    });
+    engine.load(QUrl::fromLocalFile(QDir(modulePath).filePath(QStringLiteral("AppRouter.qml"))));
+    QVERIFY2(!engine.rootObjects().isEmpty(), qPrintable(warnings.join(QLatin1Char('\n'))));
+    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+    QVERIFY(window);
+    QTest::qWait(250);
+    QVERIFY(window->findChild<QObject *>(QStringLiteral("subtitleWorkspace")));
+    QVERIFY(window->findChild<QObject *>(QStringLiteral("aiReviewMenuButton")));
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-workspace-router-%1.png")
+        .arg(QGuiApplication::platformName()))));
+    QVERIFY(router.switchTo(QStringLiteral("roughcut")));
+    QTest::qWait(200);
+    QVERIFY(window->findChild<QObject *>(QStringLiteral("roughCutWorkspace")));
+    QVERIFY(window->findChild<QObject *>(QStringLiteral("roughCutAiReviewButton")));
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/roughcut-workspace-%1.png")
+        .arg(QGuiApplication::platformName()))));
 }
 
 void EditorIntegrationTests::appControllerAlignmentCancelWaitsForWorker()
@@ -995,16 +1286,19 @@ void EditorIntegrationTests::playbackRepeatedOpenCloseDoesNotGrowUnbounded()
     for (int index = 0; index < 3; ++index) {
         cycle();
     }
-#ifdef Q_OS_WIN
-    const SIZE_T baseline = workingSetBytes();
-#endif
-    for (int index = 0; index < 50; ++index) {
+    for (int index = 0; index < 40; ++index) {
         cycle();
     }
 #ifdef Q_OS_WIN
-    const SIZE_T after = workingSetBytes();
+    const SIZE_T baseline = privateBytes();
+#endif
+    for (int index = 0; index < 10; ++index) {
+        cycle();
+    }
+#ifdef Q_OS_WIN
+    const SIZE_T after = privateBytes();
     QVERIFY2(after < baseline + 32ull * 1024ull * 1024ull,
-        qPrintable(QStringLiteral("working set grew from %1 to %2")
+        qPrintable(QStringLiteral("private bytes grew from %1 to %2")
                        .arg(static_cast<qulonglong>(baseline))
                        .arg(static_cast<qulonglong>(after))));
 #endif

@@ -21,6 +21,7 @@ struct RoughCutAuxiliaryResult final {
     bool funAsrFailed = false;
     bool whisperFailed = false;
     bool conflict = false;
+    RoughCutDecision agreementDecision = RoughCutDecision::Review;
 };
 
 class RoughCutAuxiliaryRecognition final {

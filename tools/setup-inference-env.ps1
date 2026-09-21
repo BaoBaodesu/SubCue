@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "C:\Users\baobao\AppData\Roaming\uv\python\cpython-3.11.16-windows-x86_64-none\python.exe"
+    [string]$Python = "C:\Users\baobao\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\python.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,16 +7,16 @@ $root = Split-Path -Parent $PSScriptRoot
 $environment = Join-Path $root ".venv-inference"
 $cache = Join-Path $root ".uv-cache"
 $packages = Join-Path $root "out\inference-packages"
-$torchWheel = Join-Path $packages "torch-2.6.0+cu124-cp311-cp311-win_amd64.whl"
+$torchWheel = Join-Path $packages "torch-2.6.0+cu124-cp312-cp312-win_amd64.whl"
 $env:UV_CACHE_DIR = $cache
 
 uv venv $environment --python $Python
 New-Item -ItemType Directory -Force -Path $packages | Out-Null
 curl.exe -L --fail --retry 20 --retry-all-errors --retry-delay 2 -C - `
     -o $torchWheel `
-    "https://download-r2.pytorch.org/whl/cu124/torch-2.6.0%2Bcu124-cp311-cp311-win_amd64.whl"
+    "https://download-r2.pytorch.org/whl/cu124/torch-2.6.0%2Bcu124-cp312-cp312-win_amd64.whl"
 if ((Get-FileHash -Algorithm SHA256 $torchWheel).Hash -ne
-    "6A1FB2714E9323F11EDB6E8ABF7AAD5F79E45AD25C081CDE87681A18D99C29EB") {
+    "3313061C1FEC4C7310CF47944E84513DCD27B6173B72A349BB7CA68D0EE6E9C0") {
     throw "CUDA PyTorch wheel 校验失败"
 }
 uv pip install --python (Join-Path $environment "Scripts\python.exe") $torchWheel

@@ -13,6 +13,7 @@
 #include <QtCore/QString>
 #include <QtCore/QVector>
 
+#include <algorithm>
 #include <optional>
 #include <variant>
 
@@ -105,7 +106,73 @@ struct OmniUsage final {
     qint64 promptTokens = -1;
     qint64 completionTokens = -1;
     qint64 totalTokens = -1;
+    qint64 promptTextTokens = -1;
+    qint64 promptAudioTokens = -1;
 };
+
+[[nodiscard]] inline qint64 omniNonNegative(qint64 value) noexcept
+{
+    return value < 0 ? 0 : value;
+}
+
+inline void addOmniUsage(OmniUsage *target, const OmniUsage &delta) noexcept
+{
+    if (!target) return;
+    auto add = [](qint64 *destination, qint64 source) {
+        if (source < 0) return;
+        *destination = (*destination < 0 ? 0 : *destination) + source;
+    };
+    add(&target->promptTokens, delta.promptTokens);
+    add(&target->completionTokens, delta.completionTokens);
+    add(&target->totalTokens, delta.totalTokens);
+    add(&target->promptTextTokens, delta.promptTextTokens);
+    add(&target->promptAudioTokens, delta.promptAudioTokens);
+}
+
+[[nodiscard]] inline qint64 omniUsageTotal(const OmniUsage &usage) noexcept
+{
+    if (usage.totalTokens > 0) return usage.totalTokens;
+    return omniNonNegative(usage.promptTokens) + omniNonNegative(usage.completionTokens);
+}
+
+[[nodiscard]] inline double estimateOmniCostYuan(const OmniUsage &usage) noexcept
+{
+    // 百炼北京刊例：qwen3.8-flash 文本输入 0.8 / 输出 2.7 元每百万 token。
+    // 音频输入按同系列 Omni Flash 中国内地约 $2.265/百万，按 7.2 汇率折合 16.3 元。
+    constexpr double kTextInputYuanPerMillion = 0.8;
+    constexpr double kAudioInputYuanPerMillion = 16.3;
+    constexpr double kOutputYuanPerMillion = 2.7;
+    const qint64 audio = omniNonNegative(usage.promptAudioTokens);
+    const qint64 text = usage.promptTextTokens >= 0
+        ? usage.promptTextTokens
+        : std::max<qint64>(0, omniNonNegative(usage.promptTokens) - audio);
+    const qint64 output = omniNonNegative(usage.completionTokens);
+    return (static_cast<double>(text) * kTextInputYuanPerMillion
+        + static_cast<double>(audio) * kAudioInputYuanPerMillion
+        + static_cast<double>(output) * kOutputYuanPerMillion) / 1'000'000.0;
+}
+
+[[nodiscard]] inline QString formatOmniReviewSummary(const QString &model, const OmniUsage &usage)
+{
+    const QString used = model.isEmpty()
+        ? QString::fromLatin1(kOmniReviewDefaultModel) : model;
+    const qint64 prompt = omniNonNegative(usage.promptTokens);
+    const qint64 completion = omniNonNegative(usage.completionTokens);
+    const qint64 total = omniUsageTotal(usage);
+    if (total <= 0 && prompt <= 0 && completion <= 0) {
+        return QStringLiteral("模型 %1").arg(used);
+    }
+    const double yuan = estimateOmniCostYuan(usage);
+    const QString cost = yuan < 0.01
+        ? QString::number(yuan, 'f', 4)
+        : QString::number(yuan, 'f', 2);
+    const QString totalText = QString::number(total > 0 ? total : prompt + completion);
+    if (prompt > 0 || completion > 0) {
+        return QStringLiteral("模型 %1，消耗 %2 token（输入 %3 / 输出 %4），约 ¥%5")
+            .arg(used, totalText, QString::number(prompt), QString::number(completion), cost);
+    }
+    return QStringLiteral("模型 %1，消耗 %2 token，约 ¥%3").arg(used, totalText, cost);
+}
 
 struct OmniChatResponse final {
     QJsonObject arguments;

@@ -41,9 +41,9 @@ set(_inference_runtime "${_inference_dir}/runtime")
 file(MAKE_DIRECTORY "${_inference_runtime}/Lib")
 file(COPY "${SUBCUE_INFERENCE_EXE}" DESTINATION "${_inference_dir}")
 file(COPY "${SUBCUE_SOURCE_DIR}/tools/asr_python_worker.py" DESTINATION "${_inference_dir}")
-file(COPY "${SUBCUE_PYTHON_ROOT}/python311.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
+file(COPY "${SUBCUE_PYTHON_ROOT}/python312.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
     DESTINATION "${_inference_dir}")
-file(COPY "${SUBCUE_PYTHON_ROOT}/python311.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
+file(COPY "${SUBCUE_PYTHON_ROOT}/python312.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
     DESTINATION "${_inference_runtime}")
 file(COPY "${SUBCUE_PYTHON_ROOT}/DLLs" DESTINATION "${_inference_runtime}")
 foreach(_runtime_dll IN ITEMS vcruntime140.dll vcruntime140_1.dll)
@@ -68,6 +68,16 @@ file(COPY "${SUBCUE_INFERENCE_SITE_PACKAGES}/" DESTINATION "${_inference_runtime
     PATTERN "test" EXCLUDE PATTERN "*.lib" EXCLUDE PATTERN "*.pdb" EXCLUDE)
 # Torch C++ 头文件只供扩展编译使用，推理运行时无需携带。
 file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/torch/include")
+# Worker 运行时未 import 的转移依赖（qwen-asr 演示 UI / numba JIT、已移除的学习框架），不打进正式包。
+foreach(_unused_python IN ITEMS gradio gradio_client llvmlite numba xgboost sklearn scikit_learn)
+    file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/${_unused_python}")
+    file(GLOB _unused_meta LIST_DIRECTORIES true
+        "${_inference_runtime}/Lib/site-packages/${_unused_python}-*"
+        "${_inference_runtime}/Lib/site-packages/${_unused_python}.*")
+    foreach(_meta IN LISTS _unused_meta)
+        file(REMOVE_RECURSE "${_meta}")
+    endforeach()
+endforeach()
 
 set(_system_root "$ENV{SystemRoot}")
 if(NOT _system_root)
@@ -121,7 +131,8 @@ foreach(_style_dll IN ITEMS
     Qt6QuickControls2Material.dll
     Qt6QuickControls2MaterialStyleImpl.dll
     Qt6QuickControls2Universal.dll
-    Qt6QuickControls2UniversalStyleImpl.dll)
+    Qt6QuickControls2UniversalStyleImpl.dll
+    Qt6QuickControls2WindowsStyleImpl.dll)
     file(REMOVE "${SUBCUE_PACKAGE_DIR}/${_style_dll}")
 endforeach()
 
@@ -279,8 +290,8 @@ endif()
 set(_required
     "${SUBCUE_PACKAGE_DIR}/SubCue.exe"
     "${SUBCUE_PACKAGE_DIR}/inference/SubCueInference.exe"
-    "${SUBCUE_PACKAGE_DIR}/inference/python311.dll"
-    "${SUBCUE_PACKAGE_DIR}/inference/runtime/python311.dll"
+    "${SUBCUE_PACKAGE_DIR}/inference/python312.dll"
+    "${SUBCUE_PACKAGE_DIR}/inference/runtime/python312.dll"
     "${SUBCUE_PACKAGE_DIR}/inference/asr_python_worker.py"
     "${SUBCUE_PACKAGE_DIR}/avcodec-63.dll"
     "${SUBCUE_PACKAGE_DIR}/avformat-63.dll"
@@ -348,4 +359,5 @@ endforeach()
 file(WRITE "${SUBCUE_PACKAGE_DIR}/package-size.txt"
     "Package bytes: ${_package_bytes}\nExcluded development library bytes: ${_development_bytes}\n")
 file(WRITE "${SUBCUE_PACKAGE_DIR}/package.stamp" "SubCue ${SUBCUE_BUILD_TYPE} package\n")
+# CUDA 便携包必须内置 PyTorch CUDA 与 CUDA 13 三件套，体积会显著超过 610 MiB 政策目标。
 message(STATUS "Windows package ready: ${SUBCUE_PACKAGE_DIR} (${_package_bytes} bytes; ${_development_bytes} development library bytes excluded)")

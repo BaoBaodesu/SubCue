@@ -38,8 +38,8 @@ RoughCutDecision RoughCutAuxiliaryRecognition::reconcile(
     const QString funAsr = Normalizer::normalizeText(result->funAsrText);
     result->conflict = result->funAsrFailed || primary.isEmpty()
         || funAsr.isEmpty() || primary != funAsr;
-    // 辅助识别只提供复核证据；冲突或失败绝不能把片段升级为 CUT。
-    return result->conflict ? RoughCutDecision::Review : current;
+    if (result->conflict) return RoughCutDecision::Review;
+    return current == RoughCutDecision::Review ? result->agreementDecision : current;
 }
 
 } // namespace subcue

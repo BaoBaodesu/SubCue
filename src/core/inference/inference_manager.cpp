@@ -41,10 +41,17 @@ InferenceProcessResult InferenceManager::run(
     QElapsedTimer timer;
     timer.start();
     QByteArray pendingOutput;
+    const bool keepFullStdout = !event;
+    constexpr qsizetype kEventStdoutTail = 64 * 1024;
+    const auto trimStdoutTail = [&] {
+        if (keepFullStdout || result.standardOutput.size() <= kEventStdoutTail) return;
+        result.standardOutput.remove(0, result.standardOutput.size() - kEventStdoutTail);
+    };
     const auto readOutput = [&] {
         result.standardError.append(process.readAllStandardError());
         const QByteArray output = process.readAllStandardOutput();
         result.standardOutput.append(output);
+        trimStdoutTail();
         pendingOutput.append(output);
         qsizetype newline = -1;
         while ((newline = pendingOutput.indexOf('\n')) >= 0) {

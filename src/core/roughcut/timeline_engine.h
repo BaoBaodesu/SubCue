@@ -24,7 +24,7 @@ public:
         const QVector<RoughCutSegmentDecision> &decisions,
         int sampleRate, qint64 sourceSampleCount,
         const QVector<RoughCutGapKind> &gaps = {},
-        int preRollMs = 80, int postRollMs = 100);
+        int preRollMs = 80, int postRollMs = 250);
 };
 
 } // namespace subcue

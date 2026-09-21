@@ -1,4 +1,4 @@
-// 嵌入的 Python 仅提供发行版 DLL；避免 Python.h 在 MSVC Debug 下自动链接 python311_d.lib。
+// 嵌入的 Python 仅提供发行版 DLL；避免 Python.h 在 MSVC Debug 下自动链接调试版 Python。
 #ifdef _DEBUG
 #undef _DEBUG
 #include <Python.h>
@@ -26,7 +26,7 @@ int wmain(int argc, wchar_t *argv[])
     const std::filesystem::path executableDirectory = std::filesystem::absolute(argv[0]).parent_path();
     const std::filesystem::path bundledRuntime = executableDirectory / L"runtime";
     const std::filesystem::path bundledWorker = executableDirectory / L"asr_python_worker.py";
-    const std::filesystem::path pythonHomePath = std::filesystem::exists(bundledRuntime / L"python311.dll")
+    const std::filesystem::path pythonHomePath = std::filesystem::exists(bundledRuntime / L"python312.dll")
         ? bundledRuntime : std::filesystem::path(SUBCUE_INFERENCE_PYTHON_HOME);
     const std::filesystem::path sitePackagesPath = std::filesystem::exists(
         bundledRuntime / L"Lib" / L"site-packages")
@@ -38,6 +38,7 @@ int wmain(int argc, wchar_t *argv[])
     PyConfig_InitPythonConfig(&config);
     config.parse_argv = 0;
     config.install_signal_handlers = 0;
+    config.write_bytecode = 0;
     const std::wstring pythonHomeValue = pythonHomePath.wstring();
     const PyStatus homeStatus = PyConfig_SetString(&config, &config.home, pythonHomeValue.c_str());
     if (PyStatus_Exception(homeStatus)) {

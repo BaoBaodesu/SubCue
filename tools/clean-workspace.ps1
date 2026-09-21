@@ -1,5 +1,6 @@
 param(
-    [switch]$Apply
+    [switch]$Apply,
+    [string[]]$Only = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,31 +22,50 @@ function Add-CleanupTarget([string]$Path) {
     $targets.Add($resolved)
 }
 
-Add-CleanupTarget (Join-Path $projectRoot 'build')
-Add-CleanupTarget (Join-Path $projectRoot '.test_tmp')
-Add-CleanupTarget (Join-Path $projectRoot 'out\build\_probe')
-Add-CleanupTarget (Join-Path $projectRoot 'out\build\audio-fix')
-Add-CleanupTarget (Join-Path $projectRoot 'out\build\verify-release')
-Add-CleanupTarget (Join-Path $projectRoot 'out\build\windows-release-cuda\package')
-Add-CleanupTarget (Join-Path $projectRoot 'dist\subcue-0.1.1-editor-fix')
-Add-CleanupTarget (Join-Path $projectRoot '.git\lfs\tmp')
+if ($Only.Count -gt 0) {
+    foreach ($item in $Only) {
+        $candidate = if ([System.IO.Path]::IsPathRooted($item)) {
+            $item
+        } else {
+            Join-Path $projectRoot $item
+        }
+        Add-CleanupTarget $candidate
+    }
+} else {
+    Add-CleanupTarget (Join-Path $projectRoot 'build')
+    Add-CleanupTarget (Join-Path $projectRoot '.test_tmp')
+    Add-CleanupTarget (Join-Path $projectRoot '.venv-ml')
+    Add-CleanupTarget (Join-Path $projectRoot 'out\build\_probe')
+    Add-CleanupTarget (Join-Path $projectRoot 'out\build\audio-fix')
+    Add-CleanupTarget (Join-Path $projectRoot 'out\build\verify-release')
+    Add-CleanupTarget (Join-Path $projectRoot 'dist\subcue-0.1.1-editor-fix')
+    Add-CleanupTarget (Join-Path $projectRoot '.git\lfs\tmp')
 
-$lfsFiles = & git -C $projectRoot lfs ls-files --all 2>$null
-if (-not $lfsFiles) {
-    Add-CleanupTarget (Join-Path $projectRoot '.git\lfs\objects')
-} elseif (Test-Path -LiteralPath (Join-Path $projectRoot '.git\lfs\objects')) {
-    Write-Host '[保留] .git\lfs\objects（检测到 Git 历史中的 LFS 引用）'
-}
-
-Get-ChildItem -LiteralPath (Join-Path $projectRoot '.git\objects') -File -Recurse -Force `
-    -Filter 'tmp_obj_*' -ErrorAction SilentlyContinue | ForEach-Object {
-        Add-CleanupTarget $_.FullName
+    $buildRoot = Join-Path $projectRoot 'out\build'
+    if (Test-Path -LiteralPath $buildRoot) {
+        Get-ChildItem -LiteralPath $buildRoot -Directory -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Add-CleanupTarget (Join-Path $_.FullName 'package')
+            }
     }
 
-Get-ChildItem -LiteralPath $projectRoot -File -Force -ErrorAction SilentlyContinue | Where-Object {
-    $_.Extension -in @('.log', '.err') -or $_.Name -in @('$log', 'dryrun.txt')
-} | ForEach-Object {
-    Add-CleanupTarget $_.FullName
+    $lfsFiles = & git -C $projectRoot lfs ls-files --all 2>$null
+    if (-not $lfsFiles) {
+        Add-CleanupTarget (Join-Path $projectRoot '.git\lfs\objects')
+    } elseif (Test-Path -LiteralPath (Join-Path $projectRoot '.git\lfs\objects')) {
+        Write-Host '[保留] .git\lfs\objects（检测到 Git 历史中的 LFS 引用）'
+    }
+
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot '.git\objects') -File -Recurse -Force `
+        -Filter 'tmp_obj_*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Add-CleanupTarget $_.FullName
+        }
+
+    Get-ChildItem -LiteralPath $projectRoot -File -Force -ErrorAction SilentlyContinue | Where-Object {
+        $_.Extension -in @('.log', '.err') -or $_.Name -in @('$log', 'dryrun.txt')
+    } | ForEach-Object {
+        Add-CleanupTarget $_.FullName
+    }
 }
 
 $bytes = 0

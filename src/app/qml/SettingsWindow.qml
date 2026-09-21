@@ -26,7 +26,6 @@ Window {
     property var controller
     property int modelRequestId: 0
     property int asrCredentialRequest: 0
-    property int aiCredentialRequest: 0
     Component.onCompleted: if (typeof nativeTheme !== "undefined" && nativeTheme)
         nativeTheme.applyDarkTitleBar(settingsHost, Theme.titleBar, Theme.text, Theme.border)
     Label {
@@ -45,21 +44,18 @@ Window {
             Item {
                 id: settingsWindow
                 property var controller: settingsHost.controller
-                property var providers: []
                 property var asrProviderData: []
                 property var asrModelData: []
                 property bool modelLoading: false
                 readonly property int asrCredentialRequest: settingsHost.asrCredentialRequest
-                readonly property int aiCredentialRequest: settingsHost.aiCredentialRequest
                 readonly property int modelRequestId: settingsHost.modelRequestId
                 property string preferredModel: ""
                 property var asrVerification: ({})
                 property int asrConfigRevision: 0
                 property int asrCredentialRevision: 0
-                property int editingProviderIndex: -1
-                property string editingProviderKind: "openai"
                 property bool asrOperationBusy: false
                 property bool aiOperationBusy: false
+                property bool clearAiKeyPending: false
 
                 function clone(value) { return JSON.parse(JSON.stringify(value)) }
                 function indexById(items, id) {
@@ -67,28 +63,15 @@ Window {
                         if (items[i].id === id) return i
                     return items.length > 0 ? 0 : -1
                 }
-                function selectedProvider() {
-                    return aiProvider.currentIndex >= 0 && aiProvider.currentIndex < providers.length
-                           ? providers[aiProvider.currentIndex] : null
-                }
                 function invalidateAsr(configChanged) {
                     if (configChanged !== false) ++asrConfigRevision
                     asrVerification = ({})
                     asrStatus.text = "未验证"
                 }
-                function invalidateAi(configChanged) {
-                    const provider = selectedProvider()
-                    if (!provider) return
-                    if (configChanged !== false)
-                        provider.configRevision = (provider.configRevision || 0) + 1
-                    provider.verification = ({})
-                    providers = providers.slice()
-                    aiStatus.text = "未验证"
-                }
-                function normalizeBaseUrl(value) {
-                    let result = value.trim().replace(/\/+$/, "")
-                    if (!result.endsWith("/v1")) result += "/v1"
-                    return result
+                function refreshAiKeyStatus() {
+                    aiCredentialStatus.text = controller.aiKeySource(aiKey.text, settingsWindow.clearAiKeyPending)
+                    if (settingsWindow.clearAiKeyPending && aiKey.text.length === 0)
+                        aiStatus.text = "将在保存时清除应用保存的密钥"
                 }
                 function refreshAsrModels(preferred) {
                     preferredModel = preferred || ""
@@ -97,18 +80,9 @@ Window {
                     controller.requestAsrModels(asrProvider.currentValue || "dashscope", "",
                                                 settingsHost.modelRequestId)
                 }
-                function refreshAiModels(preferred) {
-                    const provider = selectedProvider()
-                    const models = provider && provider.modelIds ? provider.modelIds : []
-                    aiModel.model = models
-                    aiModel.currentIndex = Math.max(0, models.indexOf(preferred || (provider ? provider.selectedModel : "")))
-                    aiCredentialStatus.text = provider
-                        ? controller.requestCredentialStatus("SubCue/AI/" + provider.id, ++settingsHost.aiCredentialRequest) : "尚未配置"
-                    aiStatus.text = provider && provider.verification && provider.verification.verifiedAtUtc
-                        ? controller.verificationStatus("ai", provider.id) : "未验证"
-                }
                 function loadValues() {
                     saveStatus.text = ""
+                    settingsWindow.clearAiKeyPending = false
                     asrProviderData = controller.asrProviders()
                     const savedAsr = controller.setting("asrProvider") || "dashscope"
                     asrProvider.currentIndex = indexById(asrProviderData, savedAsr)
@@ -127,10 +101,9 @@ Window {
                     reviewProvider.currentIndex = indexById(asrProviderData, controller.setting("reviewAsrProvider") || "funasr")
                     reviewModel.text = controller.setting("reviewAsrModel") || "Fun-ASR-Nano-2512"
 
-                    aiAssist.checked = controller.setting("aiAssistEnabled")
-                    providers = clone(controller.aiProviders())
-                    aiProvider.currentIndex = indexById(providers, controller.setting("aiProviderId") || "")
-                    refreshAiModels("")
+                    aiKey.clear()
+                    refreshAiKeyStatus()
+                    aiStatus.text = "未验证"
 
                     fontFamily.text = controller.setting("fontFamily") || "Microsoft YaHei"
                     fontSize.value = controller.setting("fontSize1080p") || 52
@@ -140,7 +113,7 @@ Window {
                     outputSrt.checked = controller.setting("outputSrt")
                     outputAss.checked = controller.setting("outputAss")
                     outputDirectory.text = controller.setting("outputDirectory") || ""
-                    asrKey.clear(); aiKey.clear()
+                    asrKey.clear()
                 }
 
                 onVisibleChanged: if (visible) Qt.callLater(loadValues)
@@ -158,8 +131,6 @@ Window {
                         if (!settingsWindow.visible) return
                         if (id === "SubCue/ASR/dashscope" && requestId === asrCredentialRequest && asrProvider.currentValue === "dashscope")
                             asrCredentialStatus.text = status
-                        const provider = settingsWindow.selectedProvider()
-                        if (provider && requestId === aiCredentialRequest && id === "SubCue/AI/" + provider.id) aiCredentialStatus.text = status
                     }
                     function onAsrConnectionTestFinished(result) {
                         settingsWindow.asrOperationBusy = false
@@ -177,27 +148,16 @@ Window {
                             asrStatus.text = result.error
                         }
                     }
-                    function onAiConnectionTestFinished(providerId, result) {
+                    function onAiConnectionTestFinished(result) {
                         settingsWindow.aiOperationBusy = false
-                        const provider = settingsWindow.selectedProvider()
-                        if (!provider || provider.id !== providerId) return
                         if (result.success) {
-                            provider.modelIds = result.models
-                            if (!provider.selectedModel || result.models.indexOf(provider.selectedModel) < 0)
-                                provider.selectedModel = result.models[0]
-                            provider.verification = {
-                                "providerId": provider.id,
-                                "configRevision": provider.configRevision || 0,
-                                "credentialRevision": (provider.credentialRevision || 0) + (aiKey.text.length > 0 ? 1 : 0),
-                                "selectedModel": provider.selectedModel,
-                                "verifiedAtUtc": result.verifiedAtUtc
-                            }
-                            settingsWindow.providers = settingsWindow.providers.slice()
-                            settingsWindow.refreshAiModels(provider.selectedModel)
-                            aiStatus.text = "已验证"
+                            let text = "连接成功 · " + (result.model || "qwen3.8-omni-flash")
+                                + " · 延迟 " + result.latencyMs + " ms"
+                            if (result.totalTokens >= 0)
+                                text += " · Token " + result.totalTokens
+                            aiStatus.text = text
                         } else {
-                            settingsWindow.invalidateAi(false)
-                            aiStatus.text = result.error
+                            aiStatus.text = result.error || "连接失败"
                         }
                     }
                 }
@@ -337,9 +297,9 @@ Window {
                                 Item { Layout.fillWidth: true }
 
                                 Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
-                                SectionTitle { text: "自动复核" }
+                                SectionTitle { objectName: "asrReviewSection"; text: "ASR 复核" }
                                 FieldLabel { text: "自动开启" }
-                                SubCheckBox { id: autoReview; text: "自动打轴后立即复核（默认关闭）"; Layout.fillWidth: true }
+                                SubCheckBox { id: autoReview; text: "自动打轴后立即用 ASR 复核（默认关闭）"; Layout.fillWidth: true }
                                 Item { Layout.fillWidth: true }
                                 FieldLabel { text: "ASR 模型" }
                                 SubCheckBox { id: reviewUseSame; text: "使用与自动打轴相同的模型"; Layout.fillWidth: true }
@@ -349,111 +309,65 @@ Window {
                                 Item { visible: !reviewUseSame.checked; Layout.fillWidth: true }
                                 FieldLabel { text: "复核模型"; visible: !reviewUseSame.checked }
                                 SubTextField { id: reviewModel; visible: !reviewUseSame.checked; Layout.fillWidth: true; placeholderText: "Fun-ASR-Nano-2512" }
-                                StatusLabel { visible: !reviewUseSame.checked; text: "复核会重点更新低置信度及时间位置" }
+                                StatusLabel { visible: !reviewUseSame.checked; text: "ASR 复核会重新识别并更新低置信度及时间位置" }
 
                                 Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
-                                SectionTitle { text: "AI 辅助" }
-                                FieldLabel { text: "启用 AI" }
-                                SubCheckBox { id: aiAssist; text: "复核低置信度字幕"; Layout.fillWidth: true; enabled: !settingsWindow.aiOperationBusy }
+                                SectionTitle { objectName: "aiAssistSection"; text: "AI 辅助" }
+                                FieldLabel { text: "说明" }
+                                Label {
+                                    objectName: "aiAssistHint"
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.WordWrap
+                                    color: Theme.muted
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    text: "统一使用阿里云百炼北京地域 · qwen3.8-omni-flash。使用百炼北京地域 API Key。打轴、字幕语义与粗剪复核均需手动触发。"
+                                }
                                 Item { Layout.fillWidth: true }
 
-                                FieldLabel { text: "Provider"; visible: aiAssist.checked }
-                                SubComboBox {
-                                    id: aiProvider
-                                    visible: aiAssist.checked
-                                    enabled: !settingsWindow.aiOperationBusy
+                                FieldLabel { text: "API Key" }
+                                SubTextField {
+                                    id: aiKey
+                                    objectName: "aiApiKeyField"
                                     Layout.fillWidth: true
-                                    model: providers
-                                    textRole: "name"
-                                    valueRole: "id"
-                                    onActivated: {
-                                        aiKey.clear()
-                                        refreshAiModels("")
+                                    echoMode: TextInput.Password
+                                    enabled: !settingsWindow.aiOperationBusy
+                                    placeholderText: "使用百炼北京地域 API Key；留空保留已保存密钥"
+                                    onTextEdited: {
+                                        settingsWindow.clearAiKeyPending = false
+                                        refreshAiKeyStatus()
+                                        aiStatus.text = "未验证"
                                     }
                                 }
                                 RowLayout {
-                                    visible: aiAssist.checked
                                     spacing: 4
                                     SubButton {
-                                        text: "新增"
+                                        objectName: "clearAiKeyButton"
+                                        text: "清除密钥"
                                         enabled: !settingsWindow.aiOperationBusy
                                         onClicked: {
-                                            editingProviderIndex = -1
-                                            editingProviderKind = "openai"
-                                            providerName.text = ""
-                                            providerUrl.text = ""
-                                            providerAuth.currentIndex = 0
-                                            providerDialog.open()
+                                            aiKey.clear()
+                                            settingsWindow.clearAiKeyPending = true
+                                            refreshAiKeyStatus()
                                         }
                                     }
-                                    SubButton {
-                                        text: "添加 Qwen"
-                                        enabled: !settingsWindow.aiOperationBusy
-                                        onClicked: {
-                                            editingProviderIndex = -1
-                                            editingProviderKind = "qwen"
-                                            providerName.text = "阿里云百炼 Qwen"
-                                            providerUrl.text = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-                                            providerAuth.currentIndex = 0
-                                            providerDialog.open()
-                                        }
-                                    }
-                                    SubButton {
-                                        text: "编辑"
-                                        enabled: !settingsWindow.aiOperationBusy && selectedProvider() !== null
-                                        onClicked: {
-                                            editingProviderIndex = aiProvider.currentIndex
-                                            const provider = selectedProvider()
-                                            editingProviderKind = provider.kind || "openai"
-                                            providerName.text = provider.name
-                                            providerUrl.text = provider.baseUrl
-                                            providerAuth.currentIndex = provider.authMode === "none" ? 1 : 0
-                                            providerDialog.open()
-                                        }
-                                    }
-                                    SubButton { text: "删除"; enabled: !settingsWindow.aiOperationBusy && selectedProvider() !== null; onClicked: deleteDialog.open() }
                                 }
 
-                                FieldLabel { text: "模型"; visible: aiAssist.checked }
-                                SubComboBox {
-                                    id: aiModel
-                                    visible: aiAssist.checked
-                                    Layout.fillWidth: true
-                                    enabled: !settingsWindow.aiOperationBusy && !!model && model.length > 0
-                                    onActivated: {
-                                        const provider = selectedProvider()
-                                        if (provider) { provider.selectedModel = currentText; invalidateAi() }
-                                    }
-                                }
+                                FieldLabel { text: "密钥来源" }
+                                StatusLabel { id: aiCredentialStatus; Layout.fillWidth: true }
+                                Item { Layout.fillWidth: true }
+
+                                FieldLabel { text: "连接状态" }
+                                StatusLabel { id: aiStatus; objectName: "aiConnectionStatus"; Layout.fillWidth: true }
                                 SubButton {
+                                    objectName: "testAiConnectionButton"
                                     text: "测试连接"
-                                    visible: aiAssist.checked
-                                    enabled: !settingsWindow.aiOperationBusy && selectedProvider() !== null
+                                    enabled: !settingsWindow.aiOperationBusy
                                     onClicked: {
-                                        const provider = selectedProvider()
                                         settingsWindow.aiOperationBusy = true
                                         aiStatus.text = "正在测试…"
-                                        controller.testAiConnection(provider, aiKey.text)
+                                        controller.testAiConnection(aiKey.text)
                                     }
                                 }
-
-                                FieldLabel { text: "API Key"; visible: aiAssist.checked && selectedProvider() !== null && selectedProvider().authMode !== "none" }
-                                SubTextField {
-                                    id: aiKey
-                                    visible: aiAssist.checked && selectedProvider() !== null && selectedProvider().authMode !== "none"
-                                    enabled: !settingsWindow.aiOperationBusy
-                                    Layout.fillWidth: true
-                                    echoMode: TextInput.Password
-                                    placeholderText: selectedProvider() && selectedProvider().kind === "qwen"
-                                        ? "支持 sk-ws-… / sk-…；留空保留已保存密钥"
-                                        : "留空保持当前 Provider 的密钥"
-                                    onTextEdited: invalidateAi(false)
-                                }
-                                StatusLabel { id: aiCredentialStatus; visible: aiKey.visible }
-
-                                FieldLabel { text: "连接状态"; visible: aiAssist.checked }
-                                StatusLabel { id: aiStatus; visible: aiAssist.checked; Layout.fillWidth: true }
-                                Item { visible: aiAssist.checked; Layout.fillWidth: true }
 
                                 Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
                                 SectionTitle { text: "字幕与导出" }
@@ -503,9 +417,6 @@ Window {
                                     text: "保存"
                                     enabled: !settingsWindow.modelLoading && !settingsWindow.asrOperationBusy && !settingsWindow.aiOperationBusy
                                     onClicked: {
-                                        const provider = selectedProvider()
-                                        if (provider && aiModel.currentIndex >= 0)
-                                            provider.selectedModel = aiModel.currentText
                                         const ok = controller.saveSettings({
                                             "asrProvider": asrProvider.currentValue,
                                             "asrModel": asrModel.currentValue,
@@ -518,9 +429,7 @@ Window {
                                             "reviewUseSameAsr": reviewUseSame.checked,
                                             "reviewAsrProvider": reviewProvider.currentValue || "funasr",
                                             "reviewAsrModel": reviewModel.text.trim() || "Fun-ASR-Nano-2512",
-                                            "aiAssistEnabled": aiAssist.checked,
-                                            "aiProviderId": provider ? provider.id : "",
-                                            "aiProviders": providers,
+                                            "clearAiApiKey": settingsWindow.clearAiKeyPending,
                                             "fontFamily": fontFamily.text,
                                             "fontSize1080p": fontSize.value,
                                             "alignment": ["bottom-left", "bottom-center", "bottom-right"][alignment.currentIndex],
@@ -539,79 +448,6 @@ Window {
                                 }
                             }
                         }
-                    }
-                }
-
-                Dialog {
-                    id: providerDialog
-                    parent: Overlay.overlay
-                    anchors.centerIn: parent
-                    modal: true
-                    title: editingProviderIndex < 0 ? "新增 AI Provider" : "编辑 AI Provider"
-                    width: Math.min(520, settingsWindow.width - 48)
-                    standardButtons: Dialog.Ok | Dialog.Cancel
-                    background: Rectangle { color: Theme.panelRaised; border.color: Theme.border }
-                    contentItem: GridLayout {
-                        columns: 2
-                        rowSpacing: 10
-                        columnSpacing: 10
-                        Label { text: "名称"; color: Theme.text }
-                        SubTextField { id: providerName; Layout.fillWidth: true }
-                        Label { text: "Base URL"; color: Theme.text }
-                        SubTextField { id: providerUrl; Layout.fillWidth: true; placeholderText: "https://example.com/v1" }
-                        Item { visible: editingProviderKind === "qwen" }
-                        Label {
-                            visible: editingProviderKind === "qwen"
-                            Layout.fillWidth: true
-                            color: Theme.muted
-                            wrapMode: Text.WordWrap
-                            text: "如控制台提供业务空间专属 API Host，请在此替换默认地址。"
-                        }
-                        Label { text: "认证方式"; color: Theme.text }
-                        SubComboBox { id: providerAuth; model: ["Bearer API Key", "无需认证"]; Layout.fillWidth: true }
-                    }
-                    onAccepted: {
-                        const item = {
-                            "id": editingProviderIndex < 0 ? controller.newProviderId() : providers[editingProviderIndex].id,
-                            "kind": editingProviderKind,
-                            "name": providerName.text.trim(),
-                            "baseUrl": normalizeBaseUrl(providerUrl.text),
-                            "authMode": providerAuth.currentIndex === 1 ? "none" : "bearer",
-                            "configRevision": editingProviderIndex < 0 ? 0 : (providers[editingProviderIndex].configRevision || 0) + 1,
-                            "credentialRevision": editingProviderIndex < 0 ? 0 : (providers[editingProviderIndex].credentialRevision || 0),
-                            "modelIds": editingProviderIndex < 0 ? [] : (providers[editingProviderIndex].modelIds || []),
-                            "selectedModel": editingProviderIndex < 0 ? "" : (providers[editingProviderIndex].selectedModel || ""),
-                            "verification": {}
-                        }
-                        if (!item.name || !item.baseUrl) return
-                        if (editingProviderIndex < 0) {
-                            providers.push(item)
-                            providers = providers.slice()
-                            aiProvider.currentIndex = providers.length - 1
-                        } else {
-                            providers[editingProviderIndex] = item
-                            providers = providers.slice()
-                            aiProvider.currentIndex = editingProviderIndex
-                        }
-                        aiKey.clear()
-                        refreshAiModels("")
-                    }
-                }
-
-                Dialog {
-                    id: deleteDialog
-                    parent: Overlay.overlay
-                    anchors.centerIn: parent
-                    modal: true
-                    title: "删除 AI Provider"
-                    standardButtons: Dialog.Yes | Dialog.No
-                    Label { text: "删除后保存设置时，将同时移除该 Provider 的 API Key。"; color: Theme.text }
-                    onAccepted: {
-                        providers.splice(aiProvider.currentIndex, 1)
-                        providers = providers.slice()
-                        aiProvider.currentIndex = providers.length > 0 ? 0 : -1
-                        aiKey.clear()
-                        refreshAiModels("")
                     }
                 }
 

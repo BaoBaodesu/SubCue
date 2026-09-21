@@ -106,8 +106,20 @@ AiReviewService::AiReviewService(
     QString apiKey,
     IHttpClient *http)
     : settings_(std::move(settings)),
-      provider_(std::move(apiKey), settings_, http)
+      provider_(std::move(apiKey), settings_, http),
+      lastModel_(settings_.model)
 {
+}
+
+QString AiReviewService::lastModel() const
+{
+    return lastModel_.isEmpty() ? settings_.model : lastModel_;
+}
+
+void AiReviewService::recordChatResponse(const OmniChatResponse &response)
+{
+    addOmniUsage(&usage_, response.usage);
+    if (!response.model.trimmed().isEmpty()) lastModel_ = response.model;
 }
 
 QString AiReviewService::subtitleSystemPrompt()
@@ -204,6 +216,7 @@ OmniCompleteResult AiReviewService::completeWithRetry(
 {
     OmniCompleteResult first = provider_.complete(request, cancel);
     if (std::holds_alternative<OmniChatResponse>(first)) {
+        recordChatResponse(std::get<OmniChatResponse>(first));
         const OmniChatResponse &response = std::get<OmniChatResponse>(first);
         if (!response.arguments.isEmpty()) return first;
     }
@@ -214,12 +227,17 @@ OmniCompleteResult AiReviewService::completeWithRetry(
     qCWarning(subcueAiLog) << "omni_review retrying structured parse"
         << "provider=" << provider_.providerId()
         << "model=" << provider_.model();
-    return provider_.complete(request, cancel);
+    OmniCompleteResult retry = provider_.complete(request, cancel);
+    if (std::holds_alternative<OmniChatResponse>(retry)) {
+        recordChatResponse(std::get<OmniChatResponse>(retry));
+    }
+    return retry;
 }
 
 SubtitleOmniResult AiReviewService::reviewSubtitles(
     const SubtitleOmniRequest &request,
-    const std::atomic<bool> *cancel)
+    const std::atomic<bool> *cancel,
+    OmniReviewProgress progress)
 {
     QHash<QString, SubtitleOmniSuggestion> byId;
     qint64 durationMs = 0;
@@ -227,6 +245,18 @@ SubtitleOmniResult AiReviewService::reviewSubtitles(
         durationMs = std::max(durationMs, segment.endMs);
     }
     const auto windows = subtitleWindows(durationMs, settings_);
+    int total = 0;
+    for (const auto &window : windows) {
+        for (const SubtitleOmniSegment &segment : request.segments) {
+            if (segment.startMs >= window.second || segment.endMs <= window.first) continue;
+            ++total;
+            break;
+        }
+    }
+    if (progress) {
+        progress(0, std::max(1, total), QStringLiteral("正在准备 AI 复核…"));
+    }
+    int done = 0;
     for (const auto &window : windows) {
         if (aiCancelled(cancel)) return aiCancelledError();
         QVector<SubtitleOmniSegment> slice;
@@ -235,6 +265,9 @@ SubtitleOmniResult AiReviewService::reviewSubtitles(
             slice.append(segment);
         }
         if (slice.isEmpty()) continue;
+        if (progress) {
+            progress(done, total, QStringLiteral("正在复核窗口 %1/%2…").arg(done + 1).arg(total));
+        }
         OmniChatRequest chat;
         chat.task = OmniTaskType::SubtitleReview;
         chat.systemPrompt = subtitleSystemPrompt();
@@ -266,6 +299,10 @@ SubtitleOmniResult AiReviewService::reviewSubtitles(
                 fallback.reason = QStringLiteral("AI Review 解析失败或超时，已标记复核");
                 byId.insert(segment.segmentId, fallback);
             }
+            ++done;
+            if (progress) {
+                progress(done, total, QStringLiteral("已完成窗口 %1/%2").arg(done).arg(total));
+            }
             continue;
         }
         const OmniChatResponse response = std::get<OmniChatResponse>(std::move(completed));
@@ -280,6 +317,10 @@ SubtitleOmniResult AiReviewService::reviewSubtitles(
                 fallback.reason = QStringLiteral("AI Review 返回无法解析，已标记复核");
                 byId.insert(segment.segmentId, fallback);
             }
+            ++done;
+            if (progress) {
+                progress(done, total, QStringLiteral("已完成窗口 %1/%2").arg(done).arg(total));
+            }
             continue;
         }
         for (SubtitleOmniSuggestion suggestion : std::get<QVector<SubtitleOmniSuggestion>>(parsed)) {
@@ -293,6 +334,10 @@ SubtitleOmniResult AiReviewService::reviewSubtitles(
                 << "token_usage=" << response.usage.totalTokens;
             byId.insert(suggestion.segmentId, std::move(suggestion));
         }
+        ++done;
+        if (progress) {
+            progress(done, total, QStringLiteral("已完成窗口 %1/%2").arg(done).arg(total));
+        }
     }
     QVector<SubtitleOmniSuggestion> suggestions;
     suggestions.reserve(byId.size());
@@ -304,12 +349,21 @@ SubtitleOmniResult AiReviewService::reviewSubtitles(
 
 RoughCutOmniResult AiReviewService::reviewCandidates(
     const RoughCutOmniRequest &request,
-    const std::atomic<bool> *cancel)
+    const std::atomic<bool> *cancel,
+    OmniReviewProgress progress)
 {
     QVector<RoughCutOmniSuggestion> results;
     results.reserve(request.candidates.size());
-    for (const RoughCutOmniCandidate &candidate : request.candidates) {
+    const int total = request.candidates.size();
+    if (progress) {
+        progress(0, std::max(1, total), QStringLiteral("正在准备 AI 复核…"));
+    }
+    for (int index = 0; index < request.candidates.size(); ++index) {
+        const RoughCutOmniCandidate &candidate = request.candidates.at(index);
         if (aiCancelled(cancel)) return aiCancelledError();
+        if (progress) {
+            progress(index, total, QStringLiteral("正在复核片段 %1/%2…").arg(index + 1).arg(total));
+        }
         OmniChatRequest chat;
         chat.task = OmniTaskType::RoughCutReview;
         chat.systemPrompt = roughCutSystemPrompt();
@@ -386,14 +440,31 @@ RoughCutOmniResult AiReviewService::reviewCandidates(
 
 WordMappingOmniResult AiReviewService::reviewWordMapping(
     const WordMappingOmniRequest &request,
-    const std::atomic<bool> *cancel)
+    const std::atomic<bool> *cancel,
+    OmniReviewProgress progress)
 {
     QVector<Subtitle> subtitles = request.subtitles;
-    if (request.words.isEmpty()) return subtitles;
+    if (request.words.isEmpty()) {
+        if (progress) progress(1, 1, QStringLiteral("没有可复核的词级证据"));
+        return subtitles;
+    }
+    int total = 0;
+    for (const Subtitle &cue : subtitles) {
+        if (AlignmentEngine::needsAiReview(cue.confidence, cue.ambiguity)) ++total;
+    }
+    if (progress) {
+        progress(0, std::max(1, total),
+            total > 0 ? QStringLiteral("正在准备时间映射复核…")
+                      : QStringLiteral("没有需要复核的字幕"));
+    }
+    int done = 0;
     for (int index = 0; index < subtitles.size(); ++index) {
         if (aiCancelled(cancel)) return aiCancelledError();
         if (!AlignmentEngine::needsAiReview(subtitles.at(index).confidence, subtitles.at(index).ambiguity)) {
             continue;
+        }
+        if (progress) {
+            progress(done, total, QStringLiteral("正在复核时间映射 %1/%2…").arg(done + 1).arg(total));
         }
         OmniChatRequest chat;
         chat.task = OmniTaskType::WordMappingReview;
@@ -406,12 +477,20 @@ WordMappingOmniResult AiReviewService::reviewWordMapping(
             const AppError error = std::get<AppError>(std::move(completed));
             if (isFatalOmniError(error)) return error;
             subtitles[index].metadata.insert(QStringLiteral("aiReviewStatus"), QStringLiteral("failed"));
+            ++done;
+            if (progress) {
+                progress(done, total, QStringLiteral("已完成时间映射 %1/%2").arg(done).arg(total));
+            }
             continue;
         }
         const OmniChatResponse response = std::get<OmniChatResponse>(std::move(completed));
         auto parsed = OmniReviewJson::parseWordMappings(response.arguments);
         if (std::holds_alternative<AppError>(parsed)) {
             subtitles[index].metadata.insert(QStringLiteral("aiReviewStatus"), QStringLiteral("invalid"));
+            ++done;
+            if (progress) {
+                progress(done, total, QStringLiteral("已完成时间映射 %1/%2").arg(done).arg(total));
+            }
             continue;
         }
         const QString expectedLine = QStringLiteral("L%1").arg(index + 1);
@@ -424,6 +503,10 @@ WordMappingOmniResult AiReviewService::reviewWordMapping(
         }
         if (mapping.isEmpty()) {
             subtitles[index].metadata.insert(QStringLiteral("aiReviewStatus"), QStringLiteral("invalid"));
+            ++done;
+            if (progress) {
+                progress(done, total, QStringLiteral("已完成时间映射 %1/%2").arg(done).arg(total));
+            }
             continue;
         }
         const QString status = mapping.value(QStringLiteral("status")).toString();
@@ -435,6 +518,10 @@ WordMappingOmniResult AiReviewService::reviewWordMapping(
                     QStringLiteral("rejectedLocally"));
                 subtitles[index].skipReason = QStringLiteral("AI 映射未通过本地音频校验");
             }
+        }
+        ++done;
+        if (progress) {
+            progress(done, total, QStringLiteral("已完成时间映射 %1/%2").arg(done).arg(total));
         }
     }
     return subtitles;

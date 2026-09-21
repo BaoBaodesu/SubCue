@@ -11,6 +11,7 @@
 #include <QtGui/QFont>
 #include <QtGui/QFontInfo>
 #include <QtGui/QGuiApplication>
+#include <QtGui/QIcon>
 #include <QtGui/QPalette>
 #include <QtGui/QWindow>
 #include <QtQml/QQmlApplicationEngine>
@@ -24,6 +25,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationName(QStringLiteral("SubCue"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.1"));
     QQuickStyle::setStyle(QStringLiteral("Basic"));
+    application.setWindowIcon(QIcon(QStringLiteral(":/qt/qml/SubCue/src/app/qml/icons/app-icon.png")));
 
     QFont uiFont(QStringLiteral("Microsoft YaHei UI"));
     if (QFontInfo(uiFont).family() != QStringLiteral("Microsoft YaHei UI")) {
@@ -83,8 +85,9 @@ int main(int argc, char *argv[])
         &engine,
         &QQmlApplicationEngine::objectCreated,
         &application,
-        [&nativeTheme](QObject *object, const QUrl &) {
+        [&nativeTheme, &application](QObject *object, const QUrl &) {
             if (auto *window = qobject_cast<QWindow *>(object)) {
+                window->setIcon(application.windowIcon());
                 nativeTheme.applyDarkTitleBar(window);
             }
         });

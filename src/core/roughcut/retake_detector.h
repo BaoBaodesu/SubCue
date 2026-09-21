@@ -6,6 +6,17 @@
 
 namespace subcue {
 
+enum class RoughCutFailureType {
+    None,
+    Retake,
+    Interrupted,
+    Duplicate,
+    WrongTake,
+    Filler
+};
+
+[[nodiscard]] QString roughCutFailureName(RoughCutFailureType value);
+
 struct RoughCutTake final {
     int recordingIndex = -1;
     double score = 0.0;
@@ -13,6 +24,14 @@ struct RoughCutTake final {
     bool complete = false;
     bool interruption = false;
     bool restartMarker = false;
+    RoughCutFailureType failureType = RoughCutFailureType::None;
+    qint64 startSample = 0;
+    qint64 endSample = 0;
+    int scriptTokenStart = -1;
+    int scriptTokenEnd = -1;
+    double scriptCoverage = 0.0;
+    bool boundaryTrustworthy = false;
+    QString recognizedText;
 };
 
 struct RoughCutRetakeGroup final {

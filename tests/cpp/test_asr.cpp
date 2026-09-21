@@ -516,6 +516,9 @@ void AsrTests::realQwenFixtureAlignsWhenRequested()
         QStringLiteral(".."));
     const QString documentPath = QDir(testDir).filePath(QStringLiteral("测试文案1.docx"));
     const QString media = QDir(testDir).filePath(QStringLiteral("测试音频1.mp4"));
+    if (!QFileInfo::exists(documentPath) || !QFileInfo::exists(media)) {
+        QSKIP("Real Qwen fixture media is not present");
+    }
     const ScriptDocumentResult parsed = ScriptDocumentImporter::loadDocx(documentPath);
     QVERIFY2(std::holds_alternative<ScriptDocument>(parsed),
         qPrintable(std::holds_alternative<AppError>(parsed)

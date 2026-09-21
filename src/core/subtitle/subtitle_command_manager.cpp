@@ -191,6 +191,27 @@ bool SubtitleCommandManager::editText(const QString &id, QString text)
     return replace(id, std::move(updated), tr("修改字幕文本"));
 }
 
+bool SubtitleCommandManager::replaceMany(QVector<Subtitle> updated, const QString &commandText)
+{
+    if (updated.isEmpty()) return false;
+    QVector<Subtitle> originals;
+    originals.reserve(updated.size());
+    for (const Subtitle &item : updated) {
+        const auto current = document_->subtitle(item.id);
+        if (!current || !item.isValid()) return false;
+        originals.append(*current);
+    }
+    stack_.push(new SubtitleCommand(
+        commandText,
+        [document = document_, updated] {
+            for (const Subtitle &item : updated) document->replaceSubtitle(item.id, item);
+        },
+        [document = document_, originals] {
+            for (const Subtitle &item : originals) document->replaceSubtitle(item.id, item);
+        }));
+    return true;
+}
+
 void SubtitleCommandManager::undo() { stack_.undo(); }
 void SubtitleCommandManager::redo() { stack_.redo(); }
 void SubtitleCommandManager::clear() { stack_.clear(); }
