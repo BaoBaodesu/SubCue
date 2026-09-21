@@ -7,6 +7,7 @@
 #include "subtitle/subtitle_command_manager.h"
 #include "subtitle/subtitle_document.h"
 #include "subtitle/subtitle_model.h"
+#include "subtitle/subtitle_time_index.h"
 #include "timeline/snap_engine.h"
 #include "timeline/timeline_editor.h"
 #include "timeline/timeline_viewport.h"
@@ -277,6 +278,7 @@ private:
 
     ApplicationContext *context_ = nullptr;
     SubtitleDocument document_;
+    SubtitleTimeIndex subtitleIndex_;
     SubtitleModel model_;
     SubtitleCommandManager commands_;
     TimelineViewport viewport_;

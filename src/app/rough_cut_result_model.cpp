@@ -113,21 +113,33 @@ void RoughCutResultModel::refreshProtectedDecisions()
 void RoughCutResultModel::applyAuxiliaryResult(
     RoughCutAuxiliaryResult result, const QString &providerName)
 {
-    if (result.recordingIndex < 0 || result.recordingIndex >= baseDecisions_.size()) return;
-    RoughCutSegmentDecision &decision = baseDecisions_[result.recordingIndex];
-    if (decision.failureType != RoughCutFailureType::None)
-        result.agreementDecision = RoughCutDecision::Cut;
-    else
-        result.agreementDecision = RoughCutDecision::Keep;
-    decision.autoDecision = RoughCutAuxiliaryRecognition::reconcile(decision.autoDecision, &result);
-    if (!result.conflict) decision.decisionSource = QStringLiteral("rule+review-asr");
-    decision.evidence.append(QStringLiteral("%1：%2").arg(providerName,
-        result.funAsrFailed ? QStringLiteral("失败") : result.funAsrText));
-    if (result.conflict) decision.reason = QStringLiteral("辅助识别冲突或失败，保留复核");
+    applyAuxiliaryResults({std::move(result)}, providerName);
+}
+
+void RoughCutResultModel::applyAuxiliaryResults(
+    const QVector<RoughCutAuxiliaryResult> &results, const QString &providerName)
+{
+    if (results.isEmpty() || baseDecisions_.isEmpty()) return;
+    bool changed = false;
+    for (RoughCutAuxiliaryResult result : results) {
+        if (result.recordingIndex < 0 || result.recordingIndex >= baseDecisions_.size()) continue;
+        RoughCutSegmentDecision &decision = baseDecisions_[result.recordingIndex];
+        if (decision.failureType != RoughCutFailureType::None)
+            result.agreementDecision = RoughCutDecision::Cut;
+        else
+            result.agreementDecision = RoughCutDecision::Keep;
+        decision.autoDecision = RoughCutAuxiliaryRecognition::reconcile(decision.autoDecision, &result);
+        if (!result.conflict) decision.decisionSource = QStringLiteral("rule+review-asr");
+        decision.evidence.append(QStringLiteral("%1：%2").arg(providerName,
+            result.funAsrFailed ? QStringLiteral("失败") : result.funAsrText));
+        if (result.conflict) decision.reason = QStringLiteral("辅助识别冲突或失败，保留复核");
+        changed = true;
+    }
+    if (!changed) return;
     refreshProtectedDecisions();
     if (!recording_.isEmpty())
         emit dataChanged(index(0), index(recording_.size() - 1),
-            {StatusRole, ReasonRole, EvidenceRole, ReplacementRole});
+            {StatusRole, ReasonRole, EvidenceRole, ReplacementRole, DecisionSourceRole});
 }
 
 } // namespace subcue

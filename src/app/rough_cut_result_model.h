@@ -44,6 +44,8 @@ public:
     [[nodiscard]] bool setUserDecision(int row, std::optional<RoughCutDecision> decision);
     void replaceBaseDecisions(QVector<RoughCutSegmentDecision> decisions, bool preserveUser = true);
     void applyAuxiliaryResult(RoughCutAuxiliaryResult result, const QString &providerName);
+    void applyAuxiliaryResults(const QVector<RoughCutAuxiliaryResult> &results,
+                               const QString &providerName);
 
 private:
     void refreshProtectedDecisions();

@@ -6,6 +6,7 @@
 #include "playback/audio_output.h"
 #include "preview/preview_renderer.h"
 #include "subtitle/subtitle.h"
+#include "timeline_scene_item.h"
 #include "video_preview_item.h"
 
 #ifdef Q_OS_WIN
@@ -71,6 +72,8 @@ private slots:
     void projectFilesImportReopenAndRemove();
     void invalidImportPreservesCurrentMedia();
     void appControllerAppliesSubtitlesAndOverlayText();
+    void currentSubtitlePrefersDocumentOrderOnOverlap();
+    void timelinePlayheadDoesNotDirtyStaticGeometry();
     void appControllerSettingsRoundTrip();
     void unifiedAiKeySaveClearAndRollback();
     void saveSettingsDoesNotSendAiHttp();
@@ -373,6 +376,48 @@ void AppControllerTests::appControllerAppliesSubtitlesAndOverlayText()
     controller.seek(1'500);
     QCOMPARE(controller.currentSubtitleText(), QStringLiteral("World"));
     QCOMPARE(controller.formatTime(3'661'234), QStringLiteral("01:01:01.234"));
+}
+
+void AppControllerTests::currentSubtitlePrefersDocumentOrderOnOverlap()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+
+    Subtitle first;
+    first.text = QStringLiteral("First");
+    first.start = MediaTime::fromMilliseconds(1'000);
+    first.end = MediaTime::fromMilliseconds(2'000);
+    first.status = QStringLiteral("MATCHED");
+    Subtitle second;
+    second.text = QStringLiteral("Covering");
+    second.start = MediaTime::fromMilliseconds(0);
+    second.end = MediaTime::fromMilliseconds(3'000);
+    second.status = QStringLiteral("MATCHED");
+    controller.applySubtitles({first, second});
+    controller.seek(100);
+    QCOMPARE(controller.currentSubtitleText(), QStringLiteral("Covering"));
+    controller.seek(1'500);
+    QCOMPARE(controller.currentSubtitleText(), QStringLiteral("First"));
+    controller.seek(2'000);
+    QCOMPARE(controller.currentSubtitleText(), QStringLiteral("Covering"));
+    controller.seek(3'000);
+    QCOMPARE(controller.currentSubtitleText(), QString());
+}
+
+void AppControllerTests::timelinePlayheadDoesNotDirtyStaticGeometry()
+{
+    TimelineSceneItem item;
+    item.setDurationUs(10'000'000);
+    item.setPixelsPerMs(0.2);
+    item.consumePaintDirtyForTest();
+    item.setPlayheadUs(1'000'000);
+    QCOMPARE(int(item.pendingPaintDirty()), int(TimelineSceneItem::PaintPlayhead));
+    QVERIFY((item.pendingPaintDirty() & TimelineSceneItem::PaintGeometry) == 0);
+    item.consumePaintDirtyForTest();
+    item.setScrollOffset(40);
+    QVERIFY(item.pendingPaintDirty() & TimelineSceneItem::PaintGeometry);
 }
 
 void AppControllerTests::appControllerSettingsRoundTrip()

@@ -872,8 +872,7 @@ void RoughCutController::startAuxiliaryRecognition()
                 return;
             }
             controller->auxiliaryResults_ = results;
-            for (const auto &result : controller->auxiliaryResults_)
-                controller->model_.applyAuxiliaryResult(result, providerName);
+            controller->model_.applyAuxiliaryResults(controller->auxiliaryResults_, providerName);
             controller->rebuildTimeline();
             controller->progressPercent_ = 100;
             controller->setBusy(false);

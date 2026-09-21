@@ -13,6 +13,7 @@ private slots:
     void userDecisionOverridesAndRestoresAuto();
     void replaceBaseDecisionsPreservesUserOverride();
     void manualCutOfReplacementSuspendsDependentAutoCut();
+    void auxiliaryResultsApplyOnceThenProtect();
 };
 
 void RoughCutResultModelTests::exposesDecisionAndSourceTimes()
@@ -97,6 +98,33 @@ void RoughCutResultModelTests::manualCutOfReplacementSuspendsDependentAutoCut()
     QVERIFY(model.setUserDecision(1, std::nullopt));
     QCOMPARE(model.data(model.index(0), RoughCutResultModel::StatusRole).toString(),
         QStringLiteral("CUT"));
+}
+
+void RoughCutResultModelTests::auxiliaryResultsApplyOnceThenProtect()
+{
+    RoughCutResultModel model;
+    RecognizedPassage first{QStringLiteral("a"), QStringLiteral("今天介绍"), 0, 500};
+    first.scriptTokenStart = 0;
+    first.scriptTokenEnd = 4;
+    first.boundaryTrustworthy = true;
+    first.preciseTiming = true;
+    RecognizedPassage second{QStringLiteral("b"), QStringLiteral("自动粗剪"), 600, 1'200};
+    second.scriptTokenStart = 4;
+    second.scriptTokenEnd = 8;
+    second.boundaryTrustworthy = true;
+    second.preciseTiming = true;
+    RoughCutSegmentDecision keep{0, RoughCutDecision::Keep};
+    RoughCutSegmentDecision review{1, RoughCutDecision::Review};
+    model.reset({first, second}, {keep, review}, 1'000, QStringLiteral("今天介绍自动粗剪"));
+    QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+    RoughCutAuxiliaryResult firstResult{0, QStringLiteral("今天介绍"), QStringLiteral("今天介绍")};
+    RoughCutAuxiliaryResult secondResult{1, QStringLiteral("自动粗剪"), QStringLiteral("自动粗剪")};
+    model.applyAuxiliaryResults({firstResult, secondResult}, QStringLiteral("FunASR"));
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(model.data(model.index(0), RoughCutResultModel::DecisionSourceRole).toString(),
+        QStringLiteral("rule+review-asr"));
+    QCOMPARE(model.data(model.index(1), RoughCutResultModel::StatusRole).toString(),
+        QStringLiteral("KEEP"));
 }
 
 QTEST_MAIN(RoughCutResultModelTests)

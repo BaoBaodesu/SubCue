@@ -30,6 +30,7 @@ class TimelineRenderNode final : public QSGNode {
 public:
     QVector<TimelineCueVisual> cues;
     QFont font;
+    bool hasPlayhead = false;
 };
 
 QSGSimpleRectNode *makeRect(const QRectF &rect, const QColor &color)
@@ -117,9 +118,11 @@ void TimelineSceneItem::setPlayheadUs(qint64 value)
         && (!wheelInteraction_.isValid() || wheelInteraction_.elapsed() >= 180)
         && viewport_.followPlayback(followDirection_, width())) {
         emit viewChanged();
+        refresh();
+    } else {
+        refreshPlayhead();
     }
     emit playheadUsChanged();
-    refresh();
 }
 
 qint64 TimelineSceneItem::inPointUs() const noexcept
@@ -362,6 +365,7 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
         } else {
             clearChildren(root);
             geometry = nullptr;
+            root->hasPlayhead = false;
         }
     } else {
         root = new TimelineRenderNode;
@@ -385,7 +389,34 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
         }
     }
 
+    const quint8 dirty = dirty_;
+    dirty_ = PaintNone;
+    if (!(dirty & PaintGeometry) && (dirty & PaintPlayhead) && root->hasPlayhead && geometry != nullptr) {
+        QSGNode *headNode = geometry->lastChild();
+        QSGNode *lineNode = nullptr;
+        if (headNode != nullptr) {
+            lineNode = geometry->firstChild();
+            while (lineNode != nullptr && lineNode->nextSibling() != headNode)
+                lineNode = lineNode->nextSibling();
+        }
+        auto *line = dynamic_cast<QSGSimpleRectNode *>(lineNode);
+        auto *head = dynamic_cast<QSGSimpleRectNode *>(headNode);
+        if (line != nullptr && head != nullptr) {
+            const double x = viewport_.xAtTime(viewport_.playhead());
+            const double viewHeight = height();
+            if (x >= -2.0 && x <= width() + 2.0) {
+                line->setRect(QRectF(x, 0.0, 2.0, viewHeight));
+                head->setRect(QRectF(x - 4.0, 0.0, 10.0, 7.0));
+            } else {
+                line->setRect(QRectF());
+                head->setRect(QRectF());
+            }
+            return root;
+        }
+    }
+
     clearChildren(geometry);
+    root->hasPlayhead = false;
 
     const TimelineSceneLayout layout = currentLayout();
     geometry->appendChildNode(makeRect(toRect(layout.background), backgroundColor_));
@@ -503,6 +534,7 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
     if (layout.playheadVisible) {
         geometry->appendChildNode(makeRect(QRectF(layout.playheadX, 0.0, 2.0, viewHeight), playheadColor_));
         geometry->appendChildNode(makeRect(QRectF(layout.playheadX - 4.0, 0.0, 10.0, 7.0), playheadColor_));
+        root->hasPlayhead = true;
     }
 
     auto *cueLabels = dynamic_cast<QSGTextNode *>(geometry->nextSibling());
@@ -553,7 +585,7 @@ void TimelineSceneItem::mousePressEvent(QMouseEvent *event)
     emit playheadUsChanged();
     emit userSeeked(viewport_.playhead().microseconds());
     event->accept();
-    refresh();
+    refreshPlayhead();
 }
 
 void TimelineSceneItem::mouseMoveEvent(QMouseEvent *event)
@@ -570,7 +602,7 @@ void TimelineSceneItem::mouseMoveEvent(QMouseEvent *event)
     emit playheadUsChanged();
     emit userSeeked(viewport_.playhead().microseconds());
     event->accept();
-    refresh();
+    refreshPlayhead();
 }
 
 void TimelineSceneItem::mouseReleaseEvent(QMouseEvent *event)
@@ -680,6 +712,13 @@ TimelineSceneLayout TimelineSceneItem::currentLayout() const
 
 void TimelineSceneItem::refresh()
 {
+    dirty_ |= PaintGeometry | PaintPlayhead;
+    update();
+}
+
+void TimelineSceneItem::refreshPlayhead()
+{
+    dirty_ |= PaintPlayhead;
     update();
 }
 

@@ -210,6 +210,8 @@ qt_add_library(SubCueCore STATIC
     src/core/subtitle/subtitle_command_manager.h
     src/core/subtitle/subtitle_document.cpp
     src/core/subtitle/subtitle_document.h
+    src/core/subtitle/subtitle_time_index.cpp
+    src/core/subtitle/subtitle_time_index.h
     src/core/subtitle/subtitle_model.cpp
     src/core/subtitle/subtitle_model.h
     src/core/subtitle/timecode.cpp

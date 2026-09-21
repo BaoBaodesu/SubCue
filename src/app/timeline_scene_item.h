@@ -73,6 +73,14 @@ public:
     Q_INVOKABLE void fit();
     Q_INVOKABLE int visibleCueCount() const;
 
+    enum PaintDirty : quint8 {
+        PaintNone = 0,
+        PaintPlayhead = 1,
+        PaintGeometry = 2
+    };
+    [[nodiscard]] quint8 pendingPaintDirty() const noexcept { return dirty_; }
+    void consumePaintDirtyForTest() noexcept { dirty_ = PaintNone; }
+
     void setWaveform(std::shared_ptr<const WaveformPyramid> waveform);
     void setSubtitles(QList<Subtitle> subtitles);
     void setPreviewCue(std::optional<Subtitle> cue);
@@ -123,6 +131,7 @@ private:
     [[nodiscard]] TimelineSceneMetrics metrics() const;
     [[nodiscard]] TimelineSceneLayout currentLayout() const;
     void refresh();
+    void refreshPlayhead();
     void rebuildCueIndex();
     void updateHoveredCue(double x, double y);
     [[nodiscard]] QFont rulerFont() const;
@@ -146,6 +155,7 @@ private:
     std::optional<MediaTime> inPoint_;
     std::optional<MediaTime> outPoint_;
     RulerLabelCache rulerLabels_;
+    quint8 dirty_ = PaintGeometry | PaintPlayhead;
     QColor backgroundColor_{UiTheme::kTimelineBackground};
     QColor rulerColor_{UiTheme::kRuler};
     QColor subtitleTrackColor_{UiTheme::kSubtitleTrack};

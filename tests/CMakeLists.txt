@@ -78,6 +78,10 @@ target_compile_definitions(SubCueCacheWaveformTests PRIVATE
 target_link_libraries(SubCueCacheWaveformTests PRIVATE SubCue::Core Qt6::Test)
 subcue_register_test(SubCueCacheWaveformTests TIMEOUT 30)
 
+qt_add_executable(SubCueSubtitleTimeIndexTests cpp/test_subtitle_time_index.cpp)
+target_link_libraries(SubCueSubtitleTimeIndexTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueSubtitleTimeIndexTests)
+
 qt_add_executable(SubCueTimelineTests cpp/test_timeline.cpp)
 target_link_libraries(SubCueTimelineTests PRIVATE SubCue::Core Qt6::Test)
 subcue_register_test(SubCueTimelineTests)

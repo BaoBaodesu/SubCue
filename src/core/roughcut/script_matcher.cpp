@@ -116,10 +116,15 @@ QVector<Candidate> candidates(const ScriptIndex &script, const QString &text, in
     return result;
 }
 
+struct Node final {
+    ScriptMatch match;
+    int parent = -1;
+};
+
 struct Beam final {
     int cursor = 0;
     double score = 0.0;
-    QVector<ScriptMatch> path;
+    int node = -1;
 };
 
 } // namespace
@@ -134,6 +139,8 @@ QVector<ScriptMatch> ScriptMatcher::match(
         return QVector<ScriptMatch>{};
     };
     const ScriptIndex indexed = indexScript(script);
+    QVector<Node> nodes;
+    if (recording.size() > 0) nodes.reserve(recording.size() * 8 + 32);
     QVector<Beam> beams{{}};
     for (int recordingIndex = 0; recordingIndex < recording.size(); ++recordingIndex) {
         if (cancel && cancel->load()) return markCancelled();
@@ -141,11 +148,13 @@ QVector<ScriptMatch> ScriptMatcher::match(
             recording.at(recordingIndex).text, recordingIndex, cancel);
         if (cancel && cancel->load()) return markCancelled();
         QVector<Beam> expanded;
+        expanded.reserve(beams.size() * (options.size() + 1));
         for (const Beam &beam : beams) {
             Beam added = beam;
             added.score -= 5.0;
-            added.path.append({recordingIndex, -1, ScriptMatchStatus::Added});
-            expanded.append(std::move(added));
+            added.node = nodes.size();
+            nodes.append({{recordingIndex, -1, ScriptMatchStatus::Added}, beam.node});
+            expanded.append(added);
             for (const Candidate &option : options) {
                 const int start = option.match.scriptTokenStart;
                 if (start + 240 < beam.cursor) continue;
@@ -158,8 +167,9 @@ QVector<ScriptMatch> ScriptMatcher::match(
                 match.status = start < beam.cursor ? ScriptMatchStatus::Retake
                     : option.score >= 86.0 ? ScriptMatchStatus::Match
                     : ScriptMatchStatus::Modified;
-                next.path.append(match);
-                expanded.append(std::move(next));
+                next.node = nodes.size();
+                nodes.append({match, beam.node});
+                expanded.append(next);
             }
         }
         std::sort(expanded.begin(), expanded.end(), [](const Beam &left, const Beam &right) {
@@ -170,13 +180,16 @@ QVector<ScriptMatch> ScriptMatcher::match(
         for (Beam &beam : expanded) {
             if (seen.contains(beam.cursor)) continue;
             seen.insert(beam.cursor, true);
-            beams.append(std::move(beam));
+            beams.append(beam);
             if (beams.size() >= 24) break;
         }
     }
     QVector<ScriptMatch> result;
     if (beams.isEmpty()) return result;
-    QVector<ScriptMatch> path = beams.constFirst().path;
+    QVector<ScriptMatch> path;
+    for (int node = beams.constFirst().node; node >= 0; node = nodes.at(node).parent)
+        path.append(nodes.at(node).match);
+    std::reverse(path.begin(), path.end());
     for (int index = 0; index + 1 < path.size(); ++index) {
         ScriptMatch &failed = path[index];
         ScriptMatch &next = path[index + 1];

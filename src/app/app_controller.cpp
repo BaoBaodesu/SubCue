@@ -124,19 +124,23 @@ AppController::AppController(ApplicationContext *context, QObject *parent)
     });
     QObject::connect(&tickTimer_, &QTimer::timeout, this, &AppController::onTick);
     QObject::connect(&document_, &SubtitleDocument::reset, this, [this] {
+        subtitleIndex_.rebuild(document_.subtitles());
         syncTimelineItem();
         updateCurrentSubtitle();
         emit selectedCueChanged();
     });
     QObject::connect(&document_, &SubtitleDocument::inserted, this, [this] {
+        subtitleIndex_.rebuild(document_.subtitles());
         syncTimelineItem();
         updateCurrentSubtitle();
     });
     QObject::connect(&document_, &SubtitleDocument::removed, this, [this] {
+        subtitleIndex_.rebuild(document_.subtitles());
         syncTimelineItem();
         updateCurrentSubtitle();
     });
     QObject::connect(&document_, &SubtitleDocument::changed, this, [this](int) {
+        subtitleIndex_.rebuild(document_.subtitles());
         syncTimelineItem();
         updateCurrentSubtitle();
     });
@@ -1697,14 +1701,8 @@ void AppController::updatePositionFromClock()
 void AppController::updateCurrentSubtitle()
 {
     QString text;
-    const qint64 position = positionMs();
-    for (const Subtitle &subtitle : document_.subtitles()) {
-        if (subtitle.isTimed() && subtitle.start.milliseconds() <= position
-            && position < subtitle.end.milliseconds()) {
-            text = subtitle.text;
-            break;
-        }
-    }
+    const int index = subtitleIndex_.lookup(positionMs(), direction_);
+    if (index >= 0 && index < document_.count()) text = document_.subtitles().at(index).text;
     if (text != currentSubtitle_) {
         currentSubtitle_ = text;
         emit currentSubtitleChanged();
