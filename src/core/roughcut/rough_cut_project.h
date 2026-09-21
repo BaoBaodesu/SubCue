@@ -6,6 +6,8 @@
 #include <QtCore/QByteArray>
 #include <QtCore/QString>
 
+#include <atomic>
+#include <functional>
 #include <optional>
 
 namespace subcue {
@@ -28,7 +30,9 @@ struct RoughCutProject final {
 class RoughCutProjectSerializer final {
 public:
     [[nodiscard]] static QByteArray mediaSha256(const QString &path,
-                                                QString *errorMessage = nullptr);
+                                                QString *errorMessage = nullptr,
+                                                const std::atomic<bool> *cancel = nullptr,
+                                                const std::function<void(qint64, qint64)> &progress = {});
     [[nodiscard]] static bool save(const QString &path, const RoughCutProject &project,
                                    QString *errorMessage = nullptr);
     [[nodiscard]] static std::optional<RoughCutProject> load(

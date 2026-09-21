@@ -4,6 +4,8 @@
 #include <QtCore/QTemporaryDir>
 #include <QtTest/QTest>
 
+#include <atomic>
+
 using namespace subcue;
 
 class RoughCutProjectTests final : public QObject {
@@ -14,6 +16,7 @@ private slots:
     void mediaFingerprintDetectsContentChange();
     void savesUnanalyzedMediaAndScript();
     void savesAnalysisWithoutModelVersion();
+    void mediaSha256CancelStopsBeforeCompletion();
 };
 
 void RoughCutProjectTests::roundTripPreservesManualDecision()
@@ -177,6 +180,29 @@ void RoughCutProjectTests::savesAnalysisWithoutModelVersion()
     QVERIFY2(loaded.has_value(), qPrintable(error));
     QCOMPARE(loaded->decisions.constFirst().userDecision, std::optional(RoughCutDecision::Keep));
     QVERIFY(loaded->decisions.constFirst().modelVersion.isEmpty());
+}
+
+void RoughCutProjectTests::mediaSha256CancelStopsBeforeCompletion()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("long.bin"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QVERIFY(file.write(QByteArray(2 * 1024 * 1024, 'a')) == 2 * 1024 * 1024);
+    file.close();
+
+    std::atomic<bool> cancel{true};
+    int progressCalls = 0;
+    QString error;
+    const QByteArray hash = RoughCutProjectSerializer::mediaSha256(path, &error, &cancel,
+        [&progressCalls](qint64, qint64) { ++progressCalls; });
+    QVERIFY(hash.isEmpty());
+    QCOMPARE(error, QStringLiteral("校验已取消。"));
+
+    cancel = false;
+    const QByteArray full = RoughCutProjectSerializer::mediaSha256(path, &error);
+    QCOMPARE(full.size(), 32);
 }
 
 QTEST_GUILESS_MAIN(RoughCutProjectTests)

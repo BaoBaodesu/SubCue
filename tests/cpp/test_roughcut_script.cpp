@@ -6,6 +6,7 @@
 #include <QtCore/QTemporaryDir>
 #include <QtTest/QTest>
 
+#include <atomic>
 #include <variant>
 
 using namespace subcue;
@@ -17,6 +18,10 @@ private slots:
     void txtRequiresUtf8AndPreservesLines();
     void docxWorkerResultPreservesParagraphAndTable();
     void orderedMatcherClassifiesAllRelations();
+    void matchesOnePassageAcrossFourLines();
+    void keepsAdjacentPartsOfOneLineDistinct();
+    void assignsWrongTakeSharedPrefixToLaterCompleteLine();
+    void matchCancelReturnsCancelledEmptyResult();
 };
 
 void RoughCutScriptTests::txtRequiresUtf8AndPreservesLines()
@@ -76,6 +81,75 @@ void RoughCutScriptTests::orderedMatcherClassifiesAllRelations()
     QCOMPARE(matches.at(4).status, ScriptMatchStatus::Added);
     QCOMPARE(matches.at(2).scriptLineIndex, 2);
     QCOMPARE(matches.at(3).scriptLineIndex, 2);
+}
+
+void RoughCutScriptTests::matchesOnePassageAcrossFourLines()
+{
+    ScriptDocument script;
+    script.lines = {
+        {1, 1, false, QStringLiteral("欢迎来到节目")},
+        {2, 2, false, QStringLiteral("今天介绍自动粗剪")},
+        {3, 3, false, QStringLiteral("它会识别错误版本")},
+        {4, 4, false, QStringLiteral("并保留最终成片")},
+    };
+    const QVector<RecognizedPassage> recording{{QStringLiteral("all"),
+        QStringLiteral("欢迎来到节目今天介绍自动粗剪它会识别错误版本并保留最终成片。"), 0, 100}};
+    const QVector<ScriptMatch> matches = ScriptMatcher::match(script, recording);
+    QCOMPARE(matches.size(), 1);
+    QCOMPARE(matches.constFirst().status, ScriptMatchStatus::Match);
+    QCOMPARE(matches.constFirst().scriptLineIndex, 0);
+    QCOMPARE(matches.constFirst().scriptLineEndIndex, 3);
+    QCOMPARE(matches.constFirst().scriptTokenStart, 0);
+    QVERIFY(matches.constFirst().scriptTokenEnd > 20);
+}
+
+void RoughCutScriptTests::keepsAdjacentPartsOfOneLineDistinct()
+{
+    ScriptDocument script;
+    script.lines = {{1, 1, false, QStringLiteral("今天我们介绍自动粗剪")}};
+    const QVector<RecognizedPassage> recording{
+        {QStringLiteral("first"), QStringLiteral("今天我们介绍"), 0, 100},
+        {QStringLiteral("second"), QStringLiteral("自动粗剪"), 110, 200}};
+    const QVector<ScriptMatch> matches = ScriptMatcher::match(script, recording);
+    QCOMPARE(matches.size(), 2);
+    QCOMPARE(matches.at(0).scriptLineIndex, 0);
+    QCOMPARE(matches.at(1).scriptLineIndex, 0);
+    QVERIFY(matches.at(0).scriptTokenEnd <= matches.at(1).scriptTokenStart);
+    QVERIFY(matches.at(1).status != ScriptMatchStatus::Retake);
+}
+
+void RoughCutScriptTests::assignsWrongTakeSharedPrefixToLaterCompleteLine()
+{
+    ScriptDocument script;
+    script.lines = {{1, 1, false, QStringLiteral("今天我们介绍自动粗剪")}};
+    const QVector<RecognizedPassage> recording{
+        {QStringLiteral("wrong"), QStringLiteral("今天我们去吃饭"), 0, 100},
+        {QStringLiteral("correct"), QStringLiteral("今天我们介绍自动粗剪"), 120, 240}};
+    const QVector<ScriptMatch> matches = ScriptMatcher::match(script, recording);
+    QCOMPARE(matches.size(), 2);
+    QCOMPARE(matches.at(0).status, ScriptMatchStatus::Retake);
+    QCOMPARE(matches.at(0).scriptTokenStart, 0);
+    QVERIFY(matches.at(0).scriptTokenEnd <= matches.at(1).scriptTokenEnd);
+    QCOMPARE(matches.at(1).status, ScriptMatchStatus::Match);
+}
+
+void RoughCutScriptTests::matchCancelReturnsCancelledEmptyResult()
+{
+    ScriptDocument script;
+    script.lines = {{1, 1, false, QStringLiteral("今天我们介绍自动粗剪")}};
+    const QVector<RecognizedPassage> recording{
+        {QStringLiteral("a"), QStringLiteral("今天我们介绍自动粗剪"), 0, 100}};
+    std::atomic<bool> cancel{true};
+    bool cancelled = false;
+    const QVector<ScriptMatch> matches = ScriptMatcher::match(script, recording, &cancel, &cancelled);
+    QVERIFY(matches.isEmpty());
+    QVERIFY(cancelled);
+
+    cancel = false;
+    cancelled = true;
+    const QVector<ScriptMatch> completed = ScriptMatcher::match(script, recording, &cancel, &cancelled);
+    QVERIFY(!cancelled);
+    QVERIFY(!completed.isEmpty());
 }
 
 QTEST_APPLESS_MAIN(RoughCutScriptTests)

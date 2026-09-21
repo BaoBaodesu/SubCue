@@ -141,6 +141,7 @@ void RoughCutControllerTests::reanalysisKeepsOldResultsUntilSuccess()
     auto context = makeContext(dir);
     RoughCutController controller(context.get());
     controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QCOMPARE(controller.resultCount(), 1);
     QCOMPARE(controller.decisions().constFirst().userDecision, RoughCutDecision::Keep);
     controller.setDecision(0, QStringLiteral("CUT"));
@@ -196,6 +197,7 @@ void RoughCutControllerTests::unsavedStateTracksEditsSaveAndUndo()
     const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
     QVERIFY(!wav.isEmpty());
     controller.loadMedia(QUrl::fromLocalFile(wav));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(controller.canSave());
     QVERIFY(controller.modified());
     controller.setScriptText(QStringLiteral("第一句。"));
@@ -203,11 +205,13 @@ void RoughCutControllerTests::unsavedStateTracksEditsSaveAndUndo()
 
     const QString unsavedPath = dir.filePath(QStringLiteral("未分析.subcue-roughcut"));
     QVERIFY(controller.saveProject(QUrl::fromLocalFile(unsavedPath)));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(!controller.modified());
     QCOMPARE(controller.resultCount(), 0);
 
     const QString projectPath = writeProject(dir, wav);
     controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(!controller.modified());
     controller.setDecision(0, QStringLiteral("CUT"));
     QVERIFY(controller.modified());
@@ -215,6 +219,7 @@ void RoughCutControllerTests::unsavedStateTracksEditsSaveAndUndo()
     QVERIFY(!controller.modified());
     controller.setDecision(0, QStringLiteral("CUT"));
     QVERIFY(controller.saveCurrentProject());
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(!controller.modified());
 }
 
@@ -227,9 +232,11 @@ void RoughCutControllerTests::saveFailsDoesNotClearModified()
     const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
     QVERIFY(!wav.isEmpty());
     controller.loadMedia(QUrl::fromLocalFile(wav));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     controller.setScriptText(QStringLiteral("文案"));
     QVERIFY(controller.modified());
-    QVERIFY(!controller.saveProject(QUrl::fromLocalFile(dir.path())));
+    QVERIFY(controller.saveProject(QUrl::fromLocalFile(dir.path())));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(controller.modified());
 }
 
@@ -254,6 +261,7 @@ void RoughCutControllerTests::workspaceSwitchTransfersPlaybackWithoutAutoPlay()
     QCOMPARE(editor.positionMs(), editorPosition);
 
     roughCut.loadMedia(QUrl::fromLocalFile(wav));
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy(), 8'000);
     roughCut.togglePlay();
     QVERIFY(roughCut.playing());
     QVERIFY(router.switchTo(QStringLiteral("subtitle")));

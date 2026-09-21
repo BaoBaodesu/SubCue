@@ -6,6 +6,7 @@
 #include <QtCore/QVector>
 
 #include <algorithm>
+#include <atomic>
 
 namespace subcue {
 
@@ -23,6 +24,13 @@ struct RecognizedPassage final {
     bool boundaryTrustworthy = false;
     int scriptLineIndex = -1;
     int takeGroupId = -1;
+    int scriptLineEndIndex = -1;
+    double textSimilarity = 0.0;
+    double editSimilarity = 0.0;
+    double continuousCoverage = 0.0;
+    int scriptTokenStart = -1;
+    int scriptTokenEnd = -1;
+    bool preciseTiming = false;
 
     [[nodiscard]] qint64 durationSamples() const noexcept
     {
@@ -37,13 +45,18 @@ struct ScriptMatch final {
     double similarity = 0.0;
     double editSimilarity = 0.0;
     double continuousCoverage = 0.0;
+    int scriptLineEndIndex = -1;
+    int scriptTokenStart = -1;
+    int scriptTokenEnd = -1;
 };
 
 class ScriptMatcher final {
 public:
     [[nodiscard]] static QVector<ScriptMatch> match(
         const ScriptDocument &script,
-        const QVector<RecognizedPassage> &recording);
+        const QVector<RecognizedPassage> &recording,
+        const std::atomic<bool> *cancel = nullptr,
+        bool *cancelled = nullptr);
 };
 
 } // namespace subcue

@@ -95,7 +95,12 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
     markSaved();
     playbackTimer_.setInterval(30);
     connect(&playbackTimer_, &QTimer::timeout, this, [this] {
+        const bool wasPriming = playback_.isPriming();
         playback_.pump();
+        if (wasPriming && !playback_.isPriming() && !playback_.isPaused()
+            && context_ && context_->audioDevice) {
+            context_->audioDevice->resume();
+        }
         if (timelinePlaybackIndex_ >= 0 && timelineGapDeadlineMs_ >= 0
             && timelinePlaybackClock_.elapsed() >= timelineGapDeadlineMs_) {
             timelineGapDeadlineMs_ = -1;
@@ -162,65 +167,99 @@ void RoughCutController::loadMedia(const QUrl &url)
 {
     if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
-    const ProbeResult probed = MediaProbe::probe(path);
-    if (std::holds_alternative<AppError>(probed)) {
-        setStatus(std::get<AppError>(probed).userMessage());
-        return;
-    }
-    const MediaInfo info = std::get<MediaInfo>(probed);
-    if (info.audioStreamIndex < 0 || info.audioStreamIndex >= info.streams.size()) {
-        setStatus(QStringLiteral("所选文件没有音频轨。"));
-        return;
-    }
-    const MediaStreamInfo stream = info.streams.at(info.audioStreamIndex);
-    AppError error(ErrorDomain::Media, 0, QString());
+    if (path.isEmpty()) return;
     stopWorker();
-    if (busy_) { setBusy(false); }
-    progressPercent_ = 0; emit progressChanged();
-    stopWaveformWorker();
-    if (sourceWaveformItem_) sourceWaveformItem_->setWaveform({});
-    playback_.close();
-    if (!playback_.open(path, &error)) {
-        setStatus(error.userMessage());
-        return;
-    }
-    if (ownsSharedAudio_) bindSharedAudioDevice();
-    mediaPath_ = QFileInfo(path).canonicalFilePath();
-    analysisWords_.clear();
-    sampleRate_ = stream.sampleRate;
-    channels_ = stream.channels;
-    sourceSampleCount_ = std::max<qint64>(0, info.duration.microseconds() * sampleRate_ / 1'000'000);
-    model_.reset({}, {}, sampleRate_);
-    timeline_.clear();
-    history_.clear();
-    historyIndex_ = 0;
-    projectPath_.clear();
-    analysisVersion_ = 0;
-    auxiliaryResults_.clear();
-    setStatus(QStringLiteral("已加载：%1").arg(QFileInfo(mediaPath_).fileName()));
-    emit mediaChanged();
-    emit resultsChanged();
-    emit canAiReviewChanged();
-    emit historyChanged();
-    emit projectChanged();
-    emit canSaveChanged();
-    refreshModified();
-    startWaveformWorker();
+    cancel_ = false;
+    setBusy(true);
+    progressPercent_ = 0;
+    emit progressChanged();
+    setStatus(QStringLiteral("正在打开媒体…"));
+    const quint64 generation = ++workerGeneration_;
+    worker_ = std::thread([this, path, generation] {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
+        if (cancel_.load()) {
+            postUi([](RoughCutController *controller) {
+                controller->finishJobWithoutResults(QStringLiteral("校验已取消。"));
+            });
+            return;
+        }
+        const ProbeResult probed = MediaProbe::probe(path);
+        if (std::holds_alternative<AppError>(probed)) {
+            postUi([message = std::get<AppError>(probed).userMessage()](RoughCutController *controller) {
+                controller->finishJobWithoutResults(message);
+            });
+            return;
+        }
+        const MediaInfo info = std::get<MediaInfo>(probed);
+        if (info.audioStreamIndex < 0 || info.audioStreamIndex >= info.streams.size()) {
+            postUi([](RoughCutController *controller) {
+                controller->finishJobWithoutResults(QStringLiteral("所选文件没有音频轨。"));
+            });
+            return;
+        }
+        postUi([path, info](RoughCutController *controller) {
+            if (controller->cancel_) {
+                controller->finishJobWithoutResults(QStringLiteral("校验已取消。"));
+                return;
+            }
+            const MediaStreamInfo stream = info.streams.at(info.audioStreamIndex);
+            AppError error(ErrorDomain::Media, 0, QString());
+            controller->stopWaveformWorker();
+            if (controller->sourceWaveformItem_) controller->sourceWaveformItem_->setWaveform({});
+            controller->playback_.close();
+            if (!controller->playback_.open(path, &error)) {
+                controller->finishJobWithoutResults(error.userMessage());
+                return;
+            }
+            if (controller->ownsSharedAudio_) controller->bindSharedAudioDevice();
+            controller->mediaPath_ = QFileInfo(path).canonicalFilePath();
+            controller->analysisWords_.clear();
+            controller->sampleRate_ = stream.sampleRate;
+            controller->channels_ = stream.channels;
+            controller->sourceSampleCount_ = std::max<qint64>(
+                0, info.duration.microseconds() * controller->sampleRate_ / 1'000'000);
+            controller->model_.reset({}, {}, controller->sampleRate_);
+            controller->timeline_.clear();
+            controller->history_.clear();
+            controller->historyIndex_ = 0;
+            controller->projectPath_.clear();
+            controller->analysisVersion_ = 0;
+            controller->auxiliaryResults_.clear();
+            controller->setBusy(false);
+            emit controller->mediaChanged();
+            emit controller->resultsChanged();
+            emit controller->canAiReviewChanged();
+            emit controller->historyChanged();
+            emit controller->projectChanged();
+            emit controller->canSaveChanged();
+            controller->refreshModified();
+            controller->setStatus(QStringLiteral("已加载：%1").arg(QFileInfo(controller->mediaPath_).fileName()));
+            controller->startWaveformWorker();
+        });
+    });
 }
 
 bool RoughCutController::saveProject(const QUrl &url)
 {
     const QString path = localPath(url);
-    if (path.isEmpty() || mediaPath_.isEmpty()) {
-        setStatus(QStringLiteral("请先选择完整 WAV，再保存粗剪工程。"));
+    if (busy_ || shuttingDown_ || path.isEmpty() || mediaPath_.isEmpty()) {
+        if (mediaPath_.isEmpty()) setStatus(QStringLiteral("请先选择完整 WAV，再保存粗剪工程。"));
         return false;
     }
-    QString error;
-    const QByteArray hash = RoughCutProjectSerializer::mediaSha256(mediaPath_, &error);
-    if (hash.isEmpty()) { setStatus(error); return false; }
+    stopWorker();
+    cancel_ = false;
+    setBusy(true);
+    progressPercent_ = 0;
+    emit progressChanged();
+    setStatus(QStringLiteral("正在校验媒体并保存工程…"));
     RoughCutProject project;
     project.mediaPath = mediaPath_;
-    project.mediaSha256 = hash;
     project.scriptPath = scriptPath_;
     project.scriptText = scriptText_;
     project.sampleRate = sampleRate_;
@@ -230,11 +269,48 @@ bool RoughCutController::saveProject(const QUrl &url)
     project.recording = model_.recording();
     project.decisions = model_.decisions();
     project.auxiliaryResults = auxiliaryResults_;
-    if (!RoughCutProjectSerializer::save(path, project, &error)) { setStatus(error); return false; }
-    projectPath_ = QFileInfo(path).absoluteFilePath();
-    emit projectChanged();
-    markSaved();
-    setStatus(QStringLiteral("粗剪工程已保存：%1").arg(projectPath_));
+    const QString mediaPath = mediaPath_;
+    const quint64 generation = ++workerGeneration_;
+    worker_ = std::thread([this, path, project, mediaPath, generation]() mutable {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
+        QString error;
+        project.mediaSha256 = RoughCutProjectSerializer::mediaSha256(mediaPath, &error, &cancel_,
+            [postUi](qint64 done, qint64 total) {
+                if (total <= 0) return;
+                postUi([done, total](RoughCutController *controller) {
+                    if (!controller->busy_) return;
+                    controller->progressPercent_ = std::clamp(int(done * 90 / total), 0, 90);
+                    emit controller->progressChanged();
+                });
+            });
+        if (project.mediaSha256.isEmpty()) {
+            postUi([error](RoughCutController *controller) {
+                controller->finishJobWithoutResults(error);
+            });
+            return;
+        }
+        if (!RoughCutProjectSerializer::save(path, project, &error)) {
+            postUi([error](RoughCutController *controller) {
+                controller->finishJobWithoutResults(error);
+            });
+            return;
+        }
+        postUi([path](RoughCutController *controller) {
+            controller->projectPath_ = QFileInfo(path).absoluteFilePath();
+            emit controller->projectChanged();
+            controller->markSaved();
+            controller->setBusy(false);
+            controller->progressPercent_ = 100;
+            emit controller->progressChanged();
+            controller->setStatus(QStringLiteral("粗剪工程已保存：%1").arg(controller->projectPath_));
+        });
+    });
     return true;
 }
 
@@ -246,35 +322,116 @@ bool RoughCutController::saveCurrentProject()
 
 void RoughCutController::openProject(const QUrl &url)
 {
-    if (busy_) return;
+    if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
-    QString error;
-    const std::optional<RoughCutProject> project = RoughCutProjectSerializer::load(path, &error);
-    if (!project) { setStatus(error); return; }
-    const QByteArray currentHash = RoughCutProjectSerializer::mediaSha256(project->mediaPath, &error);
-    if (currentHash.isEmpty()) { setStatus(QStringLiteral("工程源媒体不可用：%1").arg(error)); return; }
-    if (currentHash != project->mediaSha256) {
-        setStatus(QStringLiteral("源媒体内容已变化，当前工程未改动，请重新选择媒体并分析。"));
-        return;
-    }
-    loadMedia(QUrl::fromLocalFile(project->mediaPath));
-    if (mediaPath_.isEmpty()) return;
-    scriptPath_ = project->scriptPath;
-    scriptText_ = project->scriptText;
-    projectPath_ = QFileInfo(path).absoluteFilePath();
-    analysisVersion_ = project->analysisVersion;
-    auxiliaryResults_ = project->auxiliaryResults;
-    model_.reset(project->recording, project->decisions, sampleRate_, scriptText_);
-    history_.clear();
-    historyIndex_ = 0;
-    rebuildTimeline();
-    emit scriptChanged();
-    emit projectChanged();
-    emit resultsChanged();
-    emit canAiReviewChanged();
-    emit historyChanged();
-    markSaved();
-    setStatus(QStringLiteral("粗剪工程已打开：%1").arg(projectPath_));
+    if (path.isEmpty()) return;
+    stopWorker();
+    cancel_ = false;
+    setBusy(true);
+    progressPercent_ = 0;
+    emit progressChanged();
+    setStatus(QStringLiteral("正在校验工程与媒体…"));
+    const quint64 generation = ++workerGeneration_;
+    worker_ = std::thread([this, path, generation] {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
+        QString error;
+        const std::optional<RoughCutProject> project = RoughCutProjectSerializer::load(path, &error);
+        if (!project) {
+            postUi([error](RoughCutController *controller) {
+                controller->finishJobWithoutResults(error);
+            });
+            return;
+        }
+        const QByteArray currentHash = RoughCutProjectSerializer::mediaSha256(
+            project->mediaPath, &error, &cancel_,
+            [postUi](qint64 done, qint64 total) {
+                if (total <= 0) return;
+                postUi([done, total](RoughCutController *controller) {
+                    if (!controller->busy_) return;
+                    controller->progressPercent_ = std::clamp(int(done * 80 / total), 0, 80);
+                    emit controller->progressChanged();
+                });
+            });
+        if (currentHash.isEmpty()) {
+            postUi([error](RoughCutController *controller) {
+                controller->finishJobWithoutResults(error == QStringLiteral("校验已取消。")
+                    ? error : QStringLiteral("工程源媒体不可用：%1").arg(error));
+            });
+            return;
+        }
+        if (currentHash != project->mediaSha256) {
+            postUi([](RoughCutController *controller) {
+                controller->finishJobWithoutResults(
+                    QStringLiteral("源媒体内容已变化，当前工程未改动，请重新选择媒体并分析。"));
+            });
+            return;
+        }
+        const ProbeResult probed = MediaProbe::probe(project->mediaPath);
+        if (std::holds_alternative<AppError>(probed)) {
+            postUi([message = std::get<AppError>(probed).userMessage()](RoughCutController *controller) {
+                controller->finishJobWithoutResults(message);
+            });
+            return;
+        }
+        const MediaInfo info = std::get<MediaInfo>(probed);
+        if (info.audioStreamIndex < 0 || info.audioStreamIndex >= info.streams.size()) {
+            postUi([](RoughCutController *controller) {
+                controller->finishJobWithoutResults(QStringLiteral("所选文件没有音频轨。"));
+            });
+            return;
+        }
+        postUi([path, project = *project, info](RoughCutController *controller) mutable {
+            if (controller->cancel_) {
+                controller->finishJobWithoutResults(QStringLiteral("校验已取消。"));
+                return;
+            }
+            AppError openError(ErrorDomain::Media, 0, QString());
+            controller->stopWaveformWorker();
+            if (controller->sourceWaveformItem_) controller->sourceWaveformItem_->setWaveform({});
+            controller->playback_.close();
+            if (!controller->playback_.open(project.mediaPath, &openError)) {
+                controller->finishJobWithoutResults(openError.userMessage());
+                return;
+            }
+            if (controller->ownsSharedAudio_) controller->bindSharedAudioDevice();
+            const MediaStreamInfo stream = info.streams.at(info.audioStreamIndex);
+            controller->mediaPath_ = QFileInfo(project.mediaPath).canonicalFilePath();
+            controller->analysisWords_.clear();
+            controller->sampleRate_ = stream.sampleRate;
+            controller->channels_ = stream.channels;
+            controller->sourceSampleCount_ = std::max<qint64>(
+                0, info.duration.microseconds() * controller->sampleRate_ / 1'000'000);
+            controller->scriptPath_ = project.scriptPath;
+            controller->scriptText_ = project.scriptText;
+            controller->projectPath_ = QFileInfo(path).absoluteFilePath();
+            controller->analysisVersion_ = project.analysisVersion;
+            controller->auxiliaryResults_ = project.auxiliaryResults;
+            controller->model_.reset(project.recording, project.decisions,
+                controller->sampleRate_, controller->scriptText_);
+            controller->history_.clear();
+            controller->historyIndex_ = 0;
+            controller->rebuildTimeline();
+            controller->setBusy(false);
+            controller->progressPercent_ = 100;
+            emit controller->progressChanged();
+            emit controller->mediaChanged();
+            emit controller->scriptChanged();
+            emit controller->projectChanged();
+            emit controller->resultsChanged();
+            emit controller->canAiReviewChanged();
+            emit controller->historyChanged();
+            emit controller->canSaveChanged();
+            controller->markSaved();
+            controller->setStatus(QStringLiteral("粗剪工程已打开：%1").arg(controller->projectPath_));
+            controller->startWaveformWorker();
+        });
+    });
 }
 
 void RoughCutController::loadScript(const QUrl &url)
@@ -431,7 +588,13 @@ void RoughCutController::startAnalysis()
             }
             script = std::get<ScriptDocument>(imported);
         }
-        const QVector<ScriptMatch> matches = ScriptMatcher::match(script, recording);
+        bool matchCancelled = false;
+        const QVector<ScriptMatch> matches = ScriptMatcher::match(
+            script, recording, &cancel_, &matchCancelled);
+        if (matchCancelled || cancel_.load()) {
+            failWithoutCommit(QStringLiteral("分析已取消。"));
+            return;
+        }
         const QVector<RoughCutRetakeGroup> groups = RetakeDetector::detect(recording, matches, sampleRate);
         for (const ScriptMatch &match : matches) {
             if (match.recordingIndex >= 0 && match.recordingIndex < recording.size()) {
@@ -720,9 +883,8 @@ void RoughCutController::togglePlay()
     if (!playback_.isOpen()) return;
     if (playback_.isPaused()) {
         playback_.play();
-        (void)playback_.primeAudio();
-        if (context_->audioDevice) context_->audioDevice->resume();
         playbackTimer_.start();
+        if (!playback_.isPriming() && context_->audioDevice) context_->audioDevice->resume();
     } else {
         playback_.pause();
         if (context_->audioDevice) context_->audioDevice->pause();
@@ -815,7 +977,6 @@ void RoughCutController::playTimeline()
         playback_.seek(MediaTime::fromMicroseconds((clip.sourceStartSample
             + std::clamp<qint64>(startSample - clip.timelineStartSample, 0,
                 clip.sourceEndSample - clip.sourceStartSample)) * 1'000'000 / sampleRate_));
-        (void)playback_.primeAudio();
     }
     emit playbackChanged();
 }
@@ -835,8 +996,7 @@ void RoughCutController::toggleTimelinePlay()
             timelinePlaybackClock_.restart();
         } else {
             playback_.play();
-            (void)playback_.primeAudio();
-            if (context_->audioDevice) context_->audioDevice->resume();
+            if (!playback_.isPriming() && context_->audioDevice) context_->audioDevice->resume();
         }
         playbackTimer_.start();
         timelinePaused_ = false;
@@ -870,8 +1030,7 @@ void RoughCutController::startTimelineClip(int index)
     playback_.seek(MediaTime::fromMicroseconds(clip.sourceStartSample * 1'000'000 / sampleRate_));
     auditionEndSample_ = clip.sourceEndSample;
     playback_.play();
-    (void)playback_.primeAudio();
-    if (context_->audioDevice) context_->audioDevice->resume();
+    if (!playback_.isPriming() && context_->audioDevice) context_->audioDevice->resume();
     emit playbackChanged();
 }
 

@@ -11,6 +11,9 @@
 #include <QtSql/QSqlError>
 #include <QtSql/QSqlQuery>
 
+#include <algorithm>
+#include <atomic>
+
 namespace subcue {
 namespace {
 
@@ -73,7 +76,8 @@ bool setError(QString *output, const QString &message)
 
 } // namespace
 
-QByteArray RoughCutProjectSerializer::mediaSha256(const QString &path, QString *errorMessage)
+QByteArray RoughCutProjectSerializer::mediaSha256(const QString &path, QString *errorMessage,
+    const std::atomic<bool> *cancel, const std::function<void(qint64, qint64)> &progress)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -81,9 +85,23 @@ QByteArray RoughCutProjectSerializer::mediaSha256(const QString &path, QString *
         return {};
     }
     QCryptographicHash hash(QCryptographicHash::Sha256);
-    if (!hash.addData(&file)) {
-        setError(errorMessage, file.errorString());
-        return {};
+    const qint64 total = std::max<qint64>(0, file.size());
+    QByteArray chunk(1024 * 1024, Qt::Uninitialized);
+    qint64 done = 0;
+    while (!file.atEnd()) {
+        if (cancel && cancel->load()) {
+            setError(errorMessage, QStringLiteral("校验已取消。"));
+            return {};
+        }
+        const qint64 read = file.read(chunk.data(), chunk.size());
+        if (read < 0) {
+            setError(errorMessage, file.errorString());
+            return {};
+        }
+        if (read == 0) break;
+        hash.addData(QByteArrayView(chunk.constData(), qsizetype(read)));
+        done += read;
+        if (progress) progress(done, total);
     }
     return hash.result();
 }

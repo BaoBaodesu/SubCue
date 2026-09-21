@@ -916,9 +916,7 @@ void AppController::playForward()
     direction_ = 1;
     playing_ = true;
     playback_.play();
-    // 声卡恢复前先准备足够的连续样本，避免首个设备回调在空缓冲上产生爆音。
-    (void)playback_.primeAudio();
-    if (context_->audioDevice) {
+    if (!playback_.isPriming() && context_->audioDevice) {
         context_->audioDevice->resume();
     }
     elapsed_.start();
@@ -1639,7 +1637,11 @@ void AppController::onTick()
             std::max<qint64>(1, elapsedUs) * playbackRate_)));
     }
     // 音频渲染在设备自己的事件驱动线程里跑，主线程只负责泵入解码数据与画面调度。
+    const bool wasPriming = playback_.isPriming();
     playback_.pump();
+    if (wasPriming && !playback_.isPriming() && playing_ && context_->audioDevice) {
+        context_->audioDevice->resume();
+    }
     updatePositionFromClock();
     pushPreviewFrame();
 }

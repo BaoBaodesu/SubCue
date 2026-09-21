@@ -48,6 +48,7 @@ ApplicationWindow {
 
     property bool allowClose: false
     property var pendingUnsavedAction: null
+    property bool saveThenContinue: false
     function requestDestructiveAction(action) {
         if (!roughCut.modified) {
             action()
@@ -61,6 +62,19 @@ ApplicationWindow {
         pendingUnsavedAction = null
         if (action) action()
     }
+    function finishPendingSave() {
+        if (!saveThenContinue || roughCut.busy) return
+        saveThenContinue = false
+        if (roughCut.modified) {
+            pendingUnsavedAction = null
+            return
+        }
+        runPendingUnsavedAction()
+    }
+    Connections {
+        target: roughCut
+        function onBusyChanged() { appWindow.finishPendingSave() }
+    }
     Dialog {
         id: unsavedDialog
         objectName: "roughCutUnsavedDialog"
@@ -71,8 +85,11 @@ ApplicationWindow {
         Label { text: qsTr("当前粗剪工程有未保存的更改。"); color: Theme.text }
         onAccepted: {
             if (roughCut.projectPath !== "") {
-                if (roughCut.saveCurrentProject()) runPendingUnsavedAction()
-                else pendingUnsavedAction = null
+                saveThenContinue = true
+                if (!roughCut.saveCurrentProject()) {
+                    saveThenContinue = false
+                    pendingUnsavedAction = null
+                }
             } else {
                 saveThenContinue = true
                 saveProjectDialog.open()
@@ -81,7 +98,6 @@ ApplicationWindow {
         onDiscarded: runPendingUnsavedAction()
         onRejected: pendingUnsavedAction = null
     }
-    property bool saveThenContinue: false
     FileDialog {
         id: saveProjectDialog
         title: qsTr("保存粗剪工程")
@@ -95,10 +111,7 @@ ApplicationWindow {
                 pendingUnsavedAction = null
                 return
             }
-            if (saveThenContinue) {
-                saveThenContinue = false
-                runPendingUnsavedAction()
-            }
+            finishPendingSave()
         }
         onRejected: {
             saveThenContinue = false

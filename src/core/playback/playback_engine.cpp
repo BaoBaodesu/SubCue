@@ -149,6 +149,7 @@ void PlaybackEngine::play()
     audioOutput_.resume();
     clock_.resume();
     priming_ = hasAudio_.load();
+    if (priming_) primeClock_.restart();
     onSchedulerWake();
 }
 
@@ -174,8 +175,8 @@ quint64 PlaybackEngine::seek(MediaTime target)
         audioDevice_->flushResampler();
     }
     clock_.reset();
-    // 跳转后先重新泵入解码数据再出声，避免从空缓冲直接开始渲染。
     priming_ = hasAudio_.load() && !paused_.load();
+    if (priming_) primeClock_.restart();
     clockStart_ = target;
     endOfStream_ = false;
     pendingVideo_.reset();
@@ -309,9 +310,12 @@ void PlaybackEngine::pump()
 {
     drainAudioToOutput();
     if (priming_ && !paused_.load()) {
-        // 本帧先把解码数据泵进环缓冲，再交给音频线程渲染，不出现"边解码边硬切"。
-        (void)primeAudio(kPrimeTimeoutMs);
-        priming_ = false;
+        const qint64 buffered = audioOutput_.bufferedFrames();
+        if (buffered >= preRollFrames_ || endOfStream_.load()
+            || (primeClock_.isValid() && primeClock_.elapsed() >= kPrimeTimeoutMs)) {
+            if (buffered > 0) beginClock(clockStart_);
+            priming_ = false;
+        }
     }
     clock_.syncFrom(audioOutput_);
     onSchedulerWake();

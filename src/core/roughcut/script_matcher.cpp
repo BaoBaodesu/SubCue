@@ -3,133 +3,227 @@
 #include "alignment/fuzz_ratio.h"
 #include "alignment/normalizer.h"
 
+#include <QtCore/QHash>
+
 #include <algorithm>
+#include <atomic>
 
 namespace subcue {
 namespace {
 
-double similarity(const QString &left, const QString &right)
+double editSimilarity(const std::u32string &left, const std::u32string &right,
+    const std::atomic<bool> *cancel)
 {
-    return FuzzRatio::ratio(
-        Normalizer::normalizeCodepoints(left), Normalizer::normalizeCodepoints(right));
-}
-
-double editSimilarity(const QString &left, const QString &right)
-{
-    const std::u32string a = Normalizer::normalizeCodepoints(left);
-    const std::u32string b = Normalizer::normalizeCodepoints(right);
-    if (a.empty() || b.empty()) return a == b ? 100.0 : 0.0;
-    QVector<int> previous(static_cast<qsizetype>(b.size()) + 1);
-    QVector<int> current(static_cast<qsizetype>(b.size()) + 1);
-    for (int index = 0; index <= static_cast<int>(b.size()); ++index) previous[index] = index;
-    for (int row = 1; row <= static_cast<int>(a.size()); ++row) {
+    if (cancel && cancel->load()) return 0.0;
+    if (left.empty() || right.empty()) return left == right ? 100.0 : 0.0;
+    QVector<int> previous(static_cast<qsizetype>(right.size()) + 1);
+    QVector<int> current(static_cast<qsizetype>(right.size()) + 1);
+    for (int index = 0; index <= static_cast<int>(right.size()); ++index) previous[index] = index;
+    for (int row = 1; row <= static_cast<int>(left.size()); ++row) {
+        if (cancel && (row & 63) == 0 && cancel->load()) return 0.0;
         current[0] = row;
-        for (int column = 1; column <= static_cast<int>(b.size()); ++column) {
+        for (int column = 1; column <= static_cast<int>(right.size()); ++column) {
             current[column] = std::min({previous[column] + 1, current[column - 1] + 1,
-                previous[column - 1] + (a.at(row - 1) == b.at(column - 1) ? 0 : 1)});
+                previous[column - 1] + (left.at(row - 1) == right.at(column - 1) ? 0 : 1)});
         }
         previous.swap(current);
     }
-    return 100.0 * (1.0 - previous.constLast() / double(std::max(a.size(), b.size())));
+    return 100.0 * (1.0 - previous.constLast() / double(std::max(left.size(), right.size())));
 }
 
-double continuousCoverage(const QString &recognized, const QString &script)
-{
-    const std::u32string a = Normalizer::normalizeCodepoints(recognized);
-    const std::u32string b = Normalizer::normalizeCodepoints(script);
-    if (a.empty() || b.empty()) return 0.0;
-    QVector<int> previous(static_cast<qsizetype>(b.size()) + 1);
-    QVector<int> current(static_cast<qsizetype>(b.size()) + 1);
-    int longest = 0;
-    for (int row = 1; row <= static_cast<int>(a.size()); ++row) {
-        for (int column = 1; column <= static_cast<int>(b.size()); ++column) {
-            current[column] = a.at(row - 1) == b.at(column - 1)
-                ? previous.at(column - 1) + 1 : 0;
-            longest = std::max(longest, current.at(column));
+struct ScriptIndex final {
+    std::u32string text;
+    QVector<int> starts;
+    QVector<int> ends;
+
+    int lineAt(int token) const
+    {
+        for (int index = 0; index < ends.size(); ++index) {
+            if (token < ends.at(index)) return index;
         }
-        previous.swap(current);
-        current.fill(0);
+        return ends.isEmpty() ? -1 : ends.size() - 1;
     }
-    return 100.0 * longest / b.size();
-}
-
-struct MatchScore final {
-    double combined = 0.0;
-    double edit = 0.0;
-    double coverage = 0.0;
 };
 
-MatchScore score(const QString &recognized, const QString &script)
+ScriptIndex indexScript(const ScriptDocument &script)
 {
-    MatchScore result;
-    const double fuzz = similarity(recognized, script);
-    result.edit = editSimilarity(recognized, script);
-    result.coverage = continuousCoverage(recognized, script);
-    result.combined = fuzz * 0.45 + result.edit * 0.35 + result.coverage * 0.20;
+    ScriptIndex index;
+    for (const ScriptLine &line : script.lines) {
+        index.starts.append(static_cast<int>(index.text.size()));
+        index.text += Normalizer::normalizeCodepoints(line.text);
+        index.ends.append(static_cast<int>(index.text.size()));
+    }
+    return index;
+}
+
+struct Candidate final {
+    ScriptMatch match;
+    double score = 0.0;
+};
+
+QVector<Candidate> candidates(const ScriptIndex &script, const QString &text, int recordingIndex,
+    const std::atomic<bool> *cancel)
+{
+    QVector<Candidate> result;
+    if (cancel && cancel->load()) return result;
+    const std::u32string spoken = Normalizer::normalizeCodepoints(text);
+    if (spoken.empty() || script.text.empty()) return result;
+    QVector<int> starts;
+    starts.reserve(script.starts.size() + 64);
+    for (int position : script.starts) {
+        if (position < static_cast<int>(script.text.size())) starts.append(position);
+    }
+    for (int position = 0; position < static_cast<int>(script.text.size()); ++position) {
+        if (script.text.at(position) == spoken.front()
+            && (spoken.size() < 2 || position + 1 >= static_cast<int>(script.text.size())
+                || script.text.at(position + 1) == spoken.at(1)))
+            starts.append(position);
+    }
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    for (int start : starts) {
+        QVector<int> ends;
+        const int length = static_cast<int>(spoken.size());
+        for (int delta : {0, -2, 2, -length / 4, length / 4}) {
+            ends.append(std::clamp(start + length + delta, start + 1,
+                static_cast<int>(script.text.size())));
+        }
+        const int firstLine = script.lineAt(start);
+        for (int line = firstLine; line < std::min(firstLine + 4, static_cast<int>(script.ends.size())); ++line) {
+            if (script.ends.at(line) > start) ends.append(script.ends.at(line));
+        }
+        std::sort(ends.begin(), ends.end());
+        ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+        for (int end : ends) {
+            const std::u32string target = script.text.substr(start, end - start);
+            const double fuzz = FuzzRatio::ratio(spoken, target);
+            if (fuzz < 45.0) continue;
+            const double edit = editSimilarity(spoken, target, cancel);
+            if (cancel && cancel->load()) return result;
+            const int lastLine = script.lineAt(end - 1);
+            const int lineLength = std::max(1, script.ends.at(lastLine) - script.starts.at(firstLine));
+            const double coverage = std::min(100.0, 100.0 * (end - start) / lineLength);
+            const double combined = fuzz * 0.55 + edit * 0.45;
+            if (combined < 52.0) continue;
+            result.append({{recordingIndex, firstLine, ScriptMatchStatus::Modified,
+                combined, edit, coverage, lastLine, start, end}, combined});
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const Candidate &left, const Candidate &right) {
+        return left.score > right.score;
+    });
+    if (result.size() > 32) result.resize(32);
     return result;
 }
+
+struct Beam final {
+    int cursor = 0;
+    double score = 0.0;
+    QVector<ScriptMatch> path;
+};
 
 } // namespace
 
 QVector<ScriptMatch> ScriptMatcher::match(
-    const ScriptDocument &script,
-    const QVector<RecognizedPassage> &recording)
+    const ScriptDocument &script, const QVector<RecognizedPassage> &recording,
+    const std::atomic<bool> *cancel, bool *cancelled)
 {
-    QVector<ScriptMatch> matches;
-    QVector<int> matchedRecording(script.lines.size(), -1);
-    int cursor = 0;
+    if (cancelled) *cancelled = false;
+    auto markCancelled = [cancelled] {
+        if (cancelled) *cancelled = true;
+        return QVector<ScriptMatch>{};
+    };
+    const ScriptIndex indexed = indexScript(script);
+    QVector<Beam> beams{{}};
     for (int recordingIndex = 0; recordingIndex < recording.size(); ++recordingIndex) {
-        int bestLine = -1;
-        MatchScore bestScore;
-        const int upper = std::min(cursor + 4, static_cast<int>(script.lines.size()));
-        for (int line = cursor; line < upper; ++line) {
-            if (script.lines.at(line).text.trimmed().isEmpty()) continue;
-            const MatchScore candidate = score(recording.at(recordingIndex).text, script.lines.at(line).text);
-            if (candidate.combined > bestScore.combined) {
-                bestScore = candidate;
-                bestLine = line;
+        if (cancel && cancel->load()) return markCancelled();
+        const QVector<Candidate> options = candidates(indexed,
+            recording.at(recordingIndex).text, recordingIndex, cancel);
+        if (cancel && cancel->load()) return markCancelled();
+        QVector<Beam> expanded;
+        for (const Beam &beam : beams) {
+            Beam added = beam;
+            added.score -= 5.0;
+            added.path.append({recordingIndex, -1, ScriptMatchStatus::Added});
+            expanded.append(std::move(added));
+            for (const Candidate &option : options) {
+                const int start = option.match.scriptTokenStart;
+                if (start + 240 < beam.cursor) continue;
+                Beam next = beam;
+                next.score += (option.score - 58.0) / 2.0;
+                if (start < beam.cursor) next.score -= 3.0 + (beam.cursor - start) * 0.04;
+                else next.score -= std::min(24.0, (start - beam.cursor) * 0.06);
+                next.cursor = std::max(beam.cursor, option.match.scriptTokenEnd);
+                ScriptMatch match = option.match;
+                match.status = start < beam.cursor ? ScriptMatchStatus::Retake
+                    : option.score >= 86.0 ? ScriptMatchStatus::Match
+                    : ScriptMatchStatus::Modified;
+                next.path.append(match);
+                expanded.append(std::move(next));
             }
         }
-
-        int retakeLine = -1;
-        MatchScore retakeScore;
-        for (int line = 0; line < cursor; ++line) {
-            if (matchedRecording.at(line) < 0) continue;
-            const MatchScore candidate = score(recording.at(recordingIndex).text, script.lines.at(line).text);
-            if (candidate.combined > retakeScore.combined) {
-                retakeScore = candidate;
-                retakeLine = line;
-            }
+        std::sort(expanded.begin(), expanded.end(), [](const Beam &left, const Beam &right) {
+            return left.score > right.score;
+        });
+        QHash<int, bool> seen;
+        beams.clear();
+        for (Beam &beam : expanded) {
+            if (seen.contains(beam.cursor)) continue;
+            seen.insert(beam.cursor, true);
+            beams.append(std::move(beam));
+            if (beams.size() >= 24) break;
         }
-        if (retakeScore.combined >= 65.0 && retakeScore.combined > bestScore.combined) {
-            matches.append({recordingIndex, retakeLine, ScriptMatchStatus::Retake,
-                retakeScore.combined, retakeScore.edit, retakeScore.coverage});
-            continue;
-        }
-        if (bestLine < 0 || bestScore.combined < 55.0) {
-            matches.append({recordingIndex, -1, ScriptMatchStatus::Added,
-                bestScore.combined, bestScore.edit, bestScore.coverage});
-            continue;
-        }
-        while (cursor < bestLine) {
-            if (!script.lines.at(cursor).text.trimmed().isEmpty()) {
-                matches.append({-1, cursor, ScriptMatchStatus::Skipped, 0.0});
-            }
-            ++cursor;
-        }
-        matches.append({recordingIndex, bestLine,
-            bestScore.combined >= 88.0 ? ScriptMatchStatus::Match : ScriptMatchStatus::Modified,
-            bestScore.combined, bestScore.edit, bestScore.coverage});
-        matchedRecording[bestLine] = recordingIndex;
-        cursor = bestLine + 1;
     }
-    while (cursor < script.lines.size()) {
-        if (!script.lines.at(cursor).text.trimmed().isEmpty()) {
-            matches.append({-1, cursor, ScriptMatchStatus::Skipped, 0.0});
+    QVector<ScriptMatch> result;
+    if (beams.isEmpty()) return result;
+    QVector<ScriptMatch> path = beams.constFirst().path;
+    for (int index = 0; index + 1 < path.size(); ++index) {
+        ScriptMatch &failed = path[index];
+        ScriptMatch &next = path[index + 1];
+        if (failed.scriptTokenStart >= 0 && next.scriptTokenStart == failed.scriptTokenStart
+            && next.scriptTokenEnd >= failed.scriptTokenEnd
+            && next.similarity >= 85.0 && next.similarity > failed.similarity + 5.0) {
+            failed.status = ScriptMatchStatus::Retake;
+            next.status = ScriptMatchStatus::Match;
         }
+        if (failed.status != ScriptMatchStatus::Added || next.scriptTokenStart < 0
+            || next.similarity < 75.0) continue;
+        const std::u32string spoken = Normalizer::normalizeCodepoints(recording.at(index).text);
+        const std::u32string replacement = Normalizer::normalizeCodepoints(recording.at(index + 1).text);
+        int prefix = 0;
+        while (prefix < static_cast<int>(std::min(spoken.size(), replacement.size()))
+            && spoken.at(prefix) == replacement.at(prefix)) ++prefix;
+        if (prefix < 3 || next.scriptTokenStart + prefix > static_cast<int>(indexed.text.size())
+            || indexed.text.compare(next.scriptTokenStart, prefix, spoken, 0, prefix) != 0) continue;
+        failed.scriptLineIndex = next.scriptLineIndex;
+        failed.scriptLineEndIndex = next.scriptLineIndex;
+        failed.scriptTokenStart = next.scriptTokenStart;
+        failed.scriptTokenEnd = next.scriptTokenStart + prefix;
+        failed.status = ScriptMatchStatus::Retake;
+        failed.similarity = 55.0;
+        failed.editSimilarity = 55.0;
+        failed.continuousCoverage = std::min(100.0, 100.0 * prefix
+            / std::max(1, indexed.ends.at(next.scriptLineIndex)
+                - indexed.starts.at(next.scriptLineIndex)));
+    }
+    int cursor = 0;
+    for (const ScriptMatch &match : path) {
+        if (match.scriptLineIndex >= 0 && match.status != ScriptMatchStatus::Retake) {
+            while (cursor < match.scriptLineIndex) {
+                if (indexed.ends.at(cursor) > indexed.starts.at(cursor))
+                    result.append({-1, cursor, ScriptMatchStatus::Skipped});
+                ++cursor;
+            }
+            cursor = std::max(cursor, match.scriptLineEndIndex + 1);
+        }
+        result.append(match);
+    }
+    while (cursor < indexed.starts.size()) {
+        if (indexed.ends.at(cursor) > indexed.starts.at(cursor))
+            result.append({-1, cursor, ScriptMatchStatus::Skipped});
         ++cursor;
     }
-    return matches;
+    return result;
 }
 
 } // namespace subcue
