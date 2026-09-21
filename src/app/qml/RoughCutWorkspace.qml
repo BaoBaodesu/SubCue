@@ -7,7 +7,6 @@ import SubCue
 Item {
     id: window
     objectName: "roughCutWorkspace"
-    property string filter: "ALL"
     property bool textEditing: roughScriptEditor.activeFocus || roughAssetSearch.activeFocus
                                || scriptDialog.visible || mediaDialog.visible
                                || (settingsWindow && settingsWindow.visible)
@@ -43,6 +42,19 @@ Item {
             win.requestDestructiveAction(action)
         else
             action()
+    }
+    function goToReview(delta) {
+        const current = resultList.currentItem && resultList.currentItem.recordingIndex !== undefined
+            ? resultList.currentItem.recordingIndex : -1
+        const next = delta > 0 ? roughCut.nextReviewRow(current) : roughCut.previousReviewRow(current)
+        if (next < 0) return
+        roughCut.statusFilter = "REVIEW"
+        const filterRow = roughCut.filterRowForSource(next)
+        if (filterRow < 0) return
+        resultList.currentIndex = filterRow
+        resultList.positionViewAtIndex(filterRow, ListView.Contain)
+        window.activateMonitor(1)
+        roughCut.locateResult(next)
     }
     FileDialog { id: openProjectDialog; title: qsTr("打开粗剪工程"); nameFilters: [qsTr("SubCue 粗剪工程 (*.subcue-roughcut)")]; parentWindow: window.Window.window; onAccepted: window.requestLeave(function() { roughCut.openProject(selectedFile) }) }
     FileDialog { id: saveProjectDialog; title: qsTr("保存粗剪工程"); fileMode: FileDialog.SaveFile; defaultSuffix: "subcue-roughcut"; nameFilters: [qsTr("SubCue 粗剪工程 (*.subcue-roughcut)")]; parentWindow: window.Window.window; onAccepted: roughCut.saveProject(selectedFile) }
@@ -115,9 +127,9 @@ Item {
                 onClicked: roughCut.startAiReview()
             }
             MenuButton { text: qsTr("辅助识别"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: roughCut.startAuxiliaryRecognition() }
-            MenuButton { text: qsTr("取消"); enabled: roughCut.busy; onClicked: roughCut.cancelAnalysis() }
-            MenuButton { text: qsTr("导出 WAV"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: exportWavDialog.open() }
-            PrimaryButton { text: qsTr("导出 XML"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: exportDialog.open() }
+            MenuButton { text: qsTr("取消"); enabled: roughCut.busy && !roughCut.cancelling; onClicked: roughCut.cancelAnalysis() }
+            MenuButton { text: qsTr("导出 WAV"); enabled: roughCut.canExport; onClicked: exportWavDialog.open() }
+            PrimaryButton { text: qsTr("导出 XML"); enabled: roughCut.canExport; onClicked: exportDialog.open() }
         }
     }
 
@@ -362,14 +374,39 @@ Item {
                     RowLayout {
                         Layout.fillWidth: true; Layout.margins: 8; spacing: 4
                         Repeater {
-                            model: [{key:"ALL", label:qsTr("全部")}, {key:"KEEP", label:qsTr("保留")}, {key:"REVIEW", label:qsTr("复核")}, {key:"CUT", label:qsTr("剪除")}]
-                            SubButton { required property var modelData; text: modelData.label; checkable: true; checked: window.filter === modelData.key; Layout.fillWidth: true; onClicked: window.filter = modelData.key }
+                            model: [
+                                {key:"ALL", label:qsTr("全部"), count: roughCut.resultCount},
+                                {key:"KEEP", label:qsTr("保留"), count: roughCut.resultModel.keepCount},
+                                {key:"REVIEW", label:qsTr("复核"), count: roughCut.resultModel.reviewCount},
+                                {key:"CUT", label:qsTr("剪除"), count: roughCut.resultModel.cutCount}
+                            ]
+                            SubButton {
+                                required property var modelData
+                                text: modelData.label + " " + modelData.count
+                                checkable: true
+                                checked: roughCut.statusFilter === modelData.key
+                                Layout.fillWidth: true
+                                onClicked: roughCut.statusFilter = modelData.key
+                            }
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.bottomMargin: 4; spacing: 4
+                        SubButton {
+                            text: qsTr("上一条待复核")
+                            enabled: !roughCut.busy && roughCut.resultModel.reviewCount > 0
+                            onClicked: window.goToReview(-1)
+                        }
+                        SubButton {
+                            text: qsTr("下一条待复核")
+                            enabled: !roughCut.busy && roughCut.resultModel.reviewCount > 0
+                            onClicked: window.goToReview(1)
                         }
                     }
                     ListView {
                         id: resultList; objectName: "roughCutResultList"
                         Layout.fillWidth: true; Layout.fillHeight: true; clip: true
-                        model: roughCut.resultModel; ScrollBar.vertical: SubScrollBar { }
+                        model: roughCut.resultFilterModel; ScrollBar.vertical: SubScrollBar { }
                         delegate: Rectangle {
                             id: resultRow
                             required property string status; required property string text; required property string reason
@@ -378,49 +415,83 @@ Item {
                             required property string failureType; required property real modelProbability
                             required property string scriptRange; required property string replacement
                             required property string decisionSource
-                            width: resultList.width; height: visible ? 132 : 0
-                            visible: window.filter === "ALL" || window.filter === status
+                            required property int recordingIndex
+                            required property string statusLabel
+                            required property string shortReason
+                            required property string failureLabel
+                            required property string evidenceText
+                            required property string technicalDetails
+                            property bool expanded: false
+                            width: resultList.width
+                            height: resultColumn.implicitHeight + 16
                             color: ListView.isCurrentItem ? Theme.selection : status === "CUT" ? "#332126" : status === "KEEP" ? "#1D3028" : "#352F22"
                             border.color: ListView.isCurrentItem ? Theme.accent : Theme.divider
                             border.width: ListView.isCurrentItem ? 2 : 1
                             ColumnLayout {
-                                anchors.fill: parent; anchors.margins: 8; spacing: 4
-                                Label { text: (resultRow.status === "KEEP" ? qsTr("保留") : resultRow.status === "CUT" ? qsTr("剪除") : qsTr("复核"))
-                                              + (resultRow.takeGroup >= 0 ? "  TakeGroup " + (resultRow.takeGroup + 1) : "")
-                                              + (resultRow.bestTake ? qsTr("  最佳 Take") : "") + "  " + resultRow.text; color: Theme.text; elide: Text.ElideRight; Layout.fillWidth: true }
+                                id: resultColumn
+                                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                                anchors.margins: 8
+                                spacing: 4
                                 Label {
-                                    text: (resultRow.failureType !== "NONE" ? "[" + resultRow.failureType + "] " : "")
-                                          + resultRow.reason
-                                          + " · " + resultRow.scriptRange
-                                          + (resultRow.replacement !== "" ? " · " + resultRow.replacement : "")
-                                          + (resultRow.modelProbability >= 0 ? qsTr(" · 置信度 ")
-                                             + (resultRow.modelProbability * 100).toFixed(0) + "%" : "")
-                                          + (resultRow.decisionSource ? " · " + resultRow.decisionSource : "")
-                                    color: Theme.secondaryText
-                                    elide: Text.ElideRight
+                                    text: resultRow.statusLabel
+                                          + (resultRow.takeGroup >= 0 ? qsTr("  第 %1 组").arg(resultRow.takeGroup + 1) : "")
+                                          + (resultRow.bestTake ? qsTr("  最佳 Take") : "")
+                                    color: Theme.text
+                                    font.bold: true
                                     Layout.fillWidth: true
                                 }
-                                Label { text: resultRow.evidence && resultRow.evidence.length ? qsTr("证据：") + resultRow.evidence.join("；") : qsTr("证据：无"); color: Theme.muted; elide: Text.ElideRight; Layout.fillWidth: true }
+                                Label {
+                                    text: resultRow.expanded ? resultRow.text : resultRow.text
+                                    color: Theme.text
+                                    wrapMode: resultRow.expanded ? Text.Wrap : Text.NoWrap
+                                    elide: resultRow.expanded ? Text.ElideNone : Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Label {
+                                    text: (resultRow.failureLabel !== "" ? resultRow.failureLabel + " · " : "")
+                                          + (resultRow.expanded ? resultRow.reason : resultRow.shortReason)
+                                          + " · " + resultRow.scriptRange
+                                          + (resultRow.replacement !== "" ? " · " + resultRow.replacement : "")
+                                    color: Theme.secondaryText
+                                    wrapMode: resultRow.expanded ? Text.Wrap : Text.NoWrap
+                                    elide: resultRow.expanded ? Text.ElideNone : Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Label {
+                                    visible: resultRow.expanded
+                                    text: qsTr("证据：") + resultRow.evidenceText
+                                    color: Theme.muted
+                                    wrapMode: Text.Wrap
+                                    Layout.fillWidth: true
+                                }
+                                Label {
+                                    visible: resultRow.expanded && resultRow.technicalDetails !== ""
+                                    text: resultRow.technicalDetails
+                                    color: Theme.muted
+                                    wrapMode: Text.Wrap
+                                    Layout.fillWidth: true
+                                }
                                 RowLayout {
                                     Layout.fillWidth: true; spacing: 4
-                                    SubButton { text: qsTr("试听"); enabled: !roughCut.busy; onClicked: roughCut.audition(resultRow.index) }
+                                    SubButton { text: qsTr("试听"); enabled: !roughCut.busy; onClicked: roughCut.audition(resultRow.recordingIndex) }
+                                    SubButton { text: resultRow.expanded ? qsTr("收起") : qsTr("详情"); onClicked: resultRow.expanded = !resultRow.expanded }
                                     Item { Layout.fillWidth: true }
-                                    SubButton { text: qsTr("保留"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.index, "KEEP") }
-                                    SubButton { text: qsTr("复核"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.index, "REVIEW") }
-                                    SubButton { text: qsTr("剪除"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.index, "CUT") }
-                                    SubToolButton { visible: resultRow.userOverride; enabled: !roughCut.busy; text: qsTr("恢复自动判断"); icon.source: "icons/step-back.svg"; onClicked: roughCut.restoreAutoDecision(resultRow.index) }
+                                    SubButton { text: qsTr("保留"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.recordingIndex, "KEEP") }
+                                    SubButton { text: qsTr("复核"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.recordingIndex, "REVIEW") }
+                                    SubButton { text: qsTr("剪除"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.recordingIndex, "CUT") }
+                                    SubToolButton { visible: resultRow.userOverride; enabled: !roughCut.busy; text: qsTr("恢复自动判断"); icon.source: "icons/step-back.svg"; onClicked: roughCut.restoreAutoDecision(resultRow.recordingIndex) }
                                 }
                             }
                             TapHandler {
                                 onTapped: {
                                     resultList.currentIndex = resultRow.index
                                     window.activateMonitor(1)
-                                    roughCut.locateResult(resultRow.index)
+                                    roughCut.locateResult(resultRow.recordingIndex)
                                 }
-                                onDoubleTapped: roughCut.audition(resultRow.index)
+                                onDoubleTapped: roughCut.audition(resultRow.recordingIndex)
                             }
                         }
-                        Label { anchors.centerIn: parent; visible: roughCut.resultCount === 0; text: qsTr("分析后在此复核结果"); color: Theme.secondaryText }
+                        Label { anchors.centerIn: parent; visible: resultList.count === 0; text: qsTr("分析后在此复核结果"); color: Theme.secondaryText }
                     }
                 }
             }
@@ -445,7 +516,7 @@ Item {
                             id: sequencePlay
                             text: roughCut.timelineActive && !roughCut.timelinePaused ? qsTr("暂停") : qsTr("播放")
                             icon.source: roughCut.timelineActive && !roughCut.timelinePaused ? "icons/pause.svg" : "icons/play.svg"
-                            enabled: roughCut.resultCount > 0; implicitHeight: 30
+                            enabled: roughCut.canExport; implicitHeight: 30
                             onClicked: { window.activateMonitor(1); roughCut.toggleTimelinePlay() }
                             contentItem: RowLayout {
                                 spacing: 5
@@ -484,9 +555,9 @@ Item {
                     onSelectedCueIdChanged: {
                         const row = Number(selectedCueId)
                         if (selectedCueId === "" || !Number.isInteger(row) || row < 0) return
-                        window.filter = "ALL"
-                        resultList.currentIndex = row
-                        resultList.positionViewAtIndex(row, ListView.Contain)
+                        roughCut.statusFilter = "ALL"
+                        resultList.currentIndex = roughCut.filterRowForSource(row)
+                        resultList.positionViewAtIndex(resultList.currentIndex, ListView.Contain)
                     }
                 }
                 TimelineZoomBar { id: roughZoomBar; objectName: "roughCutTimelineZoomBar"; Layout.fillWidth: true; timeline: roughTimeline; onInteractingChanged: if (interacting) window.activateMonitor(1) }
@@ -517,7 +588,7 @@ Item {
             anchors.fill: parent
             anchors.margins: 10
             spacing: 16
-            Label { text: qsTr("正在自动粗剪") + " · " + parent.parent.elapsedSeconds + "s"; color: Theme.text }
+            Label { text: (roughCut.busyTaskTitle || qsTr("正在处理")) + " · " + parent.parent.elapsedSeconds + "s"; color: Theme.text }
             ColumnLayout {
                 Layout.fillWidth: true
                 Label { text: roughCut.statusText; color: Theme.secondaryText }
@@ -528,6 +599,7 @@ Item {
                     Layout.preferredHeight: 16
                     from: 0
                     to: 100
+                    indeterminate: roughCut.progressIndeterminate
                     value: roughCut.progressPercent
                     background: Rectangle {
                         color: Theme.scrollTrack
@@ -537,15 +609,37 @@ Item {
                         clip: true
                         Rectangle {
                             objectName: "roughCutAnalysisProgressFill"
+                            visible: !roughCutAnalysisProgress.indeterminate
                             width: roughCutAnalysisProgress.visualPosition * parent.width
                             height: parent.height
                             color: Theme.accent
                         }
+                        Rectangle {
+                            id: roughCutProgressIndeterminate
+                            width: Math.max(28, parent.width * 0.24)
+                            height: parent.height
+                            visible: roughCutAnalysisProgress.indeterminate
+                            color: Theme.accent
+                            SequentialAnimation on x {
+                                running: roughCutAnalysisProgress.indeterminate && analysisProgressDialog.visible
+                                loops: Animation.Infinite
+                                NumberAnimation {
+                                    from: -roughCutProgressIndeterminate.width
+                                    to: roughCutProgressIndeterminate.parent.width
+                                    duration: 900
+                                    easing.type: Easing.InOutQuad
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Label { text: roughCut.progressPercent + "%"; color: Theme.text }
-            SubButton { text: qsTr("取消"); onClicked: roughCut.cancelAnalysis() }
+            Label { text: roughCut.progressIndeterminate ? qsTr("处理中…") : (roughCut.progressPercent + "%"); color: Theme.text }
+            SubButton {
+                text: roughCut.cancelling ? qsTr("取消中…") : qsTr("取消")
+                enabled: !roughCut.cancelling
+                onClicked: roughCut.cancelAnalysis()
+            }
         }
     }
 

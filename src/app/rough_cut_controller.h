@@ -25,6 +25,7 @@ class TimelineSceneItem;
 class RoughCutController final : public QObject {
     Q_OBJECT
     Q_PROPERTY(QObject *resultModel READ resultModel CONSTANT)
+    Q_PROPERTY(QObject *resultFilterModel READ resultFilterModel CONSTANT)
     Q_PROPERTY(QString mediaPath READ mediaPath NOTIFY mediaChanged)
     Q_PROPERTY(QString scriptPath READ scriptPath NOTIFY scriptChanged)
     Q_PROPERTY(QString scriptText READ scriptText WRITE setScriptText NOTIFY scriptChanged)
@@ -32,6 +33,9 @@ class RoughCutController final : public QObject {
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(int progressPercent READ progressPercent NOTIFY progressChanged)
+    Q_PROPERTY(QString busyTaskTitle READ busyTaskTitle NOTIFY progressChanged)
+    Q_PROPERTY(bool progressIndeterminate READ progressIndeterminate NOTIFY progressChanged)
+    Q_PROPERTY(bool cancelling READ cancelling NOTIFY busyChanged)
     Q_PROPERTY(bool playing READ playing NOTIFY playbackChanged)
     Q_PROPERTY(bool timelineActive READ timelineActive NOTIFY playbackChanged)
     Q_PROPERTY(bool timelinePaused READ timelinePaused NOTIFY playbackChanged)
@@ -43,6 +47,8 @@ class RoughCutController final : public QObject {
     Q_PROPERTY(qint64 durationMs READ durationMs NOTIFY mediaChanged)
     Q_PROPERTY(int resultCount READ resultCount NOTIFY resultsChanged)
     Q_PROPERTY(bool canAiReview READ canAiReview NOTIFY canAiReviewChanged)
+    Q_PROPERTY(bool canExport READ canExport NOTIFY canExportChanged)
+    Q_PROPERTY(QString statusFilter READ statusFilter WRITE setStatusFilter NOTIFY statusFilterChanged)
     Q_PROPERTY(bool modified READ modified NOTIFY modifiedChanged)
     Q_PROPERTY(bool canSave READ canSave NOTIFY canSaveChanged)
 
@@ -51,6 +57,7 @@ public:
     ~RoughCutController() override;
 
     [[nodiscard]] QObject *resultModel() noexcept { return &model_; }
+    [[nodiscard]] QObject *resultFilterModel() noexcept { return &filterModel_; }
     [[nodiscard]] QString mediaPath() const { return mediaPath_; }
     [[nodiscard]] QString scriptPath() const { return scriptPath_; }
     [[nodiscard]] QString scriptText() const { return scriptText_; }
@@ -58,6 +65,9 @@ public:
     [[nodiscard]] QString statusText() const { return statusText_; }
     [[nodiscard]] bool busy() const noexcept { return busy_; }
     [[nodiscard]] int progressPercent() const noexcept { return progressPercent_; }
+    [[nodiscard]] QString busyTaskTitle() const { return busyTaskTitle_; }
+    [[nodiscard]] bool progressIndeterminate() const noexcept { return progressIndeterminate_; }
+    [[nodiscard]] bool cancelling() const noexcept { return cancelling_; }
     [[nodiscard]] bool playing() const noexcept { return !playback_.isPaused(); }
     [[nodiscard]] bool timelineActive() const noexcept { return timelinePlaybackIndex_ >= 0; }
     [[nodiscard]] bool timelinePaused() const noexcept { return timelinePaused_; }
@@ -69,6 +79,9 @@ public:
     [[nodiscard]] qint64 durationMs() const;
     [[nodiscard]] int resultCount() const { return model_.rowCount(); }
     [[nodiscard]] bool canAiReview() const { return model_.rowCount() > 0 && !busy_; }
+    [[nodiscard]] bool canExport() const noexcept { return !timeline_.isEmpty() && !busy_; }
+    [[nodiscard]] QString statusFilter() const { return filterModel_.statusFilter(); }
+    void setStatusFilter(const QString &value) { filterModel_.setStatusFilter(value); }
     [[nodiscard]] bool modified() const noexcept { return modified_; }
     [[nodiscard]] bool canSave() const noexcept { return !mediaPath_.isEmpty() && !busy_; }
     [[nodiscard]] int sampleRate() const noexcept { return sampleRate_; }
@@ -96,6 +109,10 @@ public:
     Q_INVOKABLE void seek(qint64 positionMs);
     Q_INVOKABLE void seekTimeline(qint64 positionMs);
     Q_INVOKABLE void locateResult(int row);
+    Q_INVOKABLE int sourceResultRow(int filterRow) const;
+    Q_INVOKABLE int filterRowForSource(int sourceRow) const;
+    Q_INVOKABLE int nextReviewRow(int sourceRow) const { return model_.nextReviewRow(sourceRow); }
+    Q_INVOKABLE int previousReviewRow(int sourceRow) const { return model_.previousReviewRow(sourceRow); }
     Q_INVOKABLE void audition(int row);
     Q_INVOKABLE void playTimeline();
     Q_INVOKABLE void toggleTimelinePlay();
@@ -120,6 +137,8 @@ signals:
     void positionChanged();
     void resultsChanged();
     void canAiReviewChanged();
+    void canExportChanged();
+    void statusFilterChanged();
     void modifiedChanged();
     void canSaveChanged();
 
@@ -141,6 +160,7 @@ private:
     void startTimelineClip(int index);
     void setStatus(QString value);
     void setBusy(bool value);
+    void beginTask(const QString &title, bool indeterminate);
     void bindSharedAudioDevice();
     void refreshModified();
     void markSaved();
@@ -149,6 +169,7 @@ private:
 
     ApplicationContext *context_ = nullptr;
     RoughCutResultModel model_;
+    RoughCutResultFilterModel filterModel_;
     PlaybackEngine playback_;
     QTimer playbackTimer_;
     QString mediaPath_;
@@ -172,7 +193,10 @@ private:
     QVector<TranscriptWord> analysisWords_;
     QVector<RoughCutAuxiliaryResult> auxiliaryResults_;
     bool busy_ = false;
+    bool cancelling_ = false;
+    bool progressIndeterminate_ = false;
     int progressPercent_ = 0;
+    QString busyTaskTitle_;
     double playbackRate_ = 1.0;
     std::atomic<bool> cancel_{false};
     std::atomic<quint64> workerGeneration_{0};

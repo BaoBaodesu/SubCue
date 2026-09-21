@@ -14,6 +14,7 @@ private slots:
     void replaceBaseDecisionsPreservesUserOverride();
     void manualCutOfReplacementSuspendsDependentAutoCut();
     void auxiliaryResultsApplyOnceThenProtect();
+    void filterMapsToSourceAndCountsReviews();
 };
 
 void RoughCutResultModelTests::exposesDecisionAndSourceTimes()
@@ -125,6 +126,48 @@ void RoughCutResultModelTests::auxiliaryResultsApplyOnceThenProtect()
         QStringLiteral("rule+review-asr"));
     QCOMPARE(model.data(model.index(1), RoughCutResultModel::StatusRole).toString(),
         QStringLiteral("KEEP"));
+}
+
+void RoughCutResultModelTests::filterMapsToSourceAndCountsReviews()
+{
+    RoughCutResultModel model;
+    RoughCutSegmentDecision cut{2, RoughCutDecision::Keep};
+    cut.userDecision = RoughCutDecision::Cut;
+    model.reset({
+        {QStringLiteral("1"), QStringLiteral("保留句"), 0, 100},
+        {QStringLiteral("2"), QStringLiteral("复核句"), 100, 200},
+        {QStringLiteral("3"), QStringLiteral("剪除句"), 200, 300}
+    }, {
+        {0, RoughCutDecision::Keep},
+        {1, RoughCutDecision::Review},
+        cut
+    }, 1'000);
+    QCOMPARE(model.keepCount(), 1);
+    QCOMPARE(model.reviewCount(), 1);
+    QCOMPARE(model.cutCount(), 1);
+    QCOMPARE(model.data(model.index(1), RoughCutResultModel::StatusLabelRole).toString(),
+        QStringLiteral("复核"));
+    QCOMPARE(model.data(model.index(2), RoughCutResultModel::StatusLabelRole).toString(),
+        QStringLiteral("剪除"));
+    QCOMPARE(model.data(model.index(1), RoughCutResultModel::RecordingIndexRole).toInt(), 1);
+    QCOMPARE(model.nextReviewRow(-1), 1);
+    QCOMPARE(model.nextReviewRow(1), 1);
+    QCOMPARE(model.previousReviewRow(1), 1);
+    QVERIFY(model.setUserDecision(0, RoughCutDecision::Review));
+    QCOMPARE(model.reviewCount(), 2);
+    QCOMPARE(model.nextReviewRow(1), 0);
+
+    RoughCutResultFilterModel filter;
+    filter.setSourceModel(&model);
+    QCOMPARE(filter.rowCount(), 3);
+    filter.setStatusFilter(QStringLiteral("REVIEW"));
+    QCOMPARE(filter.rowCount(), 2);
+    const int source = filter.mapToSource(filter.index(0, 0)).row();
+    QVERIFY(source == 0 || source == 1);
+    QCOMPARE(model.data(model.index(source), RoughCutResultModel::StatusRole).toString(),
+        QStringLiteral("REVIEW"));
+    QVERIFY(model.setUserDecision(source, RoughCutDecision::Keep));
+    QCOMPARE(filter.rowCount(), 1);
 }
 
 QTEST_MAIN(RoughCutResultModelTests)

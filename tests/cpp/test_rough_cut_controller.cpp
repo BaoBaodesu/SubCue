@@ -59,6 +59,7 @@ private slots:
     void unsavedStateTracksEditsSaveAndUndo();
     void saveFailsDoesNotClearModified();
     void workspaceSwitchTransfersPlaybackWithoutAutoPlay();
+    void reviewFilterAndExportGuards();
 
 private:
     [[nodiscard]] QString writeWav(const QString &path) const
@@ -269,6 +270,62 @@ void RoughCutControllerTests::workspaceSwitchTransfersPlaybackWithoutAutoPlay()
     QVERIFY(!editor.playing());
     QVERIFY(router.switchTo(QStringLiteral("roughcut")));
     QVERIFY(!roughCut.playing());
+}
+
+void RoughCutControllerTests::reviewFilterAndExportGuards()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
+    QVERIFY(!wav.isEmpty());
+    const QString projectPath = writeProject(dir, wav);
+    QVERIFY(!projectPath.isEmpty());
+
+    auto context = makeContext(dir);
+    RoughCutController controller(context.get());
+    controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY(controller.canExport());
+    QVERIFY(controller.canAiReview());
+    auto *model = qobject_cast<RoughCutResultModel *>(controller.resultModel());
+    QVERIFY(model);
+    QCOMPARE(model->keepCount(), 1);
+    QCOMPARE(controller.filterRowForSource(0), 0);
+    QCOMPARE(controller.sourceResultRow(0), 0);
+    controller.setStatusFilter(QStringLiteral("CUT"));
+    QCOMPARE(controller.filterRowForSource(0), -1);
+    controller.setStatusFilter(QStringLiteral("ALL"));
+
+    controller.setDecision(0, QStringLiteral("CUT"));
+    QVERIFY(!controller.canExport());
+    QCOMPARE(model->cutCount(), 1);
+    QCOMPARE(controller.nextReviewRow(-1), -1);
+
+    controller.undo();
+    QVERIFY(controller.canExport());
+    controller.setDecision(0, QStringLiteral("REVIEW"));
+    QVERIFY(controller.canExport());
+    QCOMPARE(controller.nextReviewRow(-1), 0);
+    QCOMPARE(controller.previousReviewRow(0), 0);
+
+    FakeAsrService asr;
+    asr.blockUntilCancel = true;
+    asr.transcript.words = {{1, QStringLiteral("第一句"), 0, 400}};
+    controller.setAnalysisOverrides(&asr);
+    controller.startAnalysis();
+    QTRY_VERIFY_WITH_TIMEOUT(controller.busy(), 2'000);
+    QCOMPARE(controller.busyTaskTitle(), QStringLiteral("正在分析"));
+    QVERIFY(!controller.canExport());
+    QVERIFY(!controller.canAiReview());
+    controller.cancelAnalysis();
+    QVERIFY(controller.cancelling());
+    QVERIFY(controller.progressIndeterminate());
+    controller.cancelAnalysis();
+    QVERIFY(controller.cancelling());
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY(!controller.cancelling());
+    QVERIFY(controller.busyTaskTitle().isEmpty());
+    QVERIFY(controller.canExport());
 }
 
 QTEST_MAIN(RoughCutControllerTests)

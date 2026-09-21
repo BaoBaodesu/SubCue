@@ -92,6 +92,9 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
     : QObject(parent), context_(context)
 {
     if (context_) context_->registerAudioClient(&playback_);
+    filterModel_.setSourceModel(&model_);
+    connect(&filterModel_, &RoughCutResultFilterModel::statusFilterChanged,
+        this, &RoughCutController::statusFilterChanged);
     markSaved();
     playbackTimer_.setInterval(30);
     connect(&playbackTimer_, &QTimer::timeout, this, [this] {
@@ -175,9 +178,7 @@ void RoughCutController::loadMedia(const QUrl &url)
     if (path.isEmpty()) return;
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0;
-    emit progressChanged();
+    beginTask(QStringLiteral("正在打开媒体"), true);
     setStatus(QStringLiteral("正在打开媒体…"));
     const quint64 generation = ++workerGeneration_;
     worker_ = std::thread([this, path, generation] {
@@ -259,9 +260,7 @@ bool RoughCutController::saveProject(const QUrl &url)
     }
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0;
-    emit progressChanged();
+    beginTask(QStringLiteral("正在保存工程"), false);
     setStatus(QStringLiteral("正在校验媒体并保存工程…"));
     RoughCutProject project;
     project.mediaPath = mediaPath_;
@@ -332,9 +331,7 @@ void RoughCutController::openProject(const QUrl &url)
     if (path.isEmpty()) return;
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0;
-    emit progressChanged();
+    beginTask(QStringLiteral("正在打开工程"), false);
     setStatus(QStringLiteral("正在校验工程与媒体…"));
     const quint64 generation = ++workerGeneration_;
     worker_ = std::thread([this, path, generation] {
@@ -494,8 +491,7 @@ void RoughCutController::startAnalysis()
     if (busy_ || shuttingDown_ || mediaPath_.isEmpty()) return;
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0; emit progressChanged();
+    beginTask(QStringLiteral("正在分析"), false);
     stopTimeline();
     setStatus(QStringLiteral("正在识别音频…"));
     const QString mediaPath = mediaPath_;
@@ -657,8 +653,12 @@ void RoughCutController::startAnalysis()
 
 void RoughCutController::cancelAnalysis()
 {
-    if (!busy_) return;
+    if (!busy_ || cancelling_) return;
+    cancelling_ = true;
     cancel_ = true;
+    progressIndeterminate_ = true;
+    emit busyChanged();
+    emit progressChanged();
     setStatus(QStringLiteral("正在取消…"));
 }
 
@@ -698,9 +698,7 @@ void RoughCutController::startAiReview()
     }
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0;
-    emit progressChanged();
+    beginTask(QStringLiteral("正在 AI 复核"), true);
     setStatus(QStringLiteral("正在进行 AI 复核…"));
     const QString mediaPath = mediaPath_;
     const int sampleRate = sampleRate_;
@@ -796,8 +794,7 @@ void RoughCutController::startAuxiliaryRecognition()
     if (ranges.isEmpty()) { setStatus(QStringLiteral("没有需要辅助识别的 REVIEW 片段。")); return; }
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0; emit progressChanged();
+    beginTask(QStringLiteral("正在辅助识别"), false);
     const QString mediaPath = mediaPath_;
     const int sampleRate = sampleRate_;
     QJsonObject settings = context_->settings;
@@ -1076,6 +1073,7 @@ void RoughCutController::redo()
 
 void RoughCutController::exportXml(const QUrl &url)
 {
+    if (timeline_.isEmpty()) return;
     RoughCutExportRequest request;
     request.mediaPath = mediaPath_;
     request.sampleRate = sampleRate_;
@@ -1098,9 +1096,7 @@ void RoughCutController::exportWav(const QUrl &url)
     if (busy_ || path.isEmpty() || mediaPath_.isEmpty() || timeline_.isEmpty()) return;
     stopWorker();
     cancel_ = false;
-    setBusy(true);
-    progressPercent_ = 0;
-    emit progressChanged();
+    beginTask(QStringLiteral("正在导出 WAV"), true);
     setStatus(QStringLiteral("正在导出精简 WAV…"));
     const QString sourcePath = mediaPath_;
     const QVector<RoughCutTimelineClip> clips = timeline_;
@@ -1192,6 +1188,7 @@ void RoughCutController::rebuildTimeline()
     timeline_ = SafeCutBoundary::buildTimeline(
         model_.recording(), model_.decisions(), sampleRate_, sourceSampleCount_, omniSettings);
     syncSceneItems();
+    emit canExportChanged();
 }
 
 void RoughCutController::applyEdit(const Edit &edit, bool forward)
@@ -1221,10 +1218,37 @@ void RoughCutController::setBusy(bool value)
 {
     if (busy_ == value) return;
     busy_ = value;
+    if (!value) {
+        cancelling_ = false;
+        progressIndeterminate_ = false;
+        busyTaskTitle_.clear();
+    }
     emit busyChanged();
     emit historyChanged();
     emit canAiReviewChanged();
     emit canSaveChanged();
+    emit canExportChanged();
+    emit progressChanged();
+}
+
+void RoughCutController::beginTask(const QString &title, bool indeterminate)
+{
+    cancelling_ = false;
+    busyTaskTitle_ = title;
+    progressIndeterminate_ = indeterminate;
+    progressPercent_ = 0;
+    setBusy(true);
+    emit progressChanged();
+}
+
+int RoughCutController::sourceResultRow(int filterRow) const
+{
+    return filterModel_.mapToSource(filterModel_.index(filterRow, 0)).row();
+}
+
+int RoughCutController::filterRowForSource(int sourceRow) const
+{
+    return filterModel_.mapFromSource(model_.index(sourceRow, 0)).row();
 }
 
 void RoughCutController::bindSharedAudioDevice()
