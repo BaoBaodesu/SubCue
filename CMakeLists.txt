@@ -14,8 +14,8 @@ option(SUBCUE_ENABLE_CUDA "Package CUDA runtime for local inference" OFF)
 if(SUBCUE_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
 endif()
-set(SUBCUE_PYTHON_ROOT "C:/Users/baobao/AppData/Roaming/uv/python/cpython-3.11.16-windows-x86_64-none"
-    CACHE PATH "Python 3.11 runtime used only by SubCueInference")
+set(SUBCUE_PYTHON_ROOT "C:/Users/baobao/AppData/Roaming/uv/python/cpython-3.12-windows-x86_64-none"
+    CACHE PATH "Python 3.12 runtime used only by SubCueInference")
 
 set(CMAKE_PREFIX_PATH "C:/Qt/6.10.3/msvc2022_64")
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Sql Test)
@@ -80,9 +80,20 @@ qt_add_library(SubCueCore STATIC
     src/core/ai/ai_provider.h
     src/core/ai/ai_provider_factory.cpp
     src/core/ai/ai_provider_factory.h
+    src/core/ai/ai_review_json.cpp
+    src/core/ai/ai_review_json.h
+    src/core/ai/ai_review_service.cpp
+    src/core/ai/ai_review_service.h
+    src/core/ai/ai_review_settings.cpp
+    src/core/ai/ai_review_settings.h
+    src/core/ai/ai_review_types.h
     src/core/ai/ai_types.h
     src/core/ai/openai_compatible_provider.cpp
     src/core/ai/openai_compatible_provider.h
+    src/core/ai/qwen_omni_provider.cpp
+    src/core/ai/qwen_omni_provider.h
+    src/core/ai/review_audio_encoder.cpp
+    src/core/ai/review_audio_encoder.h
     src/core/asr/asr_provider_factory.cpp
     src/core/asr/asr_provider_factory.h
     src/core/asr/asr_service.h
@@ -167,6 +178,8 @@ qt_add_library(SubCueCore STATIC
     src/core/roughcut/decision_engine.h
     src/core/roughcut/retake_detector.cpp
     src/core/roughcut/retake_detector.h
+    src/core/roughcut/safe_cut_boundary.cpp
+    src/core/roughcut/safe_cut_boundary.h
     src/core/roughcut/rough_cut_project.cpp
     src/core/roughcut/rough_cut_project.h
     src/core/roughcut/timeline_engine.cpp
@@ -236,7 +249,7 @@ add_library(SubCue::Core ALIAS SubCueCore)
 
 set(Python3_ROOT_DIR "${SUBCUE_PYTHON_ROOT}")
 set(Python3_FIND_STRATEGY LOCATION)
-find_package(Python3 3.11 EXACT COMPONENTS Development QUIET)
+find_package(Python3 3.12 EXACT COMPONENTS Development QUIET)
 if(Python3_Development_FOUND)
     add_executable(SubCueInference src/inference/main.cpp)
     target_link_libraries(SubCueInference PRIVATE Python3::Python)
@@ -249,8 +262,8 @@ if(Python3_Development_FOUND)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/inference")
     add_custom_command(TARGET SubCueInference POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SUBCUE_PYTHON_ROOT}/python311.dll"
-            "$<TARGET_FILE_DIR:SubCueInference>/python311.dll"
+            "${SUBCUE_PYTHON_ROOT}/python312.dll"
+            "$<TARGET_FILE_DIR:SubCueInference>/python312.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${SUBCUE_PYTHON_ROOT}/python3.dll"
             "$<TARGET_FILE_DIR:SubCueInference>/python3.dll")
@@ -360,8 +373,10 @@ if(SUBCUE_BUILD_APP)
                 -P "${CMAKE_SOURCE_DIR}/cmake/PackageWindows.cmake"
             DEPENDS
                 SubCue
+                SubCueInference
                 "${CMAKE_SOURCE_DIR}/cmake/PackageWindows.cmake"
                 "${CMAKE_SOURCE_DIR}/licenses/NOTICE.txt"
+                "${CMAKE_SOURCE_DIR}/tools/asr_python_worker.py"
                 "${CMAKE_SOURCE_DIR}/src/app/qml/Main.qml"
                 "${CMAKE_SOURCE_DIR}/src/app/qml/AboutWindow.qml"
             COMMENT "Assembling portable Windows package"

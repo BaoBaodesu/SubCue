@@ -22,7 +22,11 @@ bool WorkspaceRouter::switchTo(const QString &workspace)
     if (!canSwitch() || (workspace != QLatin1String("subtitle")
         && workspace != QLatin1String("roughcut"))) return false;
     if (workspace_ == workspace) return true;
+    if (workspace_ == QLatin1String("subtitle")) editor_->releasePlayback();
+    else roughCut_->releasePlayback();
     workspace_ = workspace;
+    if (workspace_ == QLatin1String("subtitle")) editor_->claimPlayback();
+    else roughCut_->claimPlayback();
     emit workspaceChanged();
     return true;
 }

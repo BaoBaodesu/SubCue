@@ -1,9 +1,17 @@
 #include "rough_cut_controller.h"
 
+#include "ai/ai_review_service.h"
+#include "ai/ai_review_settings.h"
+#include "ai/ai_types.h"
 #include "application_context.h"
 #include "asr/asr_provider_factory.h"
+#include "asr/asr_types.h"
+#include "asr/audio_chunk_extractor.h"
+#include "asr/http_client.h"
 #include "media/media_probe.h"
 #include "roughcut/retake_detector.h"
+#include "roughcut/alignment_evidence.h"
+#include "roughcut/safe_cut_boundary.h"
 #include "roughcut/rough_cut_project.h"
 #include "roughcut/script_document.h"
 #include "roughcut/speech_segment_analyzer.h"
@@ -13,9 +21,12 @@
 #include "waveform/waveform_generator.h"
 
 #include <QtCore/QDir>
+#include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QDataStream>
 #include <QtCore/QMetaObject>
 #include <QtCore/QPointer>
+#include <QtCore/QTemporaryDir>
 
 #include <algorithm>
 #include <variant>
@@ -75,27 +86,13 @@ std::optional<RoughCutDecision> parseDecision(const QString &value)
     return std::nullopt;
 }
 
-QVector<RecognizedPassage> attachTranscriptToSegments(
-    QVector<RecognizedPassage> segments, const Transcript &transcript, int sampleRate)
-{
-    for (RecognizedPassage &segment : segments) {
-        for (const TranscriptWord &word : transcript.words) {
-            if (word.text.trimmed().isEmpty() || word.endMs <= word.startMs) continue;
-            const qint64 midpoint = (word.startMs + word.endMs) * sampleRate / 2000;
-            if (midpoint >= segment.startSample && midpoint < segment.endSample)
-                segment.text += word.text;
-        }
-        segment.text = segment.text.trimmed();
-        if (segment.text.isEmpty()) segment.boundaryTrustworthy = false;
-    }
-    return segments;
-}
-
 } // namespace
 
 RoughCutController::RoughCutController(ApplicationContext *context, QObject *parent)
     : QObject(parent), context_(context)
 {
+    if (context_) context_->registerAudioClient(&playback_);
+    markSaved();
     playbackTimer_.setInterval(30);
     connect(&playbackTimer_, &QTimer::timeout, this, [this] {
         playback_.pump();
@@ -140,8 +137,18 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
 
 RoughCutController::~RoughCutController()
 {
+    shutdown();
+}
+
+void RoughCutController::shutdown()
+{
+    if (shuttingDown_) return;
+    shuttingDown_ = true;
+    cancel_ = true;
     stopWorker();
     stopWaveformWorker();
+    releasePlayback();
+    if (context_) context_->unregisterAudioClient(&playback_);
     playback_.close();
 }
 
@@ -153,6 +160,7 @@ qint64 RoughCutController::durationMs() const
 
 void RoughCutController::loadMedia(const QUrl &url)
 {
+    if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
     const ProbeResult probed = MediaProbe::probe(path);
     if (std::holds_alternative<AppError>(probed)) {
@@ -167,7 +175,7 @@ void RoughCutController::loadMedia(const QUrl &url)
     const MediaStreamInfo stream = info.streams.at(info.audioStreamIndex);
     AppError error(ErrorDomain::Media, 0, QString());
     stopWorker();
-    if (busy_) { busy_ = false; emit busyChanged(); }
+    if (busy_) { setBusy(false); }
     progressPercent_ = 0; emit progressChanged();
     stopWaveformWorker();
     if (sourceWaveformItem_) sourceWaveformItem_->setWaveform({});
@@ -176,16 +184,9 @@ void RoughCutController::loadMedia(const QUrl &url)
         setStatus(error.userMessage());
         return;
     }
-    if (context_->audioDevice) {
-        if (!context_->audioDevice->start(playback_.outputSampleRate(), playback_.outputChannels(), &error)) {
-            context_->audioDevice = createAudioDevice(AudioDeviceKind::Virtual);
-            (void)context_->audioDevice->start(playback_.outputSampleRate(), playback_.outputChannels());
-        }
-        playback_.setAudioDevice(context_->audioDevice.get(), 80);
-        context_->audioDevice->setPlaybackRate(playbackRate_);
-        context_->audioDevice->pause();
-    }
+    if (ownsSharedAudio_) bindSharedAudioDevice();
     mediaPath_ = QFileInfo(path).canonicalFilePath();
+    analysisWords_.clear();
     sampleRate_ = stream.sampleRate;
     channels_ = stream.channels;
     sourceSampleCount_ = std::max<qint64>(0, info.duration.microseconds() * sampleRate_ / 1'000'000);
@@ -199,18 +200,24 @@ void RoughCutController::loadMedia(const QUrl &url)
     setStatus(QStringLiteral("已加载：%1").arg(QFileInfo(mediaPath_).fileName()));
     emit mediaChanged();
     emit resultsChanged();
+    emit canAiReviewChanged();
     emit historyChanged();
     emit projectChanged();
+    emit canSaveChanged();
+    refreshModified();
     startWaveformWorker();
 }
 
-void RoughCutController::saveProject(const QUrl &url)
+bool RoughCutController::saveProject(const QUrl &url)
 {
     const QString path = localPath(url);
-    if (path.isEmpty() || mediaPath_.isEmpty() || model_.rowCount() == 0) return;
+    if (path.isEmpty() || mediaPath_.isEmpty()) {
+        setStatus(QStringLiteral("请先选择完整 WAV，再保存粗剪工程。"));
+        return false;
+    }
     QString error;
     const QByteArray hash = RoughCutProjectSerializer::mediaSha256(mediaPath_, &error);
-    if (hash.isEmpty()) { setStatus(error); return; }
+    if (hash.isEmpty()) { setStatus(error); return false; }
     RoughCutProject project;
     project.mediaPath = mediaPath_;
     project.mediaSha256 = hash;
@@ -223,14 +230,23 @@ void RoughCutController::saveProject(const QUrl &url)
     project.recording = model_.recording();
     project.decisions = model_.decisions();
     project.auxiliaryResults = auxiliaryResults_;
-    if (!RoughCutProjectSerializer::save(path, project, &error)) { setStatus(error); return; }
+    if (!RoughCutProjectSerializer::save(path, project, &error)) { setStatus(error); return false; }
     projectPath_ = QFileInfo(path).absoluteFilePath();
     emit projectChanged();
+    markSaved();
     setStatus(QStringLiteral("粗剪工程已保存：%1").arg(projectPath_));
+    return true;
+}
+
+bool RoughCutController::saveCurrentProject()
+{
+    if (projectPath_.isEmpty()) return false;
+    return saveProject(QUrl::fromLocalFile(projectPath_));
 }
 
 void RoughCutController::openProject(const QUrl &url)
 {
+    if (busy_) return;
     const QString path = localPath(url);
     QString error;
     const std::optional<RoughCutProject> project = RoughCutProjectSerializer::load(path, &error);
@@ -238,11 +254,7 @@ void RoughCutController::openProject(const QUrl &url)
     const QByteArray currentHash = RoughCutProjectSerializer::mediaSha256(project->mediaPath, &error);
     if (currentHash.isEmpty()) { setStatus(QStringLiteral("工程源媒体不可用：%1").arg(error)); return; }
     if (currentHash != project->mediaSha256) {
-        model_.reset({}, {}, project->sampleRate);
-        timeline_.clear();
-        syncSceneItems();
-        setStatus(QStringLiteral("源媒体内容已变化，旧切点已暂停使用，请重新选择媒体并分析。"));
-        emit resultsChanged();
+        setStatus(QStringLiteral("源媒体内容已变化，当前工程未改动，请重新选择媒体并分析。"));
         return;
     }
     loadMedia(QUrl::fromLocalFile(project->mediaPath));
@@ -252,19 +264,22 @@ void RoughCutController::openProject(const QUrl &url)
     projectPath_ = QFileInfo(path).absoluteFilePath();
     analysisVersion_ = project->analysisVersion;
     auxiliaryResults_ = project->auxiliaryResults;
-    model_.reset(project->recording, project->decisions, sampleRate_);
+    model_.reset(project->recording, project->decisions, sampleRate_, scriptText_);
     history_.clear();
     historyIndex_ = 0;
     rebuildTimeline();
     emit scriptChanged();
     emit projectChanged();
     emit resultsChanged();
+    emit canAiReviewChanged();
     emit historyChanged();
+    markSaved();
     setStatus(QStringLiteral("粗剪工程已打开：%1").arg(projectPath_));
 }
 
 void RoughCutController::loadScript(const QUrl &url)
 {
+    if (busy_) return;
     const QString path = localPath(url);
     if (!QFileInfo::exists(path)) {
         setStatus(QStringLiteral("文案不存在。"));
@@ -283,14 +298,21 @@ void RoughCutController::loadScript(const QUrl &url)
     scriptText_ = scriptDocumentText(std::get<ScriptDocument>(imported));
     setStatus(QStringLiteral("已选择文案：%1").arg(QFileInfo(scriptPath_).fileName()));
     emit scriptChanged();
+    refreshModified();
 }
 
 void RoughCutController::setScriptText(const QString &text)
 {
-    if (scriptText_ == text) return;
+    if (busy_ || scriptText_ == text) return;
     scriptText_ = text;
     scriptPath_.clear();
     emit scriptChanged();
+    refreshModified();
+}
+
+void RoughCutController::setAnalysisOverrides(IAsrService *asr)
+{
+    asrOverride_ = asr;
 }
 
 void RoughCutController::setSourceWaveformItem(QObject *item)
@@ -307,21 +329,12 @@ void RoughCutController::setTimelineItem(QObject *item)
 
 void RoughCutController::startAnalysis()
 {
-    if (busy_ || mediaPath_.isEmpty()) return;
+    if (busy_ || shuttingDown_ || mediaPath_.isEmpty()) return;
     stopWorker();
     cancel_ = false;
-    busy_ = true;
-    emit busyChanged();
+    setBusy(true);
     progressPercent_ = 0; emit progressChanged();
     stopTimeline();
-    model_.reset({}, {}, sampleRate_);
-    timeline_.clear();
-    auxiliaryResults_.clear();
-    history_.clear();
-    historyIndex_ = 0;
-    syncSceneItems();
-    emit resultsChanged();
-    emit historyChanged();
     setStatus(QStringLiteral("正在识别音频…"));
     const QString mediaPath = mediaPath_;
     const QString scriptPath = scriptPath_;
@@ -330,56 +343,80 @@ void RoughCutController::startAnalysis()
     const qint64 sourceSampleCount = sourceSampleCount_;
     const QJsonObject settings = context_->settings;
     const QString providerName = asrProviderName(settings);
+    const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(settings);
+    IAsrService *asrOverride = asrOverride_;
     const quint64 generation = ++workerGeneration_;
     worker_ = std::thread([this, mediaPath, scriptPath, scriptText, sampleRate, sourceSampleCount,
-                           settings, providerName, generation] {
-        QMetaObject::invokeMethod(this, [this, generation] {
-            if (generation != workerGeneration_ || !busy_) return;
-            setStatus(QStringLiteral("正在分析音频并检测讲话区间…"));
-        }, Qt::QueuedConnection);
+                           settings, providerName, omniSettings, asrOverride, generation] {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
+        auto failWithoutCommit = [postUi](const QString &message) {
+            postUi([message](RoughCutController *controller) {
+                controller->finishJobWithoutResults(message);
+            });
+        };
+        postUi([](RoughCutController *controller) {
+            if (!controller->busy_) return;
+            controller->setStatus(QStringLiteral("正在分析音频并检测讲话区间…"));
+        });
         SpeechAnalysisResult analyzed = SpeechSegmentAnalyzer::analyzeFile(
             mediaPath, sampleRate, sourceSampleCount, &cancel_);
         if (std::holds_alternative<AppError>(analyzed)) {
-            const QString message = std::get<AppError>(analyzed).userMessage();
-            QMetaObject::invokeMethod(this, [this, message, generation] {
-                if (generation != workerGeneration_) return;
-                busy_ = false; emit busyChanged(); setStatus(message);
-            }, Qt::QueuedConnection);
+            const AppError error = std::get<AppError>(analyzed);
+            failWithoutCommit(error.domain() == ErrorDomain::Asr
+                && error.code() == static_cast<int>(AsrErrorCode::Cancelled)
+                ? QStringLiteral("分析已取消。") : error.userMessage());
             return;
         }
         QVector<RecognizedPassage> recording = std::get<QVector<RecognizedPassage>>(std::move(analyzed));
-        QMetaObject::invokeMethod(this, [this, providerName, generation] {
-            if (generation != workerGeneration_ || !busy_) return;
-            progressPercent_ = 20; emit progressChanged();
-            setStatus(QStringLiteral("正在使用 %1 进行粗内容识别…")
+        postUi([providerName](RoughCutController *controller) {
+            if (!controller->busy_) return;
+            controller->progressPercent_ = 20;
+            emit controller->progressChanged();
+            controller->setStatus(QStringLiteral("正在使用 %1 进行粗内容识别…")
                 .arg(providerName));
-        }, Qt::QueuedConnection);
+        });
         AsrProviderFactory factory;
-        std::unique_ptr<IAsrService> asr = factory.create(settings, QString());
+        std::unique_ptr<IAsrService> ownedAsr;
+        IAsrService *asr = asrOverride;
+        if (!asr) {
+            ownedAsr = factory.create(settings, QString());
+            asr = ownedAsr.get();
+        }
         const AsrResult result = asr->transcribe({mediaPath, &cancel_,
-            [this, generation](int current, int total) {
+            [postUi](int current, int total) {
                 if (total <= 0) return;
-                QMetaObject::invokeMethod(this, [this, generation, current, total] {
-                    if (generation != workerGeneration_ || !busy_) return;
-                    progressPercent_ = std::clamp(20 + current * 65 / total, 20, 85);
-                    emit progressChanged();
-                }, Qt::QueuedConnection);
+                postUi([current, total](RoughCutController *controller) {
+                    if (!controller->busy_) return;
+                    controller->progressPercent_ = std::clamp(20 + current * 65 / total, 20, 85);
+                    emit controller->progressChanged();
+                });
             }});
         if (std::holds_alternative<AppError>(result)) {
-            const QString message = std::get<AppError>(result).userMessage();
-            QMetaObject::invokeMethod(this, [this, message, generation] {
-                if (generation != workerGeneration_) return;
-                busy_ = false; emit busyChanged(); setStatus(message);
-            }, Qt::QueuedConnection);
+            const AppError error = std::get<AppError>(result);
+            failWithoutCommit(error.domain() == ErrorDomain::Asr
+                && error.code() == static_cast<int>(AsrErrorCode::Cancelled)
+                ? QStringLiteral("分析已取消。") : error.userMessage());
             return;
         }
-        recording = attachTranscriptToSegments(
-            std::move(recording), std::get<Transcript>(result), sampleRate);
-        QMetaObject::invokeMethod(this, [this, generation] {
-            if (generation != workerGeneration_ || !busy_) return;
-            progressPercent_ = 85; emit progressChanged();
-            setStatus(QStringLiteral("正在匹配文案与粗剪片段…"));
-        }, Qt::QueuedConnection);
+        const Transcript transcript = std::get<Transcript>(result);
+        recording = RoughCutAlignmentEvidence::buildPassages(
+            std::move(recording), transcript, sampleRate, sourceSampleCount);
+        postUi([](RoughCutController *controller) {
+            if (!controller->busy_) return;
+            controller->progressPercent_ = 85;
+            emit controller->progressChanged();
+            controller->setStatus(QStringLiteral("正在匹配文案与粗剪片段…"));
+        });
+        if (cancel_.load()) {
+            failWithoutCommit(QStringLiteral("分析已取消。"));
+            return;
+        }
         ScriptDocument script;
         if (!scriptText.isEmpty()) {
             script = scriptDocumentFromText(scriptText);
@@ -389,11 +426,7 @@ void RoughCutController::startAnalysis()
                 ? ScriptDocumentImporter::loadDocx(scriptPath, {}, &cancel_)
                 : ScriptDocumentImporter::loadTxt(scriptPath);
             if (std::holds_alternative<AppError>(imported)) {
-                const QString message = std::get<AppError>(imported).userMessage();
-                QMetaObject::invokeMethod(this, [this, message, generation] {
-                    if (generation != workerGeneration_) return;
-                    busy_ = false; emit busyChanged(); setStatus(message);
-                }, Qt::QueuedConnection);
+                failWithoutCommit(std::get<AppError>(imported).userMessage());
                 return;
             }
             script = std::get<ScriptDocument>(imported);
@@ -401,8 +434,15 @@ void RoughCutController::startAnalysis()
         const QVector<ScriptMatch> matches = ScriptMatcher::match(script, recording);
         const QVector<RoughCutRetakeGroup> groups = RetakeDetector::detect(recording, matches, sampleRate);
         for (const ScriptMatch &match : matches) {
-            if (match.recordingIndex >= 0 && match.recordingIndex < recording.size())
+            if (match.recordingIndex >= 0 && match.recordingIndex < recording.size()) {
                 recording[match.recordingIndex].scriptLineIndex = match.scriptLineIndex;
+                recording[match.recordingIndex].scriptLineEndIndex = match.scriptLineEndIndex;
+                recording[match.recordingIndex].textSimilarity = match.similarity;
+                recording[match.recordingIndex].editSimilarity = match.editSimilarity;
+                recording[match.recordingIndex].continuousCoverage = match.continuousCoverage;
+                recording[match.recordingIndex].scriptTokenStart = match.scriptTokenStart;
+                recording[match.recordingIndex].scriptTokenEnd = match.scriptTokenEnd;
+            }
         }
         for (const RoughCutRetakeGroup &group : groups) {
             for (const RoughCutTake &take : group.takes) {
@@ -415,19 +455,35 @@ void RoughCutController::startAnalysis()
         for (const RecognizedPassage &passage : recording)
             trusted.append(passage.boundaryTrustworthy && !passage.text.isEmpty());
         QVector<RoughCutSegmentDecision> decisions = RoughCutDecisionEngine::decide(
-            recording, matches, groups, trusted);
-        QMetaObject::invokeMethod(this, [this, recording = std::move(recording),
-                                        decisions = std::move(decisions), generation]() mutable {
-            if (generation != workerGeneration_) return;
-            if (cancel_) { busy_ = false; emit busyChanged(); setStatus(QStringLiteral("分析已取消。")); return; }
-            model_.reset(std::move(recording), std::move(decisions), sampleRate_);
-            ++analysisVersion_;
-            auxiliaryResults_.clear();
-            history_.clear(); historyIndex_ = 0; rebuildTimeline();
-            busy_ = false; emit busyChanged(); emit resultsChanged(); emit historyChanged();
-            progressPercent_ = 100; emit progressChanged();
-            setStatus(QStringLiteral("分析完成：%1 个片段。").arg(model_.rowCount()));
-        }, Qt::QueuedConnection);
+            recording, matches, groups, trusted, scriptDocumentText(script));
+        RoughCutDecisionEngine::protectCuts(recording, &decisions, scriptDocumentText(script));
+        SafeCutBoundary::applyToPassages(
+            &recording, &decisions, transcript.words, sampleRate, sourceSampleCount, omniSettings);
+        postUi([recording = std::move(recording), decisions = std::move(decisions),
+                words = transcript.words](
+                   RoughCutController *controller) mutable {
+            if (controller->cancel_) {
+                controller->finishJobWithoutResults(QStringLiteral("分析已取消。"));
+                return;
+            }
+            controller->model_.reset(std::move(recording), std::move(decisions),
+                controller->sampleRate_, controller->scriptText_);
+            controller->analysisWords_ = std::move(words);
+            ++controller->analysisVersion_;
+            controller->auxiliaryResults_.clear();
+            controller->history_.clear();
+            controller->historyIndex_ = 0;
+            controller->rebuildTimeline();
+            controller->setBusy(false);
+            emit controller->resultsChanged();
+            emit controller->canAiReviewChanged();
+            emit controller->historyChanged();
+            controller->progressPercent_ = 100;
+            emit controller->progressChanged();
+            controller->refreshModified();
+            controller->setStatus(QStringLiteral("分析完成：%1 个片段。")
+                .arg(controller->model_.rowCount()));
+        });
     });
 }
 
@@ -438,6 +494,128 @@ void RoughCutController::cancelAnalysis()
     setStatus(QStringLiteral("正在取消…"));
 }
 
+void RoughCutController::startAiReview()
+{
+    if (busy_ || model_.rowCount() == 0) return;
+    const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(context_->settings);
+    const QString omniKey = OmniReviewSettingsStore::resolveApiKey({}, &context_->credentials);
+    if (omniKey.isEmpty()) {
+        setStatus(QStringLiteral("未配置 AI API Key。"));
+        return;
+    }
+    RoughCutOmniRequest reviewRequest;
+    reviewRequest.mediaPath = mediaPath_;
+    reviewRequest.scriptText = scriptText_;
+    const QVector<RecognizedPassage> recording = model_.recording();
+    const QVector<RoughCutSegmentDecision> decisions = model_.baseDecisions();
+    for (int index = 0; index < decisions.size(); ++index) {
+        if (decisions.at(index).userDecision) continue;
+        if (decisions.at(index).autoDecision == RoughCutDecision::Keep) continue;
+        const RecognizedPassage &passage = recording.at(index);
+        RoughCutOmniCandidate candidate;
+        candidate.candidateId = QString::number(index);
+        candidate.startMs = sampleRate_ > 0 ? passage.startSample * 1000 / sampleRate_ : 0;
+        candidate.endMs = sampleRate_ > 0 ? passage.endSample * 1000 / sampleRate_ : 0;
+        candidate.transcript = passage.text;
+        if (index > 0) candidate.previousContext = recording.at(index - 1).text;
+        if (index + 1 < recording.size()) candidate.nextContext = recording.at(index + 1).text;
+        candidate.reasonHint = decisions.at(index).reason;
+        if (decisions.at(index).replacementRecordingIndex >= 0)
+            candidate.replacementCandidateId = QString::number(decisions.at(index).replacementRecordingIndex);
+        reviewRequest.candidates.append(std::move(candidate));
+    }
+    if (reviewRequest.candidates.isEmpty()) {
+        setStatus(QStringLiteral("没有需要 AI 复核的候选片段。"));
+        return;
+    }
+    stopWorker();
+    cancel_ = false;
+    setBusy(true);
+    progressPercent_ = 0;
+    emit progressChanged();
+    setStatus(QStringLiteral("正在进行 AI 复核…"));
+    const QString mediaPath = mediaPath_;
+    const int sampleRate = sampleRate_;
+    const qint64 sourceSampleCount = sourceSampleCount_;
+    const QVector<TranscriptWord> words = analysisWords_;
+    const int analysisVersion = analysisVersion_;
+    const QVector<RoughCutSegmentDecision> beforeBase = decisions;
+    const quint64 generation = ++workerGeneration_;
+    IHttpClient *http = context_->aiHttp;
+    std::atomic<bool> *cancel = &cancel_;
+    worker_ = std::thread([this, reviewRequest, omniSettings, omniKey, mediaPath, sampleRate,
+                           sourceSampleCount, words, analysisVersion, beforeBase, generation, http, cancel] {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
+        AiReviewService service(omniSettings, omniKey, http);
+        RoughCutOmniResult reviewed = service.reviewCandidates(reviewRequest, cancel);
+        postUi([reviewed = std::move(reviewed), beforeBase, analysisVersion, omniSettings, words,
+                sampleRate, sourceSampleCount](RoughCutController *controller) mutable {
+            if (controller->cancel_) {
+                controller->finishJobWithoutResults(QStringLiteral("AI 复核已取消。"));
+                return;
+            }
+            controller->setBusy(false);
+            if (analysisVersion != controller->analysisVersion_
+                || controller->mediaPath_.isEmpty()) {
+                controller->setStatus(QStringLiteral("分析结果已变化，已丢弃复核结果。"));
+                return;
+            }
+            if (std::holds_alternative<AppError>(reviewed)) {
+                controller->setStatus(std::get<AppError>(reviewed).userMessage());
+                return;
+            }
+            QVector<RoughCutSegmentDecision> afterBase = beforeBase;
+            int changed = 0;
+            for (const RoughCutOmniSuggestion &suggestion :
+                 std::get<QVector<RoughCutOmniSuggestion>>(reviewed)) {
+                bool ok = false;
+                const int index = suggestion.candidateId.toInt(&ok);
+                if (!ok || index < 0 || index >= afterBase.size()) continue;
+                if (afterBase.at(index).userDecision) continue;
+                afterBase[index].autoDecision = suggestion.decision;
+                afterBase[index].decisionSource = QStringLiteral("omni");
+                afterBase[index].reason = suggestion.reason;
+                afterBase[index].modelProbability = suggestion.confidence;
+                if (!suggestion.replacementCandidateId.isEmpty()) {
+                    bool replacementOk = false;
+                    const int replacement = suggestion.replacementCandidateId.toInt(&replacementOk);
+                    if (replacementOk) afterBase[index].replacementRecordingIndex = replacement;
+                }
+                afterBase[index].evidence.append(
+                    QStringLiteral("Omni %1 %2")
+                        .arg(roughCutOmniReasonName(suggestion.reasonType),
+                             QString::number(suggestion.confidence, 'f', 2)));
+                ++changed;
+            }
+            QVector<RecognizedPassage> recording = controller->model_.recording();
+            RoughCutDecisionEngine::protectCuts(recording, &afterBase, controller->scriptText_);
+            SafeCutBoundary::applyToPassages(
+                &recording, &afterBase, words, sampleRate, sourceSampleCount, omniSettings);
+            Edit edit;
+            edit.beforeBase = beforeBase;
+            edit.afterBase = afterBase;
+            controller->history_.resize(controller->historyIndex_);
+            controller->history_.append(edit);
+            ++controller->historyIndex_;
+            controller->model_.replaceBaseDecisions(afterBase);
+            controller->rebuildTimeline();
+            emit controller->historyChanged();
+            emit controller->resultsChanged();
+            emit controller->canAiReviewChanged();
+            controller->progressPercent_ = 100;
+            emit controller->progressChanged();
+            controller->refreshModified();
+            controller->setStatus(QStringLiteral("AI 复核完成：已更新 %1 个片段。").arg(changed));
+        });
+    });
+}
+
 void RoughCutController::startAuxiliaryRecognition()
 {
     if (busy_ || mediaPath_.isEmpty() || model_.rowCount() == 0) return;
@@ -445,11 +623,18 @@ void RoughCutController::startAuxiliaryRecognition()
         model_.recording(), model_.decisions(), sampleRate_, sourceSampleCount_);
     if (ranges.isEmpty()) { setStatus(QStringLiteral("没有需要辅助识别的 REVIEW 片段。")); return; }
     stopWorker();
-    cancel_ = false; busy_ = true; emit busyChanged();
+    cancel_ = false;
+    setBusy(true);
     progressPercent_ = 0; emit progressChanged();
     const QString mediaPath = mediaPath_;
     const int sampleRate = sampleRate_;
-    const QJsonObject settings = context_->settings;
+    QJsonObject settings = context_->settings;
+    if (!settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)) {
+        settings.insert(QStringLiteral("asrProvider"),
+            settings.value(QStringLiteral("reviewAsrProvider")).toString(QStringLiteral("funasr")));
+        settings.insert(QStringLiteral("asrModel"),
+            settings.value(QStringLiteral("reviewAsrModel")).toString(QStringLiteral("Fun-ASR-Nano-2512")));
+    }
     const QString providerName = asrProviderName(settings);
     setStatus(QStringLiteral("正在使用 %1 执行辅助识别…").arg(providerName));
     const QVector<RecognizedPassage> recording = model_.recording();
@@ -457,65 +642,76 @@ void RoughCutController::startAuxiliaryRecognition()
     const quint64 generation = ++workerGeneration_;
     worker_ = std::thread([this, ranges, mediaPath, sampleRate, settings, providerName,
                            recording, decisions, generation] {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
         QVector<RoughCutAuxiliaryResult> results;
         AsrProviderFactory factory;
-        const AsrResult recognized = factory.create(settings, QString())->transcribe({mediaPath, &cancel_,
-            [this, generation](int current, int total) {
-                if (total <= 0) return;
-                QMetaObject::invokeMethod(this, [this, generation, current, total] {
-                    if (generation != workerGeneration_ || !busy_) return;
-                    progressPercent_ = std::clamp(current * 90 / total, 0, 90);
-                    emit progressChanged();
-                }, Qt::QueuedConnection);
-            }});
-        if (std::holds_alternative<AppError>(recognized)) {
-            const QString message = std::get<AppError>(recognized).userMessage();
-            QMetaObject::invokeMethod(this, [this, message, generation] {
-                if (generation != workerGeneration_) return;
-                busy_ = false;
-                progressPercent_ = 0;
-                emit busyChanged();
-                emit progressChanged();
-                setStatus(message);
-            }, Qt::QueuedConnection);
-            return;
-        }
-        const Transcript transcript = std::get<Transcript>(recognized);
+        std::unique_ptr<IAsrService> reviewAsr = factory.create(settings, QString());
+        QTemporaryDir temporary;
         for (int rangeIndex = 0; rangeIndex < ranges.size() && !cancel_; ++rangeIndex) {
             const RoughCutSuspiciousRange &range = ranges.at(rangeIndex);
-            const QString auxiliaryText = transcriptText(transcript,
-                range.startSample * 1000 / sampleRate, range.endSample * 1000 / sampleRate);
-            const bool auxiliaryFailed = auxiliaryText.isEmpty();
+            QString auxiliaryText;
+            bool auxiliaryFailed = true;
+            const AudioChunkWindow window{range.startSample / double(sampleRate),
+                range.endSample / double(sampleRate), range.startSample * 1000 / sampleRate,
+                range.endSample * 1000 / sampleRate};
+            const MediaResult<PreparedAudioChunk> extracted = AudioChunkExtractor::extract(
+                mediaPath, window, &cancel_, true);
+            if (temporary.isValid() && std::holds_alternative<PreparedAudioChunk>(extracted)) {
+                const QString clipPath = QDir(temporary.path()).filePath(
+                    QStringLiteral("review_%1.flac").arg(rangeIndex));
+                QFile clip(clipPath);
+                const QByteArray &flac = std::get<PreparedAudioChunk>(extracted).flac;
+                if (clip.open(QIODevice::WriteOnly) && clip.write(flac) == flac.size()) {
+                    clip.close();
+                    const AsrResult recognized = reviewAsr->transcribe({clipPath, &cancel_, {}});
+                    if (std::holds_alternative<Transcript>(recognized)) {
+                        for (const TranscriptWord &word : std::get<Transcript>(recognized).words)
+                            auxiliaryText += word.text;
+                        auxiliaryText = auxiliaryText.trimmed();
+                        auxiliaryFailed = auxiliaryText.isEmpty();
+                    }
+                }
+            }
             for (int index : range.recordingIndexes) {
                 RoughCutAuxiliaryResult result{index, recording.at(index).text, auxiliaryText, {},
                     auxiliaryFailed, false, false};
+                result.agreementDecision = decisions.at(index).failureType
+                        == RoughCutFailureType::None
+                    ? RoughCutDecision::Keep : RoughCutDecision::Cut;
                 (void)RoughCutAuxiliaryRecognition::reconcile(
                     decisions.at(index).autoDecision, &result);
                 results.append(std::move(result));
             }
-            QMetaObject::invokeMethod(this, [this, generation, rangeIndex, total = ranges.size()] {
-                if (generation != workerGeneration_ || !busy_) return;
-                progressPercent_ = 90 + (rangeIndex + 1) * 10 / total;
-                emit progressChanged();
-            }, Qt::QueuedConnection);
+            postUi([rangeIndex, total = ranges.size()](RoughCutController *controller) {
+                if (!controller->busy_) return;
+                controller->progressPercent_ = (rangeIndex + 1) * 100 / total;
+                emit controller->progressChanged();
+            });
         }
-        QMetaObject::invokeMethod(this, [this, results = std::move(results), providerName,
-                                        generation]() mutable {
-            if (generation != workerGeneration_) return;
-            if (!cancel_) {
-                auxiliaryResults_ = results;
-                for (const auto &result : auxiliaryResults_)
-                    model_.applyAuxiliaryResult(result, providerName);
-                rebuildTimeline();
-                progressPercent_ = 100;
-                setStatus(QStringLiteral("辅助识别完成：%1 个片段；冲突或失败均保持 REVIEW。")
-                    .arg(auxiliaryResults_.size()));
-            } else {
-                progressPercent_ = 0;
-                setStatus(QStringLiteral("辅助识别已取消。"));
+        postUi([results = std::move(results), providerName](RoughCutController *controller) mutable {
+            if (controller->cancel_) {
+                controller->finishJobWithoutResults(QStringLiteral("辅助识别已取消。"));
+                return;
             }
-            busy_ = false; emit busyChanged(); emit progressChanged(); emit resultsChanged();
-        }, Qt::QueuedConnection);
+            controller->auxiliaryResults_ = results;
+            for (const auto &result : controller->auxiliaryResults_)
+                controller->model_.applyAuxiliaryResult(result, providerName);
+            controller->rebuildTimeline();
+            controller->progressPercent_ = 100;
+            controller->setBusy(false);
+            emit controller->progressChanged();
+            emit controller->resultsChanged();
+            emit controller->canAiReviewChanged();
+            controller->refreshModified();
+            controller->setStatus(QStringLiteral("辅助识别完成：%1 个片段；一致结果已更新，冲突保持 REVIEW。")
+                .arg(controller->auxiliaryResults_.size()));
+        });
     });
 }
 
@@ -681,6 +877,7 @@ void RoughCutController::startTimelineClip(int index)
 
 void RoughCutController::setDecision(int row, const QString &value)
 {
+    if (busy_) return;
     const std::optional<RoughCutDecision> decision = parseDecision(value);
     if (!decision || row < 0 || row >= model_.decisions().size()) return;
     const Edit edit{row, model_.decisions().at(row).userDecision, decision};
@@ -693,7 +890,7 @@ void RoughCutController::setDecision(int row, const QString &value)
 
 void RoughCutController::restoreAutoDecision(int row)
 {
-    if (row < 0 || row >= model_.decisions().size() || !model_.decisions().at(row).userDecision) return;
+    if (busy_ || row < 0 || row >= model_.decisions().size() || !model_.decisions().at(row).userDecision) return;
     const Edit edit{row, model_.decisions().at(row).userDecision, std::nullopt};
     history_.resize(historyIndex_); history_.append(edit); ++historyIndex_; applyEdit(edit, true);
 }
@@ -734,9 +931,8 @@ void RoughCutController::exportWav(const QUrl &url)
     if (busy_ || path.isEmpty() || mediaPath_.isEmpty() || timeline_.isEmpty()) return;
     stopWorker();
     cancel_ = false;
-    busy_ = true;
+    setBusy(true);
     progressPercent_ = 0;
-    emit busyChanged();
     emit progressChanged();
     setStatus(QStringLiteral("正在导出精简 WAV…"));
     const QString sourcePath = mediaPath_;
@@ -745,18 +941,23 @@ void RoughCutController::exportWav(const QUrl &url)
     const int channels = channels_;
     const quint64 generation = ++workerGeneration_;
     worker_ = std::thread([this, path, sourcePath, clips, sampleRate, channels, generation] {
+        auto postUi = [this, generation](auto fn) {
+            const QPointer<RoughCutController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
+                if (!self || generation != self->workerGeneration_) return;
+                fn(self.data());
+            }, Qt::QueuedConnection);
+        };
         QString error;
         const bool saved = RoughCutWavExporter::save(path, sourcePath, clips,
             sampleRate, channels, &cancel_, &error);
-        QMetaObject::invokeMethod(this, [this, path, saved, error, generation] {
-            if (generation != workerGeneration_) return;
-            busy_ = false;
-            progressPercent_ = saved ? 100 : 0;
-            emit busyChanged();
-            emit progressChanged();
-            setStatus(saved ? QStringLiteral("精简 WAV 已导出：%1").arg(path)
+        postUi([path, saved, error](RoughCutController *controller) {
+            controller->setBusy(false);
+            controller->progressPercent_ = saved ? 100 : 0;
+            emit controller->progressChanged();
+            controller->setStatus(saved ? QStringLiteral("精简 WAV 已导出：%1").arg(path)
                             : error);
-        }, Qt::QueuedConnection);
+        });
     });
 }
 
@@ -788,9 +989,10 @@ void RoughCutController::startWaveformWorker()
         if (!std::holds_alternative<std::shared_ptr<const WaveformPyramid>>(result)) return;
         const std::shared_ptr<const WaveformPyramid> waveform =
             std::get<std::shared_ptr<const WaveformPyramid>>(result);
-        QMetaObject::invokeMethod(this, [this, generation, waveform] {
-            if (generation != waveformGeneration_) return;
-            if (sourceWaveformItem_) sourceWaveformItem_->setWaveform(waveform);
+        const QPointer<RoughCutController> self(this);
+        QMetaObject::invokeMethod(this, [self, generation, waveform] {
+            if (!self || generation != self->waveformGeneration_) return;
+            if (self->sourceWaveformItem_) self->sourceWaveformItem_->setWaveform(waveform);
         }, Qt::QueuedConnection);
     });
 }
@@ -819,23 +1021,126 @@ void RoughCutController::syncSceneItems()
 
 void RoughCutController::rebuildTimeline()
 {
-    timeline_ = RoughCutTimelineEngine::build(model_.recording(), model_.decisions(),
-                                               sampleRate_, sourceSampleCount_);
+    const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(context_->settings);
+    timeline_ = SafeCutBoundary::buildTimeline(
+        model_.recording(), model_.decisions(), sampleRate_, sourceSampleCount_, omniSettings);
     syncSceneItems();
 }
 
 void RoughCutController::applyEdit(const Edit &edit, bool forward)
 {
+    if (!edit.beforeBase.isEmpty() || !edit.afterBase.isEmpty()) {
+        model_.replaceBaseDecisions(forward ? edit.afterBase : edit.beforeBase, false);
+        rebuildTimeline();
+        emit historyChanged();
+        emit resultsChanged();
+        refreshModified();
+        return;
+    }
     (void)model_.setUserDecision(edit.row, forward ? edit.after : edit.before);
     rebuildTimeline();
     emit historyChanged();
     emit resultsChanged();
+    refreshModified();
 }
 
 void RoughCutController::setStatus(QString value)
 {
     statusText_ = std::move(value);
     emit statusChanged();
+}
+
+void RoughCutController::setBusy(bool value)
+{
+    if (busy_ == value) return;
+    busy_ = value;
+    emit busyChanged();
+    emit historyChanged();
+    emit canAiReviewChanged();
+    emit canSaveChanged();
+}
+
+void RoughCutController::bindSharedAudioDevice()
+{
+    if (!context_ || !context_->audioDevice || !playback_.isOpen()) return;
+    AppError error(ErrorDomain::Media, 0, QString());
+    IAudioDevice *device = context_->audioDevice.get();
+    if (!device->start(playback_.outputSampleRate(), playback_.outputChannels(), &error)) {
+        context_->replaceAudioDevice(createAudioDevice(AudioDeviceKind::Virtual));
+        device = context_->audioDevice.get();
+        if (device) (void)device->start(playback_.outputSampleRate(), playback_.outputChannels());
+    }
+    if (!device) return;
+    playback_.setAudioDevice(device, 80);
+    device->setPlaybackRate(playbackRate_);
+    device->pause();
+    ownsSharedAudio_ = true;
+}
+
+void RoughCutController::releasePlayback()
+{
+    playback_.pause();
+    if (context_ && context_->audioDevice) context_->audioDevice->pause();
+    playbackTimer_.stop();
+    playback_.setAudioDevice(nullptr, 0);
+    ownsSharedAudio_ = false;
+    emit playbackChanged();
+}
+
+void RoughCutController::claimPlayback()
+{
+    ownsSharedAudio_ = true;
+    bindSharedAudioDevice();
+    emit playbackChanged();
+}
+
+void RoughCutController::refreshModified()
+{
+    const bool next = projectFingerprint() != savedFingerprint_;
+    if (next == modified_) return;
+    modified_ = next;
+    emit modifiedChanged();
+}
+
+void RoughCutController::markSaved()
+{
+    savedFingerprint_ = projectFingerprint();
+    if (modified_) {
+        modified_ = false;
+        emit modifiedChanged();
+    }
+}
+
+QByteArray RoughCutController::projectFingerprint() const
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream << mediaPath_ << scriptPath_ << scriptText_ << analysisVersion_;
+    const auto &recording = model_.recording();
+    const auto &decisions = model_.decisions();
+    stream << int(recording.size());
+    for (int index = 0; index < recording.size(); ++index) {
+        const RecognizedPassage &passage = recording.at(index);
+        stream << passage.id << passage.text << passage.startSample << passage.endSample;
+        if (index < decisions.size()) {
+            const RoughCutSegmentDecision &decision = decisions.at(index);
+            stream << int(decision.autoDecision)
+                   << (decision.userDecision ? int(*decision.userDecision) : -1)
+                   << decision.reason;
+        }
+    }
+    stream << int(auxiliaryResults_.size());
+    for (const RoughCutAuxiliaryResult &result : auxiliaryResults_)
+        stream << result.recordingIndex << result.funAsrText << result.conflict;
+    return bytes;
+}
+
+void RoughCutController::finishJobWithoutResults(const QString &message)
+{
+    setBusy(false);
+    progressPercent_ = 0;
+    emit progressChanged();
+    setStatus(message);
 }
 
 } // namespace subcue

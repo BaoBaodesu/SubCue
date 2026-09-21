@@ -225,7 +225,14 @@ qint64 PlaybackEngine::consumeAudio(MediaTime duration)
 
 void PlaybackEngine::setAudioDevice(IAudioDevice *device, int preRollMs)
 {
+    if (audioDevice_ && audioDevice_ != device) {
+        audioDevice_->setSampleProvider({});
+    }
     audioDevice_ = device;
+    if (!device) {
+        preRollFrames_ = 0;
+        return;
+    }
     const int milliseconds = std::clamp(preRollMs, 4 * 1'000 / 60, AudioOutput::kMaximumBufferMilliseconds);
     preRollFrames_ = outputSampleRate_ > 0
         ? av_rescale(milliseconds, outputSampleRate_, 1'000)

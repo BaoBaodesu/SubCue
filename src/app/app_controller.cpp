@@ -4,11 +4,14 @@
 #include "timeline_scene_item.h"
 #include "video_preview_item.h"
 
+#include "ai/ai_review_service.h"
+#include "ai/ai_review_settings.h"
 #include "ai/ai_types.h"
-#include "ai/openai_compatible_provider.h"
+#include "ai/qwen_omni_provider.h"
 #include "alignment/alignment_preflight.h"
 #include "asr/asr_provider_factory.h"
 #include "asr/asr_types.h"
+#include "asr/http_client.h"
 #include "asr/local_python_asr_service.h"
 #include "common/logging.h"
 #include "media/media_probe.h"
@@ -28,6 +31,7 @@
 #include <QtCore/QJsonValue>
 #include <QtCore/QMetaObject>
 #include <QtCore/QPointer>
+#include <QtCore/QUrl>
 #include <QtCore/QVariantMap>
 #include <QtCore/QUuid>
 #include <QtGui/QDesktopServices>
@@ -71,18 +75,6 @@ QString readTextFile(const QString &path, QString *errorMessage)
     return QString::fromUtf8(bytes);
 }
 
-QJsonObject selectedAiProvider(const QJsonObject &settings)
-{
-    const QString selected = settings.value(QStringLiteral("aiProviderId")).toString();
-    for (const QJsonValue &value : settings.value(QStringLiteral("aiProviders")).toArray()) {
-        const QJsonObject provider = value.toObject();
-        if (provider.value(QStringLiteral("id")).toString() == selected) {
-            return provider;
-        }
-    }
-    return {};
-}
-
 QString aiCredentialId(const QString &providerId)
 {
     return QStringLiteral("SubCue/AI/%1").arg(providerId);
@@ -117,6 +109,7 @@ AppController::AppController(ApplicationContext *context, QObject *parent)
       editor_(&document_, &commands_, &viewport_, &snap_)
 {
     Q_ASSERT(context_ != nullptr);
+    context_->registerAudioClient(&playback_);
     backgroundTasks_.setMaxThreadCount(3);
     tickTimer_.setInterval(10);
     tickTimer_.setTimerType(Qt::PreciseTimer);
@@ -200,6 +193,11 @@ bool AppController::busy() const { return busy_; }
 
 bool AppController::canExport() const { return canExport_; }
 
+bool AppController::canOmniReview() const
+{
+    return alignmentCompleted_ && !busy_;
+}
+
 int AppController::selectedCue() const { return selectedCue_; }
 
 QString AppController::scriptText() const { return scriptText_; }
@@ -210,9 +208,12 @@ void AppController::setScriptText(const QString &value)
         return;
     }
     scriptText_ = value;
+    ++scriptGeneration_;
+    invalidateAlignmentEvidence();
     if (alignmentCompleted_) {
         alignmentCompleted_ = false;
         emit canReviewChanged();
+        emit canOmniReviewChanged();
     }
     emit scriptTextChanged();
 }
@@ -352,40 +353,45 @@ void AppController::loadMediaPath(const QString &path)
     const MediaInfo info = std::get<MediaInfo>(probed);
 
     stop();
-    // 设备先起：它决定实际混音采样率，解码数据按这个采样率泵入环缓冲。
     IAudioDevice *device = context_->audioDevice.get();
-    if (device) {
+    if (ownsSharedAudio_ && device) {
+        // 设备先起：它决定实际混音采样率，解码数据按这个采样率泵入环缓冲。
         AppError audioError(ErrorDomain::Media, 0, QString());
         if (!device->start(playback_.outputSampleRate(), playback_.outputChannels(), &audioError)) {
             qCInfo(subcueAppLog) << "Audio device start failed, falling back to virtual:"
                                  << audioError.userMessage();
-            context_->audioDevice = createAudioDevice(AudioDeviceKind::Virtual);
+            context_->replaceAudioDevice(createAudioDevice(AudioDeviceKind::Virtual));
             device = context_->audioDevice.get();
-            (void)device->start(playback_.outputSampleRate(), playback_.outputChannels(), nullptr);
+            if (device) {
+                (void)device->start(playback_.outputSampleRate(), playback_.outputChannels(), nullptr);
+            }
         }
-        device->setPlaybackRate(playbackRate_);
+        if (device) device->setPlaybackRate(playbackRate_);
     }
 
     AppError openError(ErrorDomain::Media, 0, QString());
     if (!playback_.open(path, &openError)) {
-        if (device) {
-            device->stop();
-        }
         setStatus(QStringLiteral("媒体打开失败：%1").arg(openError.userMessage()));
         return;
     }
-    playback_.setAudioDevice(device, kAudioPreRollMs);
-    if (device) {
+    if (ownsSharedAudio_ && device) {
+        playback_.setAudioDevice(device, kAudioPreRollMs);
         device->pause();
     }
 
     alignmentCancel_ = true;
     ++alignmentGeneration_;
     stopAlignmentWorker();
+    omniReviewCancel_ = true;
+    ++omniReviewGeneration_;
+    stopOmniReviewWorker();
     setBusy(false);
+    ++mediaGeneration_;
+    invalidateAlignmentEvidence();
     if (alignmentCompleted_) {
         alignmentCompleted_ = false;
         emit canReviewChanged();
+        emit canOmniReviewChanged();
     }
     setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
                             [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
@@ -595,6 +601,129 @@ void AppController::startReview()
     startAlignmentRun(true);
 }
 
+void AppController::startOmniSubtitleReview()
+{
+    if (busy_) return;
+    if (!alignmentCompleted_ || document_.count() <= 0 || mediaPath_.isEmpty()) {
+        setStatus(QStringLiteral("请先完成自动打轴后再进行 AI 复核。"));
+        return;
+    }
+    const OmniReviewSettings settings = OmniReviewSettingsStore::fromJson(context_->settings);
+    const QString apiKey = OmniReviewSettingsStore::resolveApiKey({}, &context_->credentials);
+    if (apiKey.isEmpty()) {
+        setStatus(QStringLiteral("未配置 AI API Key。字幕编辑仍可继续使用。"));
+        return;
+    }
+    stopOmniReviewWorker();
+    omniReviewCancel_ = false;
+    setBusy(true);
+    setStatus(QStringLiteral("正在复核字幕内容…"));
+    SubtitleOmniRequest request;
+    request.mediaPath = mediaPath_;
+    request.scriptText = scriptText_;
+    const QList<Subtitle> cues = document_.subtitles();
+    request.segments.reserve(cues.size());
+    for (int index = 0; index < cues.size(); ++index) {
+        const Subtitle &cue = cues.at(index);
+        SubtitleOmniSegment segment;
+        segment.segmentId = cue.id;
+        segment.text = cue.text;
+        segment.startMs = cue.start.milliseconds();
+        segment.endMs = cue.end.milliseconds();
+        if (index > 0) segment.previousText = cues.at(index - 1).text;
+        if (index + 1 < cues.size()) segment.nextText = cues.at(index + 1).text;
+        request.segments.append(std::move(segment));
+    }
+    const quint64 generation = ++omniReviewGeneration_;
+    const quint64 mediaGeneration = mediaGeneration_;
+    const quint64 scriptGeneration = scriptGeneration_;
+    const quint64 evidenceGeneration = alignmentEvidenceGeneration_;
+    IHttpClient *http = context_->aiHttp;
+    std::atomic<bool> *cancel = &omniReviewCancel_;
+    QPointer<AppController> self(this);
+    omniReviewThread_ = std::thread([self, request, settings, apiKey, generation,
+                                     mediaGeneration, scriptGeneration, evidenceGeneration, http, cancel] {
+        AiReviewService service(settings, apiKey, http);
+        SubtitleOmniResult result = service.reviewSubtitles(request, cancel);
+        if (self) {
+            QMetaObject::invokeMethod(self, [self, generation, mediaGeneration, scriptGeneration,
+                                             evidenceGeneration, result = std::move(result)]() mutable {
+                if (self) self->finishOmniSubtitleReview(
+                    generation, std::move(result), mediaGeneration, scriptGeneration, evidenceGeneration);
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+void AppController::startWordMappingReview()
+{
+    if (busy_) return;
+    if (!alignmentCompleted_ || document_.count() <= 0 || mediaPath_.isEmpty()) {
+        setStatus(QStringLiteral("请先完成打轴。"));
+        return;
+    }
+    if (alignmentWords_.isEmpty()) {
+        setStatus(QStringLiteral("缺少有效词级证据，请先完成打轴。"));
+        return;
+    }
+    const OmniReviewSettings settings = OmniReviewSettingsStore::fromJson(context_->settings);
+    const QString apiKey = OmniReviewSettingsStore::resolveApiKey({}, &context_->credentials);
+    if (apiKey.isEmpty()) {
+        setStatus(QStringLiteral("未配置 AI API Key。字幕编辑仍可继续使用。"));
+        return;
+    }
+    stopOmniReviewWorker();
+    omniReviewCancel_ = false;
+    setBusy(true);
+    setStatus(QStringLiteral("正在复核时间映射…"));
+    WordMappingOmniRequest request;
+    request.words = alignmentWords_;
+    for (const Subtitle &cue : document_.subtitles()) request.subtitles.append(cue);
+    const quint64 generation = ++omniReviewGeneration_;
+    const quint64 mediaGeneration = mediaGeneration_;
+    const quint64 scriptGeneration = scriptGeneration_;
+    const quint64 evidenceGeneration = alignmentEvidenceGeneration_;
+    IHttpClient *http = context_->aiHttp;
+    std::atomic<bool> *cancel = &omniReviewCancel_;
+    QPointer<AppController> self(this);
+    omniReviewThread_ = std::thread([self, request, settings, apiKey, generation,
+                                     mediaGeneration, scriptGeneration, evidenceGeneration, http, cancel] {
+        AiReviewService service(settings, apiKey, http);
+        WordMappingOmniResult result = service.reviewWordMapping(request, cancel);
+        if (self) {
+            QMetaObject::invokeMethod(self, [self, generation, mediaGeneration, scriptGeneration,
+                                             evidenceGeneration, result = std::move(result)]() mutable {
+                if (self) self->finishWordMappingReview(
+                    generation, std::move(result), mediaGeneration, scriptGeneration, evidenceGeneration);
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+void AppController::acceptOmniSubtitleSuggestion(int row)
+{
+    if (row < 0 || row >= document_.count()) return;
+    Subtitle cue = document_.subtitles().at(row);
+    const QString suggested = cue.metadata.value(QStringLiteral("omniSuggestedText")).toString();
+    cue.metadata.insert(QStringLiteral("omniReviewStatus"),
+        omniReviewStatusName(OmniReviewStatus::Accepted));
+    document_.replaceSubtitle(cue.id, cue);
+    if (!suggested.trimmed().isEmpty() && suggested != cue.text) {
+        commands_.editText(cue.id, suggested);
+    }
+    setStatus(QStringLiteral("已接受 AI 字幕建议。"));
+}
+
+void AppController::ignoreOmniSubtitleSuggestion(int row)
+{
+    if (row < 0 || row >= document_.count()) return;
+    Subtitle cue = document_.subtitles().at(row);
+    cue.metadata.insert(QStringLiteral("omniReviewStatus"),
+        omniReviewStatusName(OmniReviewStatus::Ignored));
+    document_.replaceSubtitle(cue.id, cue);
+    setStatus(QStringLiteral("已忽略 AI 字幕建议。"));
+}
+
 void AppController::startAlignmentRun(bool review)
 {
     if (busy_) {
@@ -603,7 +732,9 @@ void AppController::startAlignmentRun(bool review)
     if (!review && alignmentCompleted_) {
         alignmentCompleted_ = false;
         emit canReviewChanged();
+        emit canOmniReviewChanged();
     }
+    invalidateAlignmentEvidence();
     const QStringList lines = TxtImporter::parse(QString(scriptText_).replace(QStringLiteral("\\n"), QStringLiteral("\n")));
     if (mediaPath_.isEmpty() || lines.isEmpty()) {
         QVariantList values;
@@ -638,7 +769,7 @@ void AppController::startAlignmentRun(bool review)
     }
     reviewRun_ = review;
     IAsrService *asr = asrOverride_;
-    IAiProvider *ai = aiOverride_;
+    Q_UNUSED(aiOverride_);
     setBusy(true);
     setCanExport(false);
     alignmentProgress_ = 0;
@@ -646,11 +777,10 @@ void AppController::startAlignmentRun(bool review)
     alignmentProgressText_ = alignmentState_.message;
     emit alignmentProgressChanged();
 
-    alignmentThread_ = std::thread([this, generation, mediaPath, mediaInfo, lines, settings, asr, ai] {
+    alignmentThread_ = std::thread([this, generation, mediaPath, mediaInfo, lines, settings, asr] {
         QElapsedTimer preflightTimer;
         preflightTimer.start();
         const QString asrProvider = AsrProviderFactory::providerIdFromSettings(settings);
-        const QJsonObject aiProvider = selectedAiProvider(settings);
         const QJsonObject asrVerification = settings
             .value(QStringLiteral("asrVerification")).toObject();
         const bool asrVerified = asr != nullptr
@@ -662,25 +792,9 @@ void AppController::startAlignmentRun(bool review)
                 && asrVerification.value(QStringLiteral("credentialRevision")).toInt()
                     == settings.value(QStringLiteral("asrCredentialRevision")).toInt()
                 && !asrVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
-        const QJsonObject aiVerification = aiProvider.value(QStringLiteral("verification")).toObject();
-        const bool aiVerified = ai != nullptr
-            || (!aiProvider.isEmpty()
-                && aiVerification.value(QStringLiteral("providerId")).toString()
-                    == aiProvider.value(QStringLiteral("id")).toString()
-                && aiVerification.value(QStringLiteral("configRevision")).toInt()
-                    == aiProvider.value(QStringLiteral("configRevision")).toInt()
-                && aiVerification.value(QStringLiteral("credentialRevision")).toInt()
-                    == aiProvider.value(QStringLiteral("credentialRevision")).toInt()
-                && aiVerification.value(QStringLiteral("selectedModel")).toString()
-                    == aiProvider.value(QStringLiteral("selectedModel")).toString()
-                && !aiVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
         const PreflightState preflightState{
             asr != nullptr || context_->credentials.exists(QStringLiteral("SubCue/ASR/dashscope")),
-            ai != nullptr || aiProvider.value(QStringLiteral("authMode")).toString() == QLatin1String("none")
-                || context_->credentials.exists(aiCredentialId(aiProvider.value(QStringLiteral("id")).toString())),
             asrVerified,
-            aiVerified,
-            ai != nullptr,
         };
         const QVector<PreflightIssue> issues = AlignmentPreflight::check(
             mediaPath, mediaInfo, lines, settings, preflightState);
@@ -693,11 +807,12 @@ void AppController::startAlignmentRun(bool review)
                                           {QStringLiteral("detail"), issue.detail},
                                           {QStringLiteral("settingsSection"), issue.settingsSection}});
             }
-            QMetaObject::invokeMethod(this, [this, generation, values] {
-                if (generation != alignmentGeneration_.load()) return;
-                finishAlignment(generation, AppError(ErrorDomain::Validation, 1,
+            QPointer<AppController> self(this);
+            QMetaObject::invokeMethod(this, [self, generation, values = values] {
+                if (!self || generation != self->alignmentGeneration_.load()) return;
+                self->finishAlignment(generation, AppError(ErrorDomain::Validation, 1,
                     QStringLiteral("自动打轴前检查未通过")));
-                if (!alignmentCancel_) emit alignmentPreflightFailed(values);
+                if (!self->alignmentCancel_) emit self->alignmentPreflightFailed(values);
             }, Qt::QueuedConnection);
             return;
         }
@@ -705,32 +820,33 @@ void AppController::startAlignmentRun(bool review)
         const AlignmentCredentials credentials{
             asrProvider == QLatin1String(kAsrProviderDashScope)
                 ? context_->credentials.load(QStringLiteral("SubCue/ASR/dashscope")) : QString(),
-            aiProvider.value(QStringLiteral("authMode")).toString() == QLatin1String("none")
-                ? QString()
-                : context_->credentials.load(aiCredentialId(
-                    aiProvider.value(QStringLiteral("id")).toString())),
+            {},
         };
         qCInfo(subcueAppLog) << "preflight elapsed_ms=" << preflightTimer.elapsed();
-        AlignmentPipeline pipeline(settings, credentials, asr, ai);
+        AlignmentPipeline pipeline(settings, credentials, asr);
         const AlignmentRunResult result = pipeline.run(
             mediaPath,
             lines,
             &alignmentCancel_,
             [this, generation](const AlignmentProgressState &progress) {
+                const QString stage = progress.stage;
+                const QString message = progress.message;
+                const int completed = progress.completed;
+                const int total = progress.total;
                 QPointer<AppController> self(this);
-                QMetaObject::invokeMethod(this, [self, generation, progress] {
+                QMetaObject::invokeMethod(this, [self, generation, stage, message, completed, total] {
                     if (!self || generation != self->alignmentGeneration_.load() || self->alignmentCancel_) {
                         return;
                     }
-                    self->alignmentState_ = progress;
-                    self->alignmentProgressText_ = progress.message;
-                    self->alignmentProgress_ = progress.percent();
+                    self->alignmentState_ = {stage, message, completed, total};
+                    self->alignmentProgressText_ = message;
+                    self->alignmentProgress_ = self->alignmentState_.percent();
                     emit self->alignmentProgressChanged();
-                    self->setStatus(progress.message);
+                    self->setStatus(message);
                 }, Qt::QueuedConnection);
             });
         QPointer<AppController> self(this);
-        QMetaObject::invokeMethod(this, [self, generation, result] {
+        QMetaObject::invokeMethod(this, [self, generation, result = result] {
             if (!self) {
                 return;
             }
@@ -745,6 +861,7 @@ void AppController::cancelAlignment()
         return;
     }
     alignmentCancel_ = true;
+    omniReviewCancel_ = true;
     alignmentProgressText_ = QStringLiteral("正在取消…");
     emit alignmentProgressChanged();
     setStatus(alignmentProgressText_);
@@ -1211,67 +1328,39 @@ void AppController::requestAsrModels(const QString &providerId, const QString &d
     emit asrModelsReady(requestId, asrModels(providerId));
 }
 
-QVariantList AppController::aiProviders() const
+void AppController::testAiConnection(const QString &apiKey)
 {
-    return context_->settings.value(QStringLiteral("aiProviders")).toArray().toVariantList();
-}
-
-QVariantList AppController::aiModels(const QString &providerId) const
-{
-    for (const QJsonValue &value : context_->settings.value(QStringLiteral("aiProviders")).toArray()) {
-        const QJsonObject provider = value.toObject();
-        if (provider.value(QStringLiteral("id")).toString() == providerId) {
-            QVariantList models;
-            for (const QJsonValue &model : provider.value(QStringLiteral("modelIds")).toArray()) {
-                models.append(model.toString());
-            }
-            return models;
-        }
-    }
-    return {};
-}
-
-QString AppController::newProviderId() const
-{
-    return QUuid::createUuid().toString(QUuid::WithoutBraces);
-}
-
-void AppController::testAiConnection(const QVariantMap &values, const QString &apiKey)
-{
-    const QJsonObject provider = QJsonObject::fromVariantMap(values);
-    const QString id = provider.value(QStringLiteral("id")).toString();
-    const QUrl url(provider.value(QStringLiteral("baseUrl")).toString());
-    const QString host = url.host().toLower();
-    const bool localHttp = url.scheme() == QLatin1String("http")
-        && (host == QLatin1String("localhost") || host == QLatin1String("127.0.0.1")
-            || host == QLatin1String("::1"));
-    if (id.isEmpty() || !url.isValid() || url.host().isEmpty()
-        || (url.scheme() != QLatin1String("https") && !localHttp)) {
-        emit aiConnectionTestFinished(id, {
+    const OmniReviewSettings omni = OmniReviewSettingsStore::fromJson(context_->settings);
+    const QString key = OmniReviewSettingsStore::resolveApiKey(apiKey, &context_->credentials);
+    if (key.isEmpty()) {
+        emit aiConnectionTestFinished({
             {QStringLiteral("success"), false},
-            {QStringLiteral("error"), QStringLiteral("Base URL 无效；仅本机地址允许 HTTP")}});
-        return;
-    }
-    const bool bearer = provider.value(QStringLiteral("authMode")).toString(QStringLiteral("bearer"))
-        == QLatin1String("bearer");
-    const bool qwen = provider.value(QStringLiteral("kind")).toString() == QLatin1String("qwen");
-    const QString key = apiKey.trimmed().isEmpty()
-        ? context_->credentials.load(aiCredentialId(id)) : apiKey.trimmed();
-    if (bearer && key.isEmpty()) {
-        emit aiConnectionTestFinished(id, {
-            {QStringLiteral("success"), false},
-            {QStringLiteral("error"), QStringLiteral("请先输入当前 Provider 的 API Key")}});
+            {QStringLiteral("error"), QStringLiteral("请先输入 API Key，或设置 DASHSCOPE_API_KEY")}});
         return;
     }
     if (shuttingDown_) return;
     QPointer<AppController> self(this);
-    backgroundTasks_.start([self, id, key, url, bearer, qwen, cancel = &backgroundCancel_] {
-        OpenAICompatibleProvider service(key, QString(), url, bearer,
-            qwen ? OpenAICompatibleProvider::qwenModelsEndpoint(url) : QUrl{}, nullptr);
-        const QVariantMap result = providerResult(service.testConnection(cancel));
+    IHttpClient *http = context_->aiHttp;
+    backgroundTasks_.start([self, key, omni, http, cancel = &backgroundCancel_] {
+        QwenOmniProvider service(key, omni, http);
+        OmniTestResult tested = service.testConnection(cancel);
+        QVariantMap result;
+        if (std::holds_alternative<AppError>(tested)) {
+            result.insert(QStringLiteral("success"), false);
+            result.insert(QStringLiteral("error"), std::get<AppError>(tested).userMessage());
+        } else {
+            const OmniConnectionTestResult connected = std::get<OmniConnectionTestResult>(tested);
+            result.insert(QStringLiteral("success"), true);
+            result.insert(QStringLiteral("model"), connected.model);
+            result.insert(QStringLiteral("latencyMs"), connected.latencyMs);
+            result.insert(QStringLiteral("promptTokens"), connected.usage.promptTokens);
+            result.insert(QStringLiteral("completionTokens"), connected.usage.completionTokens);
+            result.insert(QStringLiteral("totalTokens"), connected.usage.totalTokens);
+            result.insert(QStringLiteral("verifiedAtUtc"), connected.verifiedAtUtc.toString(Qt::ISODate));
+        }
         if (self && !cancel->load()) {
-            QMetaObject::invokeMethod(self, [self, id, result] {
-                if (self) emit self->aiConnectionTestFinished(id, result);
+            QMetaObject::invokeMethod(self, [self, result] {
+                if (self) emit self->aiConnectionTestFinished(result);
             }, Qt::QueuedConnection);
         }
     });
@@ -1311,24 +1400,29 @@ bool AppController::saveSettings(
     const QString &aiApiKey)
 {
     const QJsonObject originalSettings = context_->settings;
-    const QJsonArray previousProviders = context_->settings.value(QStringLiteral("aiProviders")).toArray();
+    const QStringList droppedKeys = {
+        QStringLiteral("aiAssistEnabled"), QStringLiteral("aiProviderId"), QStringLiteral("aiProviders"),
+        QStringLiteral("omniReviewEnabled"), QStringLiteral("omniReviewProvider"),
+        QStringLiteral("omniReviewModel"), QStringLiteral("omniReviewBaseUrl"),
+        QStringLiteral("omniReviewReasoningEffort"), QStringLiteral("clearAiApiKey"),
+    };
+    const bool clearAiKey = values.value(QStringLiteral("clearAiApiKey")).toBool();
     for (auto iterator = values.cbegin(); iterator != values.cend(); ++iterator) {
+        if (droppedKeys.contains(iterator.key())) continue;
         context_->settings.insert(iterator.key(), QJsonValue::fromVariant(iterator.value()));
     }
     QString error;
     const QString asrCredentialId = QStringLiteral("SubCue/ASR/dashscope");
+    const QString omniCredentialId = QString::fromLatin1(kOmniReviewCredentialId);
     const QString previousAsrSecret = asrApiKey.trimmed().isEmpty()
         ? QString() : context_->credentials.load(asrCredentialId);
-    QString changedAiCredentialId;
-    QString previousAiSecret;
     const auto restoreCredential = [this](const QString &id, const QString &secret) {
         if (id.isEmpty()) return;
         if (secret.isEmpty()) (void)context_->credentials.remove(id);
         else (void)context_->credentials.save(id, secret);
     };
     if (!asrApiKey.trimmed().isEmpty()) {
-        if (!context_->credentials.save(
-                asrCredentialId, asrApiKey.trimmed(), &error)) {
+        if (!context_->credentials.save(asrCredentialId, asrApiKey.trimmed(), &error)) {
             context_->settings = originalSettings;
             setStatus(QStringLiteral("设置保存失败：%1").arg(error));
             return false;
@@ -1336,56 +1430,52 @@ bool AppController::saveSettings(
         context_->settings.insert(QStringLiteral("asrCredentialRevision"),
             context_->settings.value(QStringLiteral("asrCredentialRevision")).toInt() + 1);
     }
-    QJsonObject provider = selectedAiProvider(context_->settings);
-    if (!aiApiKey.trimmed().isEmpty() && !provider.isEmpty()) {
-        changedAiCredentialId = aiCredentialId(provider.value(QStringLiteral("id")).toString());
-        previousAiSecret = context_->credentials.load(changedAiCredentialId);
-        if (!context_->credentials.save(changedAiCredentialId, aiApiKey.trimmed(), &error)) {
-            if (!asrApiKey.trimmed().isEmpty()) {
-                restoreCredential(asrCredentialId, previousAsrSecret);
-            }
+    QString previousOmniSecret = context_->credentials.load(omniCredentialId);
+    bool omniSecretChanged = false;
+    if (clearAiKey) {
+        omniSecretChanged = true;
+        if (!context_->credentials.remove(omniCredentialId, &error)) {
+            if (!asrApiKey.trimmed().isEmpty()) restoreCredential(asrCredentialId, previousAsrSecret);
             context_->settings = originalSettings;
             setStatus(QStringLiteral("设置保存失败：%1").arg(error));
             return false;
         }
-        provider.insert(QStringLiteral("credentialRevision"),
-            provider.value(QStringLiteral("credentialRevision")).toInt() + 1);
-        QJsonArray providers = context_->settings.value(QStringLiteral("aiProviders")).toArray();
-        for (qsizetype index = 0; index < providers.size(); ++index) {
-            if (providers.at(index).toObject().value(QStringLiteral("id")).toString()
-                == provider.value(QStringLiteral("id")).toString()) {
-                providers.replace(index, provider);
-                break;
-            }
+    } else if (!aiApiKey.trimmed().isEmpty()) {
+        omniSecretChanged = true;
+        if (!context_->credentials.save(omniCredentialId, aiApiKey.trimmed(), &error)) {
+            if (!asrApiKey.trimmed().isEmpty()) restoreCredential(asrCredentialId, previousAsrSecret);
+            context_->settings = originalSettings;
+            setStatus(QStringLiteral("设置保存失败：%1").arg(error));
+            return false;
         }
-        context_->settings.insert(QStringLiteral("aiProviders"), providers);
     }
     if (!context_->settingsManager.save(context_->settings, &error)) {
-        if (!asrApiKey.trimmed().isEmpty()) {
-            restoreCredential(asrCredentialId, previousAsrSecret);
-        }
-        restoreCredential(changedAiCredentialId, previousAiSecret);
+        if (!asrApiKey.trimmed().isEmpty()) restoreCredential(asrCredentialId, previousAsrSecret);
+        if (omniSecretChanged) restoreCredential(omniCredentialId, previousOmniSecret);
         context_->settings = originalSettings;
         setStatus(QStringLiteral("设置保存失败：%1").arg(error));
         return false;
     }
-    const QJsonArray currentProviders = context_->settings.value(QStringLiteral("aiProviders")).toArray();
-    for (const QJsonValue &oldValue : previousProviders) {
-        const QString oldId = oldValue.toObject().value(QStringLiteral("id")).toString();
-        bool retained = false;
-        for (const QJsonValue &newValue : currentProviders) {
-            if (newValue.toObject().value(QStringLiteral("id")).toString() == oldId) {
-                retained = true;
-                break;
-            }
-        }
-        if (!retained) {
-            (void)context_->credentials.remove(aiCredentialId(oldId));
-        }
+    QJsonArray leftoverIds = context_->settings.value(QStringLiteral("legacyAiCredentialIds")).toArray();
+    for (const QJsonValue &id : leftoverIds) {
+        (void)context_->credentials.remove(aiCredentialId(id.toString()));
     }
+    context_->settings.insert(QStringLiteral("legacyAiCredentialIds"), QJsonArray{});
+    (void)context_->settingsManager.save(context_->settings);
     emit settingsChanged();
+    emit canOmniReviewChanged();
     setStatus(QStringLiteral("设置已保存。"));
     return true;
+}
+
+QString AppController::aiKeySource(const QString &uiKey, bool ignoreSaved) const
+{
+    const AiKeySource source = OmniReviewSettingsStore::resolveApiKeySource(
+        uiKey, &context_->credentials, ignoreSaved);
+    if (ignoreSaved && source == AiKeySource::Environment) {
+        return QStringLiteral("已清除应用保存的密钥，仍可使用环境变量 DASHSCOPE_API_KEY");
+    }
+    return OmniReviewSettingsStore::resolveApiKeyLabel(uiKey, &context_->credentials, ignoreSaved);
 }
 
 QString AppController::credentialStatus(const QString &credentialId) const
@@ -1413,18 +1503,11 @@ QString AppController::requestCredentialStatus(const QString &credentialId, int 
 
 QString AppController::verificationStatus(const QString &section, const QString &providerId) const
 {
+    Q_UNUSED(providerId);
     QString verifiedAt;
     if (section == QLatin1String("asr")) {
         verifiedAt = context_->settings.value(QStringLiteral("asrVerification")).toObject()
             .value(QStringLiteral("verifiedAtUtc")).toString();
-    } else {
-        for (const QJsonValue &value : context_->settings.value(QStringLiteral("aiProviders")).toArray()) {
-            if (value.toObject().value(QStringLiteral("id")).toString() == providerId) {
-                verifiedAt = value.toObject().value(QStringLiteral("verification")).toObject()
-                    .value(QStringLiteral("verifiedAtUtc")).toString();
-                break;
-            }
-        }
     }
     if (verifiedAt.isEmpty()) {
         return QStringLiteral("未验证");
@@ -1440,11 +1523,18 @@ void AppController::shutdown()
     backgroundCancel_ = true;
     backgroundTasks_.clear();
     alignmentCancel_ = true;
+    omniReviewCancel_ = true;
     stopAlignmentWorker();
+    stopOmniReviewWorker();
     stopWaveformWorker();
     backgroundTasks_.waitForDone();
     stop();
     tickTimer_.stop();
+    playback_.setAudioDevice(nullptr, 0);
+    if (context_) {
+        context_->unregisterAudioClient(&playback_);
+        context_->unbindAudioClients();
+    }
     playback_.close();
     waveform_.reset();
     if (timelineItem_) timelineItem_->setWaveform({});
@@ -1454,6 +1544,36 @@ void AppController::shutdown()
     if (context_) {
         (void)context_->settingsManager.save(context_->settings);
     }
+}
+
+void AppController::releasePlayback()
+{
+    const bool wasPlaying = playing_;
+    playing_ = false;
+    ownsSharedAudio_ = false;
+    playback_.pause();
+    tickTimer_.stop();
+    playback_.setAudioDevice(nullptr, 0);
+    if (context_ && context_->audioDevice) context_->audioDevice->pause();
+    if (wasPlaying) emit playbackChanged();
+}
+
+void AppController::claimPlayback()
+{
+    ownsSharedAudio_ = true;
+    if (!playback_.isOpen() || !context_ || !context_->audioDevice) return;
+    AppError audioError(ErrorDomain::Media, 0, QString());
+    IAudioDevice *device = context_->audioDevice.get();
+    if (!device->isStarted()
+        && !device->start(playback_.outputSampleRate(), playback_.outputChannels(), &audioError)) {
+        context_->replaceAudioDevice(createAudioDevice(AudioDeviceKind::Virtual));
+        device = context_->audioDevice.get();
+        if (device) (void)device->start(playback_.outputSampleRate(), playback_.outputChannels());
+    }
+    if (!device) return;
+    device->setPlaybackRate(playbackRate_);
+    playback_.setAudioDevice(device, kAudioPreRollMs);
+    device->pause();
 }
 
 void AppController::applySubtitles(const QList<Subtitle> &subtitles)
@@ -1483,6 +1603,7 @@ void AppController::setBusy(bool value)
     }
     busy_ = value;
     emit busyChanged();
+    emit canOmniReviewChanged();
 }
 
 void AppController::setCanExport(bool value)
@@ -1599,6 +1720,107 @@ void AppController::stopAlignmentWorker()
     }
 }
 
+void AppController::stopOmniReviewWorker()
+{
+    if (omniReviewThread_.joinable()) {
+        omniReviewThread_.join();
+    }
+}
+
+void AppController::finishOmniSubtitleReview(quint64 generation, SubtitleOmniResult result,
+    quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration)
+{
+    if (generation != omniReviewGeneration_.load()) return;
+    setBusy(false);
+    if (omniReviewCancel_) {
+        setStatus(QStringLiteral("AI 复核已取消。"));
+        return;
+    }
+    if (mediaGeneration != mediaGeneration_ || scriptGeneration != scriptGeneration_
+        || evidenceGeneration != alignmentEvidenceGeneration_) {
+        setStatus(QStringLiteral("媒体或文稿已变化，已丢弃复核结果。"));
+        return;
+    }
+    if (std::holds_alternative<AppError>(result)) {
+        setStatus(std::get<AppError>(result).userMessage());
+        return;
+    }
+    const QVector<SubtitleOmniSuggestion> suggestions =
+        std::get<QVector<SubtitleOmniSuggestion>>(std::move(result));
+    QVector<Subtitle> updated;
+    int changed = 0;
+    for (const Subtitle &cue : document_.subtitles()) {
+        Subtitle copy = cue;
+        for (const SubtitleOmniSuggestion &suggestion : suggestions) {
+            if (suggestion.segmentId != cue.id) continue;
+            AiReviewService::applySubtitleSuggestion(&copy, suggestion);
+            ++changed;
+            break;
+        }
+        if (copy.metadata != cue.metadata) updated.append(copy);
+    }
+    if (!updated.isEmpty()) {
+        commands_.replaceMany(updated, QStringLiteral("字幕内容复核标记"));
+    }
+    emit canOmniReviewChanged();
+    setStatus(QStringLiteral("字幕内容复核完成：%1 条建议待确认。").arg(changed));
+}
+
+void AppController::finishWordMappingReview(quint64 generation, WordMappingOmniResult result,
+    quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration)
+{
+    if (generation != omniReviewGeneration_.load()) return;
+    setBusy(false);
+    if (omniReviewCancel_) {
+        setStatus(QStringLiteral("AI 复核已取消。"));
+        return;
+    }
+    if (mediaGeneration != mediaGeneration_ || scriptGeneration != scriptGeneration_
+        || evidenceGeneration != alignmentEvidenceGeneration_) {
+        setStatus(QStringLiteral("媒体或文稿已变化，已丢弃复核结果。"));
+        return;
+    }
+    if (std::holds_alternative<AppError>(result)) {
+        setStatus(std::get<AppError>(result).userMessage());
+        return;
+    }
+    const QVector<Subtitle> reviewed = std::get<QVector<Subtitle>>(std::move(result));
+    QVector<Subtitle> changed;
+    const QList<Subtitle> current = document_.subtitles();
+    if (reviewed.size() != current.size()) {
+        setStatus(QStringLiteral("时间映射复核结果与当前字幕不一致，已丢弃。"));
+        return;
+    }
+    for (int index = 0; index < reviewed.size(); ++index) {
+        if (reviewed.at(index).id != current.at(index).id) {
+            setStatus(QStringLiteral("时间映射复核结果与当前字幕不一致，已丢弃。"));
+            return;
+        }
+        const Subtitle &before = current.at(index);
+        const Subtitle &after = reviewed.at(index);
+        if (before.start != after.start || before.end != after.end
+            || before.startWordId != after.startWordId || before.endWordId != after.endWordId
+            || before.metadata != after.metadata || before.status != after.status
+            || before.source != after.source) {
+            changed.append(after);
+        }
+    }
+    if (changed.isEmpty()) {
+        setStatus(QStringLiteral("时间映射复核完成：没有可应用的映射。"));
+        return;
+    }
+    commands_.replaceMany(changed, QStringLiteral("复核时间映射"));
+    setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
+        [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
+    setStatus(QStringLiteral("时间映射复核完成：已更新 %1 条。").arg(changed.size()));
+}
+
+void AppController::invalidateAlignmentEvidence()
+{
+    alignmentWords_.clear();
+    ++alignmentEvidenceGeneration_;
+}
+
 void AppController::finishAlignment(quint64 generation, AlignmentRunResult result)
 {
     if (generation != alignmentGeneration_.load()) {
@@ -1641,11 +1863,14 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
     applySubtitles(cues);
     lastOutputPaths_ = output.outputPaths;
     mediaInfo_ = output.mediaInfo;
+    alignmentWords_ = output.words;
+    ++alignmentEvidenceGeneration_;
     setBusy(false);
     setCanExport(!output.result.exportableSubtitles().isEmpty());
     if (!alignmentCompleted_) {
         alignmentCompleted_ = true;
         emit canReviewChanged();
+        emit canOmniReviewChanged();
     }
     setStatus(QStringLiteral("%1完成：已定位 %2 条，低置信 %3 条，音频未检出 %4 条")
                   .arg(completedReview ? QStringLiteral("复核") : QStringLiteral("打轴"))
@@ -1680,7 +1905,7 @@ void AppController::startWaveformWorker(const QString &path)
             path, -1, WaveformGenerator::kDefaultSampleRate, &waveformCancel_, &waveformGeneration_,
             generation);
         QPointer<AppController> self(this);
-        QMetaObject::invokeMethod(this, [self, result, generation] {
+        QMetaObject::invokeMethod(this, [self, generation, result = result] {
             if (!self || generation != self->waveformGeneration_.load()) {
                 return;
             }

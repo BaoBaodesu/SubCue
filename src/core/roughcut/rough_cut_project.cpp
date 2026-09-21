@@ -29,6 +29,16 @@ std::optional<RoughCutDecision> decision(const QString &value)
     return std::nullopt;
 }
 
+RoughCutFailureType failureType(const QString &value)
+{
+    if (value == QLatin1String("RETAKE")) return RoughCutFailureType::Retake;
+    if (value == QLatin1String("INTERRUPTED")) return RoughCutFailureType::Interrupted;
+    if (value == QLatin1String("DUPLICATE")) return RoughCutFailureType::Duplicate;
+    if (value == QLatin1String("WRONG_TAKE")) return RoughCutFailureType::WrongTake;
+    if (value == QLatin1String("FILLER")) return RoughCutFailureType::Filler;
+    return RoughCutFailureType::None;
+}
+
 QString relative(const QString &project, const QString &path)
 {
     return path.isEmpty() ? QString() : QDir::fromNativeSeparators(
@@ -92,13 +102,16 @@ bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject 
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_versions(version INTEGER PRIMARY KEY,created_at TEXT NOT NULL)"))
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_segments(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,id TEXT NOT NULL,text TEXT NOT NULL,start_sample INTEGER NOT NULL,end_sample INTEGER NOT NULL,auto_decision TEXT NOT NULL,user_decision TEXT,rule_score REAL NOT NULL,reason TEXT NOT NULL,evidence_json TEXT NOT NULL,PRIMARY KEY(analysis_version,position))"))
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_segment_details(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,silence_before INTEGER NOT NULL,silence_after INTEGER NOT NULL,vad_confidence REAL NOT NULL,audio_complete INTEGER NOT NULL,boundary_trustworthy INTEGER NOT NULL,script_line INTEGER NOT NULL,take_group INTEGER NOT NULL,best_take INTEGER NOT NULL,PRIMARY KEY(analysis_version,position))"))
+        || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_decision_details(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,script_line_end INTEGER NOT NULL,failure_type TEXT NOT NULL,model_probability REAL NOT NULL,model_version TEXT NOT NULL,decision_source TEXT NOT NULL,PRIMARY KEY(analysis_version,position))"))
+        || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_match_details(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,text_similarity REAL NOT NULL,edit_similarity REAL NOT NULL,continuous_coverage REAL NOT NULL,PRIMARY KEY(analysis_version,position))"))
+        || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS analysis_alignment_details(analysis_version INTEGER NOT NULL,position INTEGER NOT NULL,token_start INTEGER NOT NULL,token_end INTEGER NOT NULL,precise_timing INTEGER NOT NULL,replacement_index INTEGER NOT NULL,PRIMARY KEY(analysis_version,position))"))
         || !query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS auxiliary_results(analysis_version INTEGER NOT NULL,recording_index INTEGER NOT NULL,primary_text TEXT NOT NULL,funasr_text TEXT NOT NULL,whisper_text TEXT NOT NULL,funasr_failed INTEGER NOT NULL,whisper_failed INTEGER NOT NULL,conflict INTEGER NOT NULL,PRIMARY KEY(analysis_version,recording_index))"))
         || !query.exec(QStringLiteral("DELETE FROM metadata"))) {
         holder.db.rollback(); return setError(errorMessage, query.lastError().text());
     }
     query.prepare(QStringLiteral("INSERT INTO metadata VALUES(?,?)"));
     const QList<QPair<QString, QVariant>> values{
-        {QStringLiteral("schemaVersion"), 3}, {QStringLiteral("analysisVersion"), project.analysisVersion},
+        {QStringLiteral("schemaVersion"), 5}, {QStringLiteral("analysisVersion"), project.analysisVersion},
         {QStringLiteral("mediaPath"), relative(path, project.mediaPath)},
         {QStringLiteral("mediaSha256"), project.mediaSha256},
         {QStringLiteral("scriptPath"), relative(path, project.scriptPath)},
@@ -115,7 +128,8 @@ bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject 
     query.prepare(QStringLiteral("DELETE FROM analysis_segments WHERE analysis_version=?"));
     query.bindValue(0, project.analysisVersion);
     if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
-    query.prepare(QStringLiteral("INSERT INTO analysis_segments VALUES(?,?,?,?,?,?,?,?,?,?,?)"));
+    query.prepare(QStringLiteral(
+        "INSERT INTO analysis_segments VALUES(?,?,COALESCE(?,''),COALESCE(?,''),?,?,?,?,?,COALESCE(?,''),COALESCE(?,''))"));
     for (int index = 0; index < project.recording.size(); ++index) {
         const auto &passage = project.recording.at(index);
         const auto &result = project.decisions.at(index);
@@ -128,6 +142,43 @@ bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject 
         query.bindValue(7, result.userDecision ? QVariant(name(*result.userDecision)) : QVariant());
         query.bindValue(8, result.ruleScore); query.bindValue(9, result.reason);
         query.bindValue(10, QString::fromUtf8(QJsonDocument(evidence).toJson(QJsonDocument::Compact)));
+        if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    }
+    query.prepare(QStringLiteral("DELETE FROM analysis_decision_details WHERE analysis_version=?"));
+    query.bindValue(0, project.analysisVersion);
+    if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    query.prepare(QStringLiteral("INSERT INTO analysis_decision_details VALUES(?,?,?,?,?,COALESCE(?,''),COALESCE(?,''))"));
+    for (int index = 0; index < project.recording.size(); ++index) {
+        const auto &passage = project.recording.at(index);
+        const auto &result = project.decisions.at(index);
+        query.bindValue(0, project.analysisVersion); query.bindValue(1, index);
+        query.bindValue(2, passage.scriptLineEndIndex);
+        query.bindValue(3, roughCutFailureName(result.failureType));
+        query.bindValue(4, result.modelProbability); query.bindValue(5, result.modelVersion);
+        query.bindValue(6, result.decisionSource);
+        if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    }
+    query.prepare(QStringLiteral("DELETE FROM analysis_match_details WHERE analysis_version=?"));
+    query.bindValue(0, project.analysisVersion);
+    if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    query.prepare(QStringLiteral("INSERT INTO analysis_match_details VALUES(?,?,?,?,?)"));
+    for (int index = 0; index < project.recording.size(); ++index) {
+        const auto &passage = project.recording.at(index);
+        query.bindValue(0, project.analysisVersion); query.bindValue(1, index);
+        query.bindValue(2, passage.textSimilarity); query.bindValue(3, passage.editSimilarity);
+        query.bindValue(4, passage.continuousCoverage);
+        if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    }
+    query.prepare(QStringLiteral("DELETE FROM analysis_alignment_details WHERE analysis_version=?"));
+    query.bindValue(0, project.analysisVersion);
+    if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
+    query.prepare(QStringLiteral("INSERT INTO analysis_alignment_details VALUES(?,?,?,?,?,?)"));
+    for (int index = 0; index < project.recording.size(); ++index) {
+        const auto &passage = project.recording.at(index);
+        query.bindValue(0, project.analysisVersion); query.bindValue(1, index);
+        query.bindValue(2, passage.scriptTokenStart); query.bindValue(3, passage.scriptTokenEnd);
+        query.bindValue(4, passage.preciseTiming);
+        query.bindValue(5, project.decisions.at(index).replacementRecordingIndex);
         if (!query.exec()) { holder.db.rollback(); return setError(errorMessage, query.lastError().text()); }
     }
     query.prepare(QStringLiteral("DELETE FROM analysis_segment_details WHERE analysis_version=?"));
@@ -170,7 +221,7 @@ std::optional<RoughCutProject> RoughCutProjectSerializer::load(const QString &pa
     QHash<QString, QVariant> values;
     while (query.next()) values.insert(query.value(0).toString(), query.value(1));
     const int schemaVersion = values.value(QStringLiteral("schemaVersion")).toInt();
-    if (schemaVersion < 1 || schemaVersion > 3) {
+    if (schemaVersion < 1 || schemaVersion > 5) {
         setError(errorMessage, QStringLiteral("不支持的粗剪工程版本")); return std::nullopt;
     }
     RoughCutProject project;
@@ -221,13 +272,43 @@ std::optional<RoughCutProject> RoughCutProjectSerializer::load(const QString &pa
             project.decisions[position].bestTake = query.value(8).toBool();
         }
     }
+    if (schemaVersion >= 4 && query.exec(QStringLiteral("SELECT position,script_line_end,failure_type,model_probability,model_version,decision_source FROM analysis_decision_details WHERE analysis_version=%1 ORDER BY position").arg(project.analysisVersion))) {
+        while (query.next()) {
+            const int position = query.value(0).toInt();
+            if (position < 0 || position >= project.recording.size()) continue;
+            project.recording[position].scriptLineEndIndex = query.value(1).toInt();
+            project.decisions[position].failureType = failureType(query.value(2).toString());
+            project.decisions[position].modelProbability = query.value(3).toDouble();
+            project.decisions[position].modelVersion = query.value(4).toString();
+            project.decisions[position].decisionSource = query.value(5).toString();
+        }
+    }
+    if (schemaVersion >= 4 && query.exec(QStringLiteral("SELECT position,text_similarity,edit_similarity,continuous_coverage FROM analysis_match_details WHERE analysis_version=%1 ORDER BY position").arg(project.analysisVersion))) {
+        while (query.next()) {
+            const int position = query.value(0).toInt();
+            if (position < 0 || position >= project.recording.size()) continue;
+            project.recording[position].textSimilarity = query.value(1).toDouble();
+            project.recording[position].editSimilarity = query.value(2).toDouble();
+            project.recording[position].continuousCoverage = query.value(3).toDouble();
+        }
+    }
+    if (schemaVersion >= 5 && query.exec(QStringLiteral("SELECT position,token_start,token_end,precise_timing,replacement_index FROM analysis_alignment_details WHERE analysis_version=%1 ORDER BY position").arg(project.analysisVersion))) {
+        while (query.next()) {
+            const int position = query.value(0).toInt();
+            if (position < 0 || position >= project.recording.size()) continue;
+            project.recording[position].scriptTokenStart = query.value(1).toInt();
+            project.recording[position].scriptTokenEnd = query.value(2).toInt();
+            project.recording[position].preciseTiming = query.value(3).toBool();
+            project.decisions[position].replacementRecordingIndex = query.value(4).toInt();
+        }
+    }
     if (schemaVersion >= 2 && query.exec(QStringLiteral("SELECT recording_index,primary_text,funasr_text,whisper_text,funasr_failed,whisper_failed,conflict FROM auxiliary_results WHERE analysis_version=%1 ORDER BY recording_index").arg(project.analysisVersion))) {
         while (query.next()) project.auxiliaryResults.append({query.value(0).toInt(),
             query.value(1).toString(), query.value(2).toString(), query.value(3).toString(),
             query.value(4).toBool(), query.value(5).toBool(), query.value(6).toBool()});
     }
-    if (project.recording.isEmpty() || project.sampleRate <= 0 || project.channels <= 0
-        || project.sourceSampleCount <= 0 || project.mediaSha256.size() != 32) {
+    if (project.recording.size() != project.decisions.size() || project.sampleRate <= 0
+        || project.channels <= 0 || project.sourceSampleCount <= 0 || project.mediaSha256.size() != 32) {
         setError(errorMessage, QStringLiteral("粗剪工程数据不完整")); return std::nullopt;
     }
     return project;

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import SubCue
 
 ApplicationWindow {
@@ -11,7 +12,8 @@ ApplicationWindow {
     minimumWidth: 1100
     minimumHeight: 700
     visible: true
-    title: appRouter.workspace === "roughcut" ? qsTr("SubCue · 自动粗剪") : qsTr("SubCue · 自动字幕打轴")
+    title: (appRouter.workspace === "roughcut" ? qsTr("SubCue · 自动粗剪") : qsTr("SubCue · 自动字幕打轴"))
+           + (roughCut.modified ? " *" : "")
     flags: Qt.Window | (nativeTheme.expandedClientArea ? (Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint) : 0)
     color: nativeTheme.expandedClientArea ? Theme.titleBar : Theme.background
     topPadding: SafeArea.margins.top
@@ -31,7 +33,78 @@ ApplicationWindow {
 
     Component.onCompleted: nativeTheme.applyDarkTitleBar(appWindow, Theme.titleBar, Theme.text, Theme.border)
     onVisibilityChanged: if (visible) nativeTheme.applyDarkTitleBar(appWindow, Theme.titleBar, Theme.text, Theme.border)
-    onClosing: editor.shutdown()
+    onClosing: function(close) {
+        if (allowClose || !roughCut.modified) {
+            roughCut.shutdown()
+            editor.shutdown()
+            return
+        }
+        close.accepted = false
+        requestDestructiveAction(function() {
+            allowClose = true
+            appWindow.close()
+        })
+    }
+
+    property bool allowClose: false
+    property var pendingUnsavedAction: null
+    function requestDestructiveAction(action) {
+        if (!roughCut.modified) {
+            action()
+            return
+        }
+        pendingUnsavedAction = action
+        unsavedDialog.open()
+    }
+    function runPendingUnsavedAction() {
+        const action = pendingUnsavedAction
+        pendingUnsavedAction = null
+        if (action) action()
+    }
+    Dialog {
+        id: unsavedDialog
+        objectName: "roughCutUnsavedDialog"
+        anchors.centerIn: parent
+        modal: true
+        title: qsTr("未保存的更改")
+        standardButtons: Dialog.Save | Dialog.Discard | Dialog.Cancel
+        Label { text: qsTr("当前粗剪工程有未保存的更改。"); color: Theme.text }
+        onAccepted: {
+            if (roughCut.projectPath !== "") {
+                if (roughCut.saveCurrentProject()) runPendingUnsavedAction()
+                else pendingUnsavedAction = null
+            } else {
+                saveThenContinue = true
+                saveProjectDialog.open()
+            }
+        }
+        onDiscarded: runPendingUnsavedAction()
+        onRejected: pendingUnsavedAction = null
+    }
+    property bool saveThenContinue: false
+    FileDialog {
+        id: saveProjectDialog
+        title: qsTr("保存粗剪工程")
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "subcue-roughcut"
+        nameFilters: [qsTr("SubCue 粗剪工程 (*.subcue-roughcut)")]
+        parentWindow: appWindow
+        onAccepted: {
+            if (!roughCut.saveProject(selectedFile)) {
+                saveThenContinue = false
+                pendingUnsavedAction = null
+                return
+            }
+            if (saveThenContinue) {
+                saveThenContinue = false
+                runPendingUnsavedAction()
+            }
+        }
+        onRejected: {
+            saveThenContinue = false
+            pendingUnsavedAction = null
+        }
+    }
 
     Rectangle {
         id: workspaceBar

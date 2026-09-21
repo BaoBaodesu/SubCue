@@ -38,6 +38,16 @@ QVariant RoughCutResultModel::data(const QModelIndex &index, int role) const
     case TakeGroupRole: return decision.takeGroupId;
     case BestTakeRole: return decision.bestTake;
     case ScoreRole: return decision.ruleScore;
+    case FailureTypeRole: return roughCutFailureName(decision.failureType);
+    case ModelProbabilityRole: return decision.modelProbability;
+    case DecisionSourceRole: return decision.decisionSource;
+    case ScriptRangeRole: return passage.scriptLineIndex < 0 ? QStringLiteral("文案外")
+        : passage.scriptLineEndIndex > passage.scriptLineIndex
+            ? QStringLiteral("文案第 %1–%2 行").arg(passage.scriptLineIndex + 1)
+                .arg(passage.scriptLineEndIndex + 1)
+            : QStringLiteral("文案第 %1 行").arg(passage.scriptLineIndex + 1);
+    case ReplacementRole: return decision.replacementRecordingIndex < 0 ? QString()
+        : QStringLiteral("由片段 %1 替代").arg(decision.replacementRecordingIndex + 1);
     default: return {};
     }
 }
@@ -47,38 +57,77 @@ QHash<int, QByteArray> RoughCutResultModel::roleNames() const
     return {{StatusRole, "status"}, {TextRole, "text"}, {ReasonRole, "reason"},
             {EvidenceRole, "evidence"}, {StartMsRole, "startMs"}, {EndMsRole, "endMs"},
             {UserOverrideRole, "userOverride"}, {TakeGroupRole, "takeGroup"},
-            {BestTakeRole, "bestTake"}, {ScoreRole, "score"}};
+            {BestTakeRole, "bestTake"}, {ScoreRole, "score"},
+            {FailureTypeRole, "failureType"}, {ModelProbabilityRole, "modelProbability"},
+            {DecisionSourceRole, "decisionSource"},
+            {ScriptRangeRole, "scriptRange"}, {ReplacementRole, "replacement"}};
 }
 
 void RoughCutResultModel::reset(QVector<RecognizedPassage> recording,
-                                QVector<RoughCutSegmentDecision> decisions, int sampleRate)
+                                QVector<RoughCutSegmentDecision> decisions, int sampleRate,
+                                QString scriptText)
 {
     beginResetModel();
     recording_ = std::move(recording);
-    decisions_ = std::move(decisions);
+    baseDecisions_ = std::move(decisions);
     sampleRate_ = sampleRate;
+    scriptText_ = std::move(scriptText);
+    refreshProtectedDecisions();
     endResetModel();
 }
 
 bool RoughCutResultModel::setUserDecision(int row, std::optional<RoughCutDecision> decision)
 {
     if (row < 0 || row >= decisions_.size() || decisions_.at(row).userDecision == decision) return false;
-    decisions_[row].userDecision = decision;
-    emit dataChanged(index(row), index(row), {StatusRole, UserOverrideRole});
+    baseDecisions_[row].userDecision = decision;
+    refreshProtectedDecisions();
+    emit dataChanged(index(0), index(recording_.size() - 1),
+        {StatusRole, UserOverrideRole, ReasonRole, EvidenceRole, ReplacementRole});
     return true;
+}
+
+void RoughCutResultModel::replaceBaseDecisions(QVector<RoughCutSegmentDecision> decisions, bool preserveUser)
+{
+    if (decisions.size() != baseDecisions_.size()) return;
+    if (preserveUser) {
+        for (int index = 0; index < decisions.size(); ++index) {
+            if (baseDecisions_.at(index).userDecision)
+                decisions[index].userDecision = baseDecisions_.at(index).userDecision;
+        }
+    }
+    baseDecisions_ = std::move(decisions);
+    refreshProtectedDecisions();
+    if (!recording_.isEmpty()) {
+        emit dataChanged(index(0), index(recording_.size() - 1),
+            {StatusRole, ReasonRole, EvidenceRole, ReplacementRole, DecisionSourceRole,
+             ModelProbabilityRole, UserOverrideRole});
+    }
+}
+
+void RoughCutResultModel::refreshProtectedDecisions()
+{
+    decisions_ = baseDecisions_;
+    RoughCutDecisionEngine::protectCuts(recording_, &decisions_, scriptText_);
 }
 
 void RoughCutResultModel::applyAuxiliaryResult(
     RoughCutAuxiliaryResult result, const QString &providerName)
 {
-    if (result.recordingIndex < 0 || result.recordingIndex >= decisions_.size()) return;
-    RoughCutSegmentDecision &decision = decisions_[result.recordingIndex];
+    if (result.recordingIndex < 0 || result.recordingIndex >= baseDecisions_.size()) return;
+    RoughCutSegmentDecision &decision = baseDecisions_[result.recordingIndex];
+    if (decision.failureType != RoughCutFailureType::None)
+        result.agreementDecision = RoughCutDecision::Cut;
+    else
+        result.agreementDecision = RoughCutDecision::Keep;
     decision.autoDecision = RoughCutAuxiliaryRecognition::reconcile(decision.autoDecision, &result);
+    if (!result.conflict) decision.decisionSource = QStringLiteral("rule+review-asr");
     decision.evidence.append(QStringLiteral("%1：%2").arg(providerName,
         result.funAsrFailed ? QStringLiteral("失败") : result.funAsrText));
     if (result.conflict) decision.reason = QStringLiteral("辅助识别冲突或失败，保留复核");
-    const QModelIndex changed = index(result.recordingIndex);
-    emit dataChanged(changed, changed, {StatusRole, ReasonRole, EvidenceRole});
+    refreshProtectedDecisions();
+    if (!recording_.isEmpty())
+        emit dataChanged(index(0), index(recording_.size() - 1),
+            {StatusRole, ReasonRole, EvidenceRole, ReplacementRole});
 }
 
 } // namespace subcue

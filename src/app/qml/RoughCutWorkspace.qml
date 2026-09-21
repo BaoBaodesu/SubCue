@@ -37,12 +37,16 @@ Item {
         return String(minutes).padStart(2, "0") + ":" + String(seconds).padStart(2, "0")
                + "." + String(millis).padStart(3, "0")
     }
-    function mediaName(path) {
-        return path.split(/[\\/]/).pop()
+    function requestLeave(action) {
+        const win = window.Window.window
+        if (win && typeof win.requestDestructiveAction === "function")
+            win.requestDestructiveAction(action)
+        else
+            action()
     }
-    FileDialog { id: openProjectDialog; title: qsTr("打开粗剪工程"); nameFilters: [qsTr("SubCue 粗剪工程 (*.subcue-roughcut)")]; parentWindow: window.Window.window; onAccepted: roughCut.openProject(selectedFile) }
+    FileDialog { id: openProjectDialog; title: qsTr("打开粗剪工程"); nameFilters: [qsTr("SubCue 粗剪工程 (*.subcue-roughcut)")]; parentWindow: window.Window.window; onAccepted: window.requestLeave(function() { roughCut.openProject(selectedFile) }) }
     FileDialog { id: saveProjectDialog; title: qsTr("保存粗剪工程"); fileMode: FileDialog.SaveFile; defaultSuffix: "subcue-roughcut"; nameFilters: [qsTr("SubCue 粗剪工程 (*.subcue-roughcut)")]; parentWindow: window.Window.window; onAccepted: roughCut.saveProject(selectedFile) }
-    FileDialog { id: mediaDialog; title: qsTr("选择 WAV 音频"); nameFilters: [qsTr("WAV 音频 (*.wav)")]; parentWindow: window.Window.window; onAccepted: roughCut.loadMedia(selectedFile) }
+    FileDialog { id: mediaDialog; title: qsTr("选择 WAV 音频"); nameFilters: [qsTr("WAV 音频 (*.wav)")]; parentWindow: window.Window.window; onAccepted: window.requestLeave(function() { roughCut.loadMedia(selectedFile) }) }
     FileDialog { id: scriptDialog; title: qsTr("选择参考文案"); nameFilters: [qsTr("参考文案 (*.txt *.docx)")]; parentWindow: window.Window.window; onAccepted: roughCut.loadScript(selectedFile) }
     FileDialog { id: exportDialog; title: qsTr("导出 FCP7 XML"); fileMode: FileDialog.SaveFile; defaultSuffix: "xml"; nameFilters: [qsTr("FCP7 XML (*.xml)")]; parentWindow: window.Window.window; onAccepted: roughCut.exportXml(selectedFile) }
     FileDialog { id: exportWavDialog; title: qsTr("导出精简 WAV"); fileMode: FileDialog.SaveFile; defaultSuffix: "wav"; nameFilters: [qsTr("WAV 音频 (*.wav)")]; parentWindow: window.Window.window; onAccepted: roughCut.exportWav(selectedFile) }
@@ -62,7 +66,7 @@ Item {
             const url = drop.urls[0]
             const path = String(url).toLowerCase()
             if (path.endsWith(".wav")) {
-                roughCut.loadMedia(url)
+                window.requestLeave(function() { roughCut.loadMedia(url) })
                 drop.acceptProposedAction()
             } else if (path.endsWith(".txt") || path.endsWith(".docx")) {
                 roughSourceTabs.currentIndex = 1
@@ -98,12 +102,18 @@ Item {
             MenuButton { text: qsTr("设置模型…"); enabled: !roughCut.busy; onClicked: window.openSettings() }
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("打开工程"); enabled: !roughCut.busy; onClicked: openProjectDialog.open() }
-            MenuButton { text: qsTr("保存工程"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: saveProjectDialog.open() }
+            MenuButton { text: qsTr("保存工程"); enabled: roughCut.canSave; onClicked: roughCut.projectPath !== "" ? roughCut.saveCurrentProject() : saveProjectDialog.open() }
             Rectangle { width: 1; height: 24; color: Theme.divider }
             MenuButton { text: qsTr("撤销"); enabled: roughCut.canUndo; onClicked: roughCut.undo() }
             MenuButton { text: qsTr("重做"); enabled: roughCut.canRedo; onClicked: roughCut.redo() }
             Item { Layout.fillWidth: true }
             MenuButton { text: qsTr("开始分析"); enabled: roughCut.mediaPath !== "" && !roughCut.busy; onClicked: roughCut.startAnalysis() }
+            MenuButton {
+                objectName: "roughCutAiReviewButton"
+                text: qsTr("AI 复核")
+                enabled: roughCut.canAiReview
+                onClicked: roughCut.startAiReview()
+            }
             MenuButton { text: qsTr("辅助识别"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: roughCut.startAuxiliaryRecognition() }
             MenuButton { text: qsTr("取消"); enabled: roughCut.busy; onClicked: roughCut.cancelAnalysis() }
             MenuButton { text: qsTr("导出 WAV"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: exportWavDialog.open() }
@@ -250,6 +260,7 @@ Item {
                                     placeholderText: qsTr("输入、粘贴参考文案，或导入 TXT / DOCX")
                                     placeholderTextColor: Theme.placeholder
                                     wrapMode: TextEdit.Wrap
+                                    readOnly: roughCut.busy
                                     background: Rectangle {
                                         color: Theme.input
                                         border.width: 1
@@ -364,6 +375,9 @@ Item {
                             required property string status; required property string text; required property string reason
                             required property var evidence; required property int index; required property bool userOverride
                             required property int takeGroup; required property bool bestTake; required property real score
+                            required property string failureType; required property real modelProbability
+                            required property string scriptRange; required property string replacement
+                            required property string decisionSource
                             width: resultList.width; height: visible ? 132 : 0
                             visible: window.filter === "ALL" || window.filter === status
                             color: ListView.isCurrentItem ? Theme.selection : status === "CUT" ? "#332126" : status === "KEEP" ? "#1D3028" : "#352F22"
@@ -374,16 +388,27 @@ Item {
                                 Label { text: (resultRow.status === "KEEP" ? qsTr("保留") : resultRow.status === "CUT" ? qsTr("剪除") : qsTr("复核"))
                                               + (resultRow.takeGroup >= 0 ? "  TakeGroup " + (resultRow.takeGroup + 1) : "")
                                               + (resultRow.bestTake ? qsTr("  最佳 Take") : "") + "  " + resultRow.text; color: Theme.text; elide: Text.ElideRight; Layout.fillWidth: true }
-                                Label { text: resultRow.reason; color: Theme.secondaryText; elide: Text.ElideRight; Layout.fillWidth: true }
+                                Label {
+                                    text: (resultRow.failureType !== "NONE" ? "[" + resultRow.failureType + "] " : "")
+                                          + resultRow.reason
+                                          + " · " + resultRow.scriptRange
+                                          + (resultRow.replacement !== "" ? " · " + resultRow.replacement : "")
+                                          + (resultRow.modelProbability >= 0 ? qsTr(" · 置信度 ")
+                                             + (resultRow.modelProbability * 100).toFixed(0) + "%" : "")
+                                          + (resultRow.decisionSource ? " · " + resultRow.decisionSource : "")
+                                    color: Theme.secondaryText
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
                                 Label { text: resultRow.evidence && resultRow.evidence.length ? qsTr("证据：") + resultRow.evidence.join("；") : qsTr("证据：无"); color: Theme.muted; elide: Text.ElideRight; Layout.fillWidth: true }
                                 RowLayout {
                                     Layout.fillWidth: true; spacing: 4
-                                    SubButton { text: qsTr("试听"); onClicked: roughCut.audition(resultRow.index) }
+                                    SubButton { text: qsTr("试听"); enabled: !roughCut.busy; onClicked: roughCut.audition(resultRow.index) }
                                     Item { Layout.fillWidth: true }
-                                    SubButton { text: qsTr("保留"); onClicked: roughCut.setDecision(resultRow.index, "KEEP") }
-                                    SubButton { text: qsTr("复核"); onClicked: roughCut.setDecision(resultRow.index, "REVIEW") }
-                                    SubButton { text: qsTr("剪除"); onClicked: roughCut.setDecision(resultRow.index, "CUT") }
-                                    SubToolButton { visible: resultRow.userOverride; text: qsTr("恢复自动判断"); icon.source: "icons/step-back.svg"; onClicked: roughCut.restoreAutoDecision(resultRow.index) }
+                                    SubButton { text: qsTr("保留"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.index, "KEEP") }
+                                    SubButton { text: qsTr("复核"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.index, "REVIEW") }
+                                    SubButton { text: qsTr("剪除"); enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.index, "CUT") }
+                                    SubToolButton { visible: resultRow.userOverride; enabled: !roughCut.busy; text: qsTr("恢复自动判断"); icon.source: "icons/step-back.svg"; onClicked: roughCut.restoreAutoDecision(resultRow.index) }
                                 }
                             }
                             TapHandler {

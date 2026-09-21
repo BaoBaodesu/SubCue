@@ -1,10 +1,13 @@
 #pragma once
 
+#include "alignment/transcript.h"
+#include "asr/asr_service.h"
 #include "playback/playback_engine.h"
 #include "rough_cut_result_model.h"
 #include "roughcut/timeline_engine.h"
 #include "roughcut/auxiliary_recognition.h"
 
+#include <QtCore/QByteArray>
 #include <QtCore/QObject>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QPointer>
@@ -39,6 +42,9 @@ class RoughCutController final : public QObject {
     Q_PROPERTY(qint64 positionMs READ positionMs NOTIFY positionChanged)
     Q_PROPERTY(qint64 durationMs READ durationMs NOTIFY mediaChanged)
     Q_PROPERTY(int resultCount READ resultCount NOTIFY resultsChanged)
+    Q_PROPERTY(bool canAiReview READ canAiReview NOTIFY canAiReviewChanged)
+    Q_PROPERTY(bool modified READ modified NOTIFY modifiedChanged)
+    Q_PROPERTY(bool canSave READ canSave NOTIFY canSaveChanged)
 
 public:
     explicit RoughCutController(ApplicationContext *context, QObject *parent = nullptr);
@@ -57,22 +63,34 @@ public:
     [[nodiscard]] bool timelinePaused() const noexcept { return timelinePaused_; }
     [[nodiscard]] bool continuousAudition() const noexcept { return continuousAudition_; }
     [[nodiscard]] double playbackRate() const noexcept { return playbackRate_; }
-    [[nodiscard]] bool canUndo() const noexcept { return historyIndex_ > 0; }
-    [[nodiscard]] bool canRedo() const noexcept { return historyIndex_ < history_.size(); }
+    [[nodiscard]] bool canUndo() const noexcept { return !busy_ && historyIndex_ > 0; }
+    [[nodiscard]] bool canRedo() const noexcept { return !busy_ && historyIndex_ < history_.size(); }
     [[nodiscard]] qint64 positionMs() const;
     [[nodiscard]] qint64 durationMs() const;
     [[nodiscard]] int resultCount() const { return model_.rowCount(); }
+    [[nodiscard]] bool canAiReview() const { return model_.rowCount() > 0 && !busy_; }
+    [[nodiscard]] bool modified() const noexcept { return modified_; }
+    [[nodiscard]] bool canSave() const noexcept { return !mediaPath_.isEmpty() && !busy_; }
+    [[nodiscard]] int sampleRate() const noexcept { return sampleRate_; }
+    [[nodiscard]] const QVector<RecognizedPassage> &recording() const noexcept { return model_.recording(); }
+    [[nodiscard]] const QVector<RoughCutSegmentDecision> &decisions() const noexcept { return model_.decisions(); }
 
     Q_INVOKABLE void loadMedia(const QUrl &url);
     Q_INVOKABLE void loadScript(const QUrl &url);
     Q_INVOKABLE void setScriptText(const QString &text);
-    Q_INVOKABLE void saveProject(const QUrl &url);
+    Q_INVOKABLE bool saveProject(const QUrl &url);
+    Q_INVOKABLE bool saveCurrentProject();
     Q_INVOKABLE void openProject(const QUrl &url);
+    void setAnalysisOverrides(IAsrService *asr);
+    void releasePlayback();
+    void claimPlayback();
+    Q_INVOKABLE void shutdown();
     Q_INVOKABLE void setSourceWaveformItem(QObject *item);
     Q_INVOKABLE void setTimelineItem(QObject *item);
     Q_INVOKABLE void startAnalysis();
     Q_INVOKABLE void cancelAnalysis();
     Q_INVOKABLE void startAuxiliaryRecognition();
+    Q_INVOKABLE void startAiReview();
     Q_INVOKABLE void togglePlay();
     Q_INVOKABLE void setPlaybackRate(double rate);
     Q_INVOKABLE void seek(qint64 positionMs);
@@ -101,12 +119,17 @@ signals:
     void historyChanged();
     void positionChanged();
     void resultsChanged();
+    void canAiReviewChanged();
+    void modifiedChanged();
+    void canSaveChanged();
 
 private:
     struct Edit final {
         int row = -1;
         std::optional<RoughCutDecision> before;
         std::optional<RoughCutDecision> after;
+        QVector<RoughCutSegmentDecision> beforeBase;
+        QVector<RoughCutSegmentDecision> afterBase;
     };
 
     void stopWorker();
@@ -117,6 +140,12 @@ private:
     void applyEdit(const Edit &edit, bool forward);
     void startTimelineClip(int index);
     void setStatus(QString value);
+    void setBusy(bool value);
+    void bindSharedAudioDevice();
+    void refreshModified();
+    void markSaved();
+    [[nodiscard]] QByteArray projectFingerprint() const;
+    void finishJobWithoutResults(const QString &message);
 
     ApplicationContext *context_ = nullptr;
     RoughCutResultModel model_;
@@ -140,6 +169,7 @@ private:
     QVector<Edit> history_;
     int historyIndex_ = 0;
     int analysisVersion_ = 0;
+    QVector<TranscriptWord> analysisWords_;
     QVector<RoughCutAuxiliaryResult> auxiliaryResults_;
     bool busy_ = false;
     int progressPercent_ = 0;
@@ -152,6 +182,11 @@ private:
     std::thread waveformWorker_;
     QPointer<TimelineSceneItem> sourceWaveformItem_;
     QPointer<TimelineSceneItem> timelineItem_;
+    IAsrService *asrOverride_ = nullptr;
+    QByteArray savedFingerprint_;
+    bool modified_ = false;
+    bool ownsSharedAudio_ = false;
+    bool shuttingDown_ = false;
 };
 
 } // namespace subcue

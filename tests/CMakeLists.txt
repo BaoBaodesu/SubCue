@@ -148,6 +148,21 @@ qt_add_executable(SubCueAiReviewTests cpp/test_ai_review.cpp)
 target_link_libraries(SubCueAiReviewTests PRIVATE SubCue::Core Qt6::Test Qt6::Network)
 subcue_register_test(SubCueAiReviewTests)
 
+qt_add_executable(SubCueOmniProviderTests cpp/test_qwen_omni_provider.cpp)
+target_link_libraries(SubCueOmniProviderTests PRIVATE SubCue::Core Qt6::Test Qt6::Network)
+subcue_register_test(SubCueOmniProviderTests)
+
+qt_add_executable(SubCueAiReviewServiceTests cpp/test_ai_review_service.cpp)
+target_compile_definitions(SubCueAiReviewServiceTests PRIVATE
+    SUBCUE_TEST_MEDIA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/media"
+)
+target_link_libraries(SubCueAiReviewServiceTests PRIVATE SubCue::Core Qt6::Test Qt6::Network)
+subcue_register_test(SubCueAiReviewServiceTests)
+
+qt_add_executable(SubCueSafeCutBoundaryTests cpp/test_safe_cut_boundary.cpp)
+target_link_libraries(SubCueSafeCutBoundaryTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueSafeCutBoundaryTests)
+
 subcue_add_qml_test(SubCueAppControllerTests cpp/test_app_controller.cpp)
 subcue_register_test(SubCueAppControllerTests
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
@@ -155,12 +170,34 @@ subcue_register_test(SubCueAppControllerTests
 )
 
 subcue_add_qml_test(SubCueEditorIntegrationTests cpp/test_editor_integration.cpp)
+target_sources(SubCueEditorIntegrationTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.h
+    ${CMAKE_SOURCE_DIR}/src/app/workspace_router.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/workspace_router.h
+)
 if(WIN32)
     target_link_libraries(SubCueEditorIntegrationTests PRIVATE Psapi)
 endif()
 subcue_register_test(SubCueEditorIntegrationTests
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     TIMEOUT 120
+)
+
+subcue_add_qml_test(SubCueRoughCutControllerTests cpp/test_rough_cut_controller.cpp)
+target_sources(SubCueRoughCutControllerTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.h
+    ${CMAKE_SOURCE_DIR}/src/app/workspace_router.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/workspace_router.h
+)
+subcue_register_test(SubCueRoughCutControllerTests
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    TIMEOUT 60
 )
 
 qt_add_executable(SubCueSourceHygieneTests cpp/test_source_hygiene.cpp)

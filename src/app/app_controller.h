@@ -1,6 +1,7 @@
 #pragma once
 
 #include "alignment/alignment_pipeline.h"
+#include "ai/ai_review_types.h"
 #include "media/media_types.h"
 #include "playback/playback_engine.h"
 #include "subtitle/subtitle_command_manager.h"
@@ -59,6 +60,7 @@ class AppController : public QObject {
     Q_PROPERTY(bool alignmentIndeterminate READ alignmentIndeterminate NOTIFY alignmentProgressChanged)
     Q_PROPERTY(bool canExport READ canExport NOTIFY canExportChanged)
     Q_PROPERTY(bool canReview READ canReview NOTIFY canReviewChanged)
+    Q_PROPERTY(bool canOmniReview READ canOmniReview NOTIFY canOmniReviewChanged)
     Q_PROPERTY(int selectedCue READ selectedCue NOTIFY selectedCueChanged)
     Q_PROPERTY(QString scriptText READ scriptText WRITE setScriptText NOTIFY scriptTextChanged)
     Q_PROPERTY(bool snapEnabled READ snapEnabled NOTIFY snapEnabledChanged)
@@ -113,6 +115,7 @@ public:
     [[nodiscard]] bool alignmentIndeterminate() const { return alignmentState_.indeterminate(); }
     [[nodiscard]] bool canExport() const;
     [[nodiscard]] bool canReview() const { return alignmentCompleted_; }
+    [[nodiscard]] bool canOmniReview() const;
     [[nodiscard]] int selectedCue() const;
     [[nodiscard]] QString scriptText() const;
     void setScriptText(const QString &value);
@@ -149,6 +152,10 @@ public:
     Q_INVOKABLE QString localPath(const QUrl &url) const;
     Q_INVOKABLE void startAlignment();
     Q_INVOKABLE void startReview();
+    Q_INVOKABLE void startOmniSubtitleReview();
+    Q_INVOKABLE void startWordMappingReview();
+    Q_INVOKABLE void acceptOmniSubtitleSuggestion(int row);
+    Q_INVOKABLE void ignoreOmniSubtitleSuggestion(int row);
     Q_INVOKABLE void cancelAlignment();
     Q_INVOKABLE void exportSubtitles(const QString &outputDirectory = {});
     Q_INVOKABLE void createNextScriptCue();
@@ -193,19 +200,19 @@ public:
     Q_INVOKABLE QVariant setting(const QString &key) const;
     Q_INVOKABLE QVariantList asrProviders() const;
     Q_INVOKABLE QVariantList asrModels(const QString &providerId) const;
-    Q_INVOKABLE QVariantList aiProviders() const;
-    Q_INVOKABLE QVariantList aiModels(const QString &providerId) const;
-    Q_INVOKABLE QString newProviderId() const;
-    Q_INVOKABLE void testAiConnection(const QVariantMap &provider, const QString &apiKey = {});
+    Q_INVOKABLE void testAiConnection(const QString &apiKey = {});
     Q_INVOKABLE void testAsrConnection(const QVariantMap &values, const QString &apiKey = {});
     Q_INVOKABLE bool saveSettings(const QVariantMap &values, const QString &asrApiKey = {},
                                   const QString &aiApiKey = {});
+    Q_INVOKABLE QString aiKeySource(const QString &uiKey = {}, bool ignoreSaved = false) const;
     Q_INVOKABLE QString credentialStatus(const QString &credentialId = QStringLiteral("SubCue/ASR/dashscope")) const;
     Q_INVOKABLE void requestAsrModels(const QString &providerId, const QString &directory, int requestId);
     Q_INVOKABLE QString requestCredentialStatus(const QString &credentialId = QStringLiteral("SubCue/ASR/dashscope"), int requestId = 0);
     Q_INVOKABLE QString verificationStatus(const QString &section, const QString &providerId = {}) const;
     Q_INVOKABLE void shutdown();
     Q_INVOKABLE void applySubtitles(const QList<Subtitle> &subtitles);
+    void releasePlayback();
+    void claimPlayback();
 
 signals:
     void asrModelsReady(int requestId, const QVariantList &models);
@@ -219,6 +226,7 @@ signals:
     void alignmentProgressChanged();
     void canExportChanged();
     void canReviewChanged();
+    void canOmniReviewChanged();
     void selectedCueChanged();
     void scriptTextChanged();
     void snapEnabledChanged();
@@ -229,7 +237,7 @@ signals:
     void previewChanged();
     void editCueRequested(int row, const QString &text);
     void alignmentPreflightFailed(const QVariantList &issues);
-    void aiConnectionTestFinished(const QString &providerId, const QVariantMap &result);
+    void aiConnectionTestFinished(const QVariantMap &result);
     void asrConnectionTestFinished(const QVariantMap &result);
     void exportFinished(bool success, const QString &message, const QStringList &paths);
 
@@ -246,8 +254,14 @@ private:
     void stopWaveformWorker();
     void startWaveformWorker(const QString &path);
     void stopAlignmentWorker();
+    void stopOmniReviewWorker();
     void finishAlignment(quint64 generation, AlignmentRunResult result);
+    void finishOmniSubtitleReview(quint64 generation, SubtitleOmniResult result,
+        quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration);
+    void finishWordMappingReview(quint64 generation, WordMappingOmniResult result,
+        quint64 mediaGeneration, quint64 scriptGeneration, quint64 evidenceGeneration);
     void startAlignmentRun(bool review);
+    void invalidateAlignmentEvidence();
     [[nodiscard]] bool isMediaPath(const QString &path) const;
     [[nodiscard]] int activeRow() const;
     [[nodiscard]] bool setTimingMs(int row, qint64 startMs, qint64 endMs);
@@ -274,6 +288,9 @@ private:
     std::thread alignmentThread_;
     std::atomic<bool> alignmentCancel_{false};
     std::atomic<quint64> alignmentGeneration_{0};
+    std::thread omniReviewThread_;
+    std::atomic<bool> omniReviewCancel_{false};
+    std::atomic<quint64> omniReviewGeneration_{0};
     QThreadPool backgroundTasks_;
     std::atomic<bool> backgroundCancel_{false};
     IAsrService *asrOverride_ = nullptr;
@@ -304,6 +321,11 @@ private:
     bool reviewRun_ = false;
     bool hasVideo_ = false;
     bool shuttingDown_ = false;
+    bool ownsSharedAudio_ = true;
+    quint64 mediaGeneration_ = 0;
+    quint64 scriptGeneration_ = 0;
+    quint64 alignmentEvidenceGeneration_ = 0;
+    QVector<TranscriptWord> alignmentWords_;
 };
 
 } // namespace subcue
