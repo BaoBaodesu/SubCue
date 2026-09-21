@@ -6,6 +6,7 @@
 #include "common/logging.h"
 #include "inference/inference_manager.h"
 #include "media/media_probe.h"
+#include "settings/model_locator.h"
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
@@ -84,10 +85,7 @@ QString LocalPythonAsrService::providerId() const { return providerId_; }
 
 bool LocalPythonAsrService::modelReady(const QString &directory)
 {
-    const QDir dir(directory);
-    return QFileInfo::exists(dir.filePath(QStringLiteral("config.json")))
-        && (QFileInfo::exists(dir.filePath(QStringLiteral("model.safetensors")))
-            || QFileInfo::exists(dir.filePath(QStringLiteral("model.pt"))));
+    return ModelLocator::modelReady(directory);
 }
 
 ProviderTestResult LocalPythonAsrService::testConnection(const std::atomic<bool> *cancel)

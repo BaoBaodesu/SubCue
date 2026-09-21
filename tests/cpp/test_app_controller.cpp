@@ -14,6 +14,7 @@
 #include "platform/windows/wasapi_audio_device.h"
 #endif
 
+#include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
@@ -75,6 +76,7 @@ private slots:
     void currentSubtitlePrefersDocumentOrderOnOverlap();
     void timelinePlayheadDoesNotDirtyStaticGeometry();
     void appControllerSettingsRoundTrip();
+    void settingsRoundTripIncludesModelsRoot();
     void unifiedAiKeySaveClearAndRollback();
     void saveSettingsDoesNotSendAiHttp();
     void appControllerPreflightReportsAllMissingItems();
@@ -249,6 +251,11 @@ void AppControllerTests::appControllerLoadsMediaAndScript()
 
 void AppControllerTests::appControllerImportsDocxFixture()
 {
+    const QDir appDir(QCoreApplication::applicationDirPath());
+    if (!QFileInfo::exists(appDir.filePath(QStringLiteral("SubCueInference.exe")))
+        && !QFileInfo::exists(appDir.filePath(QStringLiteral("inference/SubCueInference.exe")))) {
+        QSKIP("CPU builds omit the inference worker used to parse DOCX scripts");
+    }
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
     auto context = makeContext(dir);
@@ -444,6 +451,19 @@ void AppControllerTests::appControllerSettingsRoundTrip()
     QCOMPARE(controller.setting(QStringLiteral("region")).toString(), QStringLiteral("singapore"));
     QCOMPARE(controller.credentialStatus(), QStringLiteral("已安全保存"));
     QVERIFY(!controller.statusText().contains(QStringLiteral("test-key-not-for-log")));
+}
+
+void AppControllerTests::settingsRoundTripIncludesModelsRoot()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    const QString root = dir.filePath(QStringLiteral("models-root"));
+    QVERIFY(controller.saveSettings({{QStringLiteral("modelsRoot"), root}}));
+    QCOMPARE(controller.setting(QStringLiteral("modelsRoot")).toString(), root);
+    QCOMPARE(controller.setting(QStringLiteral("qwen3AsrModelsDirectory")).toString(),
+        QDir(root).filePath(QStringLiteral("qwen3-asr-0.6b")));
 }
 
 void AppControllerTests::unifiedAiKeySaveClearAndRollback()

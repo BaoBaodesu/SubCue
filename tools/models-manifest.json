@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "qwen3-asr-0.6b",
+      "repo": "Qwen/Qwen3-ASR-0.6B",
+      "folder": "qwen3-asr-0.6b",
+      "files": [
+        {
+          "path": "model.safetensors",
+          "sha256": "79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b8353840323ea"
+        },
+        {
+          "path": "config.json",
+          "sha256": "76d3ae4601ce939830b2517f4a6cadb86cc51316c3900af6b020b051c21a478c"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "sha256": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-forced-aligner-0.6b",
+      "repo": "Qwen/Qwen3-ForcedAligner-0.6B",
+      "folder": "qwen3-forced-aligner-0.6b",
+      "files": [
+        {
+          "path": "model.safetensors",
+          "sha256": "47831d0e82f96b20e9034dba01a075ee06436654719f6a68289e49f1b65ce0e7"
+        },
+        {
+          "path": "config.json",
+          "sha256": "d616c65d46c4b90bdc651b0a0963ea932732241140f337f9bb6b0335a9c8ef09"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "sha256": "3ab80063f8511deb9566e6ad438d17b7a6277fcffd52d92854112f19d36bd81c"
+        }
+      ]
+    },
+    {
+      "id": "fun-asr-nano-2512",
+      "repo": "FunAudioLLM/Fun-ASR-Nano-2512",
+      "folder": "fun-asr-nano-2512",
+      "files": [
+        {
+          "path": "configuration.json",
+          "sha256": "b64a3a55d35bcbe2cf4d31f2d3ef25a423d3ba2ebff203298c27fa055f3c7612"
+        },
+        {
+          "path": "config.yaml",
+          "sha256": "daed38ea6484f5650fb32cbd9069b9aa13880acaf2bcb1f0bf4be2712837917c"
+        }
+      ]
+    }
+  ]
+}

@@ -18,6 +18,7 @@
 #include <QtCore/QPointer>
 #include <QtCore/QThreadPool>
 #include <QtCore/QTimer>
+#include <QtCore/QStringList>
 #include <QtCore/QUrl>
 #include <QtCore/QVariant>
 #include <QtGui/QImage>
@@ -212,6 +213,9 @@ public:
     Q_INVOKABLE void requestAsrModels(const QString &providerId, const QString &directory, int requestId);
     Q_INVOKABLE QString requestCredentialStatus(const QString &credentialId = QStringLiteral("SubCue/ASR/dashscope"), int requestId = 0);
     Q_INVOKABLE QString verificationStatus(const QString &section, const QString &providerId = {}) const;
+    Q_INVOKABLE QVariantList modelStatus(const QString &modelsRoot = {}) const;
+    Q_INVOKABLE void requestStorageTargets();
+    Q_INVOKABLE void cleanupStorage(const QStringList &ids);
     Q_INVOKABLE void shutdown();
     Q_INVOKABLE void applySubtitles(const QList<Subtitle> &subtitles);
     void releasePlayback();
@@ -243,6 +247,8 @@ signals:
     void aiConnectionTestFinished(const QVariantMap &result);
     void asrConnectionTestFinished(const QVariantMap &result);
     void exportFinished(bool success, const QString &message, const QStringList &paths);
+    void storageTargetsReady(const QVariantList &targets);
+    void storageCleanupFinished(const QVariantMap &result);
 
 private:
     void rememberProjectFile(const QString &path, const QString &type, qint64 durationMs = 0);

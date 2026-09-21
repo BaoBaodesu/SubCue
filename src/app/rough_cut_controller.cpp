@@ -4,6 +4,7 @@
 #include "ai/ai_review_settings.h"
 #include "ai/ai_types.h"
 #include "application_context.h"
+#include "asr/asr_provider_catalog.h"
 #include "asr/asr_provider_factory.h"
 #include "asr/asr_types.h"
 #include "asr/audio_chunk_extractor.h"
@@ -52,8 +53,9 @@ QString transcriptText(const Transcript &transcript, qint64 startMs, qint64 endM
 QString asrProviderName(const QJsonObject &settings)
 {
     const QString provider = AsrProviderFactory::providerIdFromSettings(settings);
-    if (provider == QLatin1String("qwen3")) return QStringLiteral("Qwen3-ASR");
-    if (provider == QLatin1String("funasr")) return QStringLiteral("Fun-ASR");
+    if (provider == QLatin1String("qwen3") || provider == QLatin1String("funasr")) {
+        return AsrProviderCatalog::displayName(provider);
+    }
     return settings.value(QStringLiteral("asrModel")).toString(QStringLiteral("云端 ASR"));
 }
 

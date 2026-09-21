@@ -58,12 +58,13 @@ AI 辅助支持通用 OpenAI-compatible Provider，也可在设置中直接“�
 setx Qt6_ROOT "C:\Qt\6.10.3\msvc2022_64"
 ```
 
-日常迭代用 `tools\build-windows.bat`（默认 Debug）或 `tools\build-windows.bat release`。脚本会进入 MSVC x64 开发者环境、按需配置、增量构建并跑 CTest；**已有构建目录时不会重新配置**，只有加 `fresh` 参数才清空重建：
+日常迭代用 `tools\build-windows.bat`（默认 CUDA Release）。脚本会进入 MSVC x64 开发者环境、按需配置、增量构建并跑 CTest；**已有构建目录时不会重新配置**，只有加 `fresh` 参数才清空重建：
 
 ```powershell
-tools\build-windows.bat            # 增量构建 Debug + 全量 CTest
-tools\build-windows.bat release    # 增量构建 Release + 全量 CTest
-tools\build-windows.bat release fresh   # 工具链变更或缓存损坏时才需要
+tools\build-windows.bat            # 默认 CUDA Release + 全量 CTest
+tools\build-windows.bat cuda
+tools\build-windows.bat release    # 仅无 CUDA 或不用本地推理时
+tools\build-windows.bat release fresh
 ```
 
 手动等价命令（需自行设好 `Qt6_ROOT` 并进入 MSVC 环境）：
@@ -74,7 +75,7 @@ cmake --build --preset windows-debug
 ctest --preset windows-debug --output-on-failure
 ```
 
-Debug 启动用根目录下的 `run-debug.bat`，Release 启动用 `tools\run-release.bat`；二者会补全 Qt、FFmpeg，以及 Debug 版额外需要的调试 CRT 与 SDK ucrt（这些都不在默认 `PATH` 上），可透传参数如 `tools\run-release.bat --smoke-test`。
+Debug 启动用根目录 `run-debug.bat`；日常请用根目录 `SubCue.bat`（自动定位 `out\build\windows-release-cuda\SubCue.exe` 并补齐 PATH，重建后无需更新）。也可使用 `tools\run-cuda.bat` / `tools\run-release.bat`。二者会补全 Qt、FFmpeg 与 CUDA，以及 Debug 版额外需要的调试 CRT 与 SDK ucrt，可透传参数如 `SubCue.bat --smoke-test`。
 
 要交互式调试（断点、调用栈、QML 调试）请用 Visual Studio 打开本文件夹并选择 `windows-debug` 预设，或用 Qt Creator，它们会自动配好上述运行环境。
 
@@ -83,9 +84,10 @@ Debug 启动用根目录下的 `run-debug.bat`，Release 启动用 `tools\run-re
 本地 Qwen3 推理使用独立 Python 进程中的 PyTorch CUDA 运行时，需要兼容的 NVIDIA 显卡：
 
 ```powershell
-tools\build-windows.bat cuda        # 配置并构建 out/build/windows-release-cuda
-tools\package-windows.bat cuda      # 便携包 → dist/windows-x64-cuda（随带 CUDA 运行时 DLL）
-tools\run-cuda.bat                  # 启动 CUDA 版 Release
+tools\build-windows.bat            # 配置并构建 out/build/windows-release-cuda
+tools\package-windows.bat          # 便携包 → dist/windows-x64-cuda
+SubCue.bat                         # 启动 CUDA 版 Release
+tools\setup-models.ps1             # 按清单下载并校验外置模型
 ```
 
 本地识别的设备选择由 Python 推理运行时决定；CUDA 便携包同时保留 CUDA Toolkit 运行时 DLL。
@@ -111,8 +113,9 @@ ctest --preset windows-debug -E SubCueEditorIntegrationTests
 ```
 SubCue/
 ├── CMakeLists.txt              # C++20 / Qt Quick / FFmpeg
-├── CMakePresets.json           # windows-debug / windows-release
-├── cmake/PackageWindows.cmake  # 便携包：Qt + FFmpeg + VC Runtime
+├── CMakePresets.json           # windows-debug / windows-release / windows-release-cuda
+├── SubCue.bat                  # 根目录启动器，动态定位当前 CUDA 构建
+├── cmake/PackageWindows.cmake  # 便携包：Qt + FFmpeg + 可选 CUDA 推理运行时
 ├── docs/                       # 架构与测试清单
 ├── licenses/                   # 随包第三方声明
 ├── src/
@@ -126,10 +129,11 @@ SubCue/
 │   └── media/                  # 小型 CFR/VFR/音频/损坏样本
 ├── run-debug.bat               # 补齐运行时依赖后启动 Debug 版
 └── tools/
-    ├── build-windows.bat       # MSVC 环境中的增量 CMake/CTest
-    ├── run-release.bat         # 补齐运行时依赖后启动 Release 版
-    ├── run-cuda.bat            # 补齐运行时依赖后启动 CUDA 版 Release
-    ├── package-windows.bat     # Release 便携包 → dist/windows-x64
+    ├── build-windows.bat       # 默认 CUDA 的增量 CMake/CTest
+    ├── setup-models.ps1        # 外置模型下载与 SHA-256 校验
+    ├── models-manifest.json    # 模型文件清单
+    ├── clean-workspace.ps1     # 预览优先清理，默认保留 CUDA 构建
+    ├── package-windows.bat     # CUDA 便携包 → dist/windows-x64-cuda
     ├── generate_alignment_golden.py
     ├── requirements-golden.txt # 仅 golden 再生需要 rapidfuzz
     └── python_ref/             # 对齐算法对照实现，不是编辑器运行路径

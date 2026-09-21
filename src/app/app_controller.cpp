@@ -9,13 +9,15 @@
 #include "ai/ai_types.h"
 #include "ai/qwen_omni_provider.h"
 #include "alignment/alignment_preflight.h"
+#include "asr/asr_provider_catalog.h"
 #include "asr/asr_provider_factory.h"
 #include "asr/asr_types.h"
 #include "asr/http_client.h"
-#include "asr/local_python_asr_service.h"
 #include "common/logging.h"
 #include "media/media_probe.h"
 #include "roughcut/script_document.h"
+#include "settings/model_locator.h"
+#include "settings/storage_cleaner.h"
 #include "subtitle/srt_parser.h"
 #include "subtitle/txt_importer.h"
 #include "waveform/waveform_generator.h"
@@ -41,6 +43,10 @@
 #include <iterator>
 #include <utility>
 #include <variant>
+
+#ifndef SUBCUE_PROJECT_ROOT
+#define SUBCUE_PROJECT_ROOT ""
+#endif
 
 namespace subcue {
 namespace {
@@ -1308,29 +1314,28 @@ QVariant AppController::setting(const QString &key) const
 
 QVariantList AppController::asrProviders() const
 {
-    return {
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("dashscope")},
-                    {QStringLiteral("name"), QStringLiteral("云端语音识别")}},
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("qwen3")},
-                    {QStringLiteral("name"), QStringLiteral("本地 Qwen3-ASR 0.6B")}},
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("funasr")},
-                    {QStringLiteral("name"), QStringLiteral("本地 Fun-ASR Nano")}},
-    };
+    QVariantList result;
+    for (const AsrProviderInfo &info : AsrProviderCatalog::providers()) {
+        result.append(QVariantMap{
+            {QStringLiteral("id"), info.id},
+            {QStringLiteral("name"), info.name},
+        });
+    }
+    return result;
 }
 
 QVariantList AppController::asrModels(const QString &providerId) const
 {
     QVariantList result;
-    if (providerId == QLatin1String("qwen3") || providerId == QLatin1String("funasr")) {
-        const QString key = providerId == QLatin1String("qwen3")
-            ? QStringLiteral("qwen3AsrModelsDirectory") : QStringLiteral("funAsrModelsDirectory");
-        const QString fallback = QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(
-            providerId == QLatin1String("qwen3") ? QStringLiteral("qwen3-asr-0.6b")
-                                                   : QStringLiteral("fun-asr-nano-2512"));
-        const QString directory = context_->settings.value(key).toString(fallback);
-        result.append(QVariantMap{{QStringLiteral("id"), providerId == QLatin1String("qwen3") ? QStringLiteral("Qwen3-ASR-0.6B") : QStringLiteral("Fun-ASR-Nano-2512")},
-            {QStringLiteral("name"), providerId == QLatin1String("qwen3") ? QStringLiteral("Qwen3-ASR-0.6B") : QStringLiteral("Fun-ASR-Nano-2512")},
-            {QStringLiteral("ready"), LocalPythonAsrService::modelReady(directory)}});
+    const AsrProviderInfo info = AsrProviderCatalog::byId(providerId);
+    if (info.local) {
+        const QString directory = ModelLocator::directoryFor(info.modelKind, context_->settings);
+        result.append(QVariantMap{
+            {QStringLiteral("id"), info.modelId},
+            {QStringLiteral("name"), info.modelName},
+            {QStringLiteral("ready"), ModelLocator::modelReady(directory)},
+            {QStringLiteral("directory"), directory},
+        });
         return result;
     }
     result.append(QVariantMap{
@@ -1486,6 +1491,7 @@ bool AppController::saveSettings(
     }
     context_->settings.insert(QStringLiteral("legacyAiCredentialIds"), QJsonArray{});
     (void)context_->settingsManager.save(context_->settings);
+    context_->settings = context_->settingsManager.load();
     emit settingsChanged();
     emit canOmniReviewChanged();
     setStatus(QStringLiteral("设置已保存。"));
@@ -1538,6 +1544,90 @@ QString AppController::verificationStatus(const QString &section, const QString 
     }
     const QDateTime date = QDateTime::fromString(verifiedAt, Qt::ISODate).toLocalTime();
     return QStringLiteral("已验证 · %1").arg(date.toString(QStringLiteral("yyyy-MM-dd HH:mm")));
+}
+
+QVariantList AppController::modelStatus(const QString &modelsRoot) const
+{
+    QVariantList result;
+    QJsonObject settings = context_->settings;
+    const QString trimmedRoot = modelsRoot.trimmed();
+    if (!trimmedRoot.isEmpty()) {
+        settings.insert(QStringLiteral("modelsRoot"), trimmedRoot);
+    }
+    const auto append = [&](ModelKind kind, const QString &id, const QString &name) {
+        const QString directory = ModelLocator::directoryFor(kind, settings);
+        result.append(QVariantMap{
+            {QStringLiteral("id"), id},
+            {QStringLiteral("name"), name},
+            {QStringLiteral("directory"), directory},
+            {QStringLiteral("ready"), ModelLocator::modelReady(directory)},
+        });
+    };
+    append(ModelKind::Qwen3Asr, QStringLiteral("qwen3-asr-0.6b"), QStringLiteral("Qwen3-ASR 0.6B"));
+    append(ModelKind::Qwen3ForcedAligner, QStringLiteral("qwen3-forced-aligner-0.6b"),
+        QStringLiteral("Qwen3 Forced Aligner 0.6B"));
+    append(ModelKind::FunAsrNano, QStringLiteral("fun-asr-nano-2512"), QStringLiteral("Fun-ASR Nano"));
+    return result;
+}
+
+void AppController::requestStorageTargets()
+{
+    if (shuttingDown_) return;
+    QPointer<AppController> self(this);
+    const QJsonObject settings = context_->settings;
+    backgroundTasks_.start([self, settings, cancel = &backgroundCancel_] {
+        if (!self || cancel->load(std::memory_order_acquire)) return;
+        StorageCleaner cleaner(
+            QString::fromUtf8(SUBCUE_PROJECT_ROOT),
+            ModelLocator::root(settings),
+            QCoreApplication::applicationDirPath());
+        const QVector<StorageTarget> scanned = cleaner.scan();
+        QVariantList targets;
+        targets.reserve(scanned.size());
+        for (const StorageTarget &target : scanned) {
+            targets.append(QVariantMap{
+                {QStringLiteral("id"), target.id},
+                {QStringLiteral("group"), target.group},
+                {QStringLiteral("label"), target.label},
+                {QStringLiteral("path"), target.path},
+                {QStringLiteral("bytes"), target.bytes},
+            });
+        }
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, targets] {
+            if (!self) return;
+            emit self->storageTargetsReady(targets);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void AppController::cleanupStorage(const QStringList &ids)
+{
+    if (shuttingDown_) return;
+    QPointer<AppController> self(this);
+    const QJsonObject settings = context_->settings;
+    backgroundTasks_.start([self, settings, ids, cancel = &backgroundCancel_] {
+        StorageCleanupResult result;
+        result.ok = false;
+        result.error = QStringLiteral("任务已取消");
+        if (self && !cancel->load(std::memory_order_acquire)) {
+            StorageCleaner cleaner(
+                QString::fromUtf8(SUBCUE_PROJECT_ROOT),
+                ModelLocator::root(settings),
+                QCoreApplication::applicationDirPath());
+            result = cleaner.remove(ids, cancel);
+        }
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, result] {
+            if (!self) return;
+            emit self->storageCleanupFinished(QVariantMap{
+                {QStringLiteral("success"), result.ok},
+                {QStringLiteral("bytesRemoved"), result.bytesRemoved},
+                {QStringLiteral("error"), result.error},
+                {QStringLiteral("removed"), result.removed},
+            });
+        }, Qt::QueuedConnection);
+    });
 }
 
 void AppController::shutdown()

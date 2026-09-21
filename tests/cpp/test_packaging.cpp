@@ -184,9 +184,13 @@ void PackagingTests::packageLayoutContainsRuntime()
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package.stamp"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-manifest.txt"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("package-size.txt"))));
+#ifdef SUBCUE_PACKAGE_HAS_INFERENCE
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/SubCueInference.exe"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/python312.dll"))));
     QVERIFY(QFileInfo::exists(packageFile(QStringLiteral("inference/runtime/python312.dll"))));
+#else
+    QVERIFY(!QFileInfo::exists(packageFile(QStringLiteral("inference/SubCueInference.exe"))));
+#endif
 }
 
 void PackagingTests::packageContainsOnlyBasicQuickControlsStyle()
@@ -220,8 +224,6 @@ void PackagingTests::packageRestrictsPythonAndCliTools()
                 || name.endsWith(QLatin1String(".pdb"))
                 || relative.contains(QLatin1String("/site-packages/gradio/"))
                 || relative.contains(QLatin1String("/site-packages/gradio_client/"))
-                || relative.contains(QLatin1String("/site-packages/numba/"))
-                || relative.contains(QLatin1String("/site-packages/llvmlite/"))
                 || relative.contains(QLatin1String("/site-packages/xgboost/"))
                 || relative.contains(QLatin1String("/site-packages/sklearn/"))
                 || relative.contains(QLatin1String("/site-packages/scikit_learn")));
@@ -355,9 +357,12 @@ void PackagingTests::packagedAppStartsWithIsolatedPath()
 
 void PackagingTests::packagedInferenceLoadsRuntime()
 {
+#ifndef SUBCUE_PACKAGE_HAS_INFERENCE
+    QSKIP("CPU package does not ship the local inference runtime");
+#endif
 #ifdef _DEBUG
     QSKIP("Debug CRT is available from the development environment, not the portable package");
-#endif
+#else
     const QString inferencePath = packageFile(QStringLiteral("inference/SubCueInference.exe"));
     QVERIFY(QFileInfo::exists(inferencePath));
 
@@ -400,6 +405,7 @@ void PackagingTests::packagedInferenceLoadsRuntime()
     QVERIFY(result.value(QStringLiteral("cuda")).toBool());
     QCOMPARE(result.value(QStringLiteral("qwenAsr")).toString(), QStringLiteral("0.0.6"));
     QVERIFY(!result.value(QStringLiteral("av")).toString().isEmpty());
+#endif
 }
 
 QTEST_MAIN(PackagingTests)

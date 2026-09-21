@@ -601,6 +601,7 @@ ApplicationWindow {
                         RowLayout {
                             anchors.fill: parent
                             anchors.leftMargin: 8
+                            anchors.rightMargin: Theme.scrollBarSize
                             Label { text: "#"; color: Theme.muted; Layout.preferredWidth: 28 }
                             Label { text: qsTr("文本"); color: Theme.muted; Layout.fillWidth: true }
                             Label { text: qsTr("时间 / 状态"); color: Theme.muted; Layout.preferredWidth: 132 }
@@ -648,7 +649,7 @@ ApplicationWindow {
                             RowLayout {
                                 anchors.fill: parent
                                 anchors.leftMargin: 8
-                                anchors.rightMargin: 6
+                                anchors.rightMargin: 6 + Theme.scrollBarSize
                                 spacing: 6
                                 Label { text: sourceIndex; color: timed ? Theme.listText : Theme.muted; Layout.preferredWidth: 28 }
                                 Label {
@@ -704,7 +705,7 @@ ApplicationWindow {
                                 id: rowMouse
                                 objectName: "subtitleRowMouse"
                                 anchors.fill: parent
-                                anchors.rightMargin: 62
+                                anchors.rightMargin: 62 + Theme.scrollBarSize
                                 hoverEnabled: true
                                 property string cueId: ""
                                 property point pressPoint

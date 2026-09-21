@@ -15,7 +15,8 @@
         "CMAKE_PREFIX_PATH": "$env{Qt6_ROOT}",
         "CMAKE_CXX_COMPILER": "cl.exe",
         "CMAKE_CXX_FLAGS": "/utf-8 /W4 /permissive-",
-        "BUILD_TESTING": "ON"
+        "BUILD_TESTING": "ON",
+        "SUBCUE_LOCAL_INFERENCE": "OFF"
       },
       "environment": {
         "Qt6_ROOT": "C:/Qt/6.10.3/msvc2022_64",
@@ -47,7 +48,8 @@
       "name": "windows-release-cuda",
       "inherits": "windows-release",
       "cacheVariables": {
-        "SUBCUE_ENABLE_CUDA": "ON"
+        "SUBCUE_ENABLE_CUDA": "ON",
+        "SUBCUE_LOCAL_INFERENCE": "ON"
       },
       "environment": {
         "PATH": "$env{CUDA_PATH}/bin/x64;$env{CUDA_PATH}/bin;$env{Qt6_ROOT}/bin;${sourceDir}/vcpkg_installed/x64-windows/bin;$penv{PATH}"

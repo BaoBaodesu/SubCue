@@ -1,15 +1,19 @@
 @echo off
 rem Assemble a portable Windows x64 folder with Qt, FFmpeg and VC Runtime.
-rem Usage: tools\package-windows.bat [debug|release|cuda]   (default: release)
+rem Usage: tools\package-windows.bat [cuda|debug|release]   (default: cuda)
 rem   cuda  packages the CUDA-enabled Release build together with the CUDA runtime DLLs
 rem Does not set environment variables named CL, LIB or LINK.
 setlocal
 
-set "BUILD_PRESET=windows-release"
-set "DIST_DIR=%~dp0..\dist\windows-x64"
+set "BUILD_PRESET=windows-release-cuda"
+set "DIST_DIR=%~dp0..\dist\windows-x64-cuda"
 if /I "%1"=="debug" (
     set "BUILD_PRESET=windows-debug"
     set "DIST_DIR=%~dp0..\dist\windows-x64-debug"
+)
+if /I "%1"=="release" (
+    set "BUILD_PRESET=windows-release"
+    set "DIST_DIR=%~dp0..\dist\windows-x64"
 )
 if /I "%1"=="cuda" (
     set "BUILD_PRESET=windows-release-cuda"

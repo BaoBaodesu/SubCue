@@ -430,7 +430,7 @@ Item {
                             ColumnLayout {
                                 id: resultColumn
                                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
-                                anchors.margins: 8
+                                anchors.leftMargin: 8; anchors.rightMargin: 8 + Theme.scrollBarSize; anchors.topMargin: 8
                                 spacing: 4
                                 Label {
                                     text: resultRow.statusLabel

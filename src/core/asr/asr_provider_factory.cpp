@@ -1,10 +1,11 @@
 #include "asr/asr_provider_factory.h"
 
+#include "asr/asr_provider_catalog.h"
 #include "asr/dashscope_asr_service.h"
 #include "asr/local_python_asr_service.h"
+#include "settings/model_locator.h"
 #include "settings/settings_manager.h"
 
-#include <QtCore/QDir>
 #include <QtCore/QFileInfo>
 namespace subcue {
 
@@ -26,9 +27,7 @@ std::unique_ptr<IAsrService> AsrProviderFactory::create(
 {
     const QString provider = providerIdFromSettings(settings);
     if (provider == QLatin1String("qwen3") || provider == QLatin1String("funasr")) {
-        const QString key = provider == QLatin1String("qwen3") ? QStringLiteral("qwen3AsrModelsDirectory") : QStringLiteral("funAsrModelsDirectory");
-        const QString fallback = QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(
-            provider == QLatin1String("qwen3") ? QStringLiteral("qwen3-asr-0.6b") : QStringLiteral("fun-asr-nano-2512"));
+        const AsrProviderInfo info = AsrProviderCatalog::byId(provider);
         QString python = settings.value(QStringLiteral("localAsrPython")).toString();
         const QString projectPython = QString::fromUtf8(SUBCUE_PROJECT_INFERENCE_PYTHON);
         if ((python.isEmpty() || python == QLatin1String("python"))
@@ -36,11 +35,9 @@ std::unique_ptr<IAsrService> AsrProviderFactory::create(
             python = projectPython;
         }
         return std::make_unique<LocalPythonAsrService>(provider,
-            settings.value(key).toString(fallback),
+            ModelLocator::directoryFor(info.modelKind, settings),
             provider == QLatin1String("qwen3")
-                ? settings.value(QStringLiteral("qwen3ForcedAlignerModelsDirectory")).toString(
-                    QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(
-                        QStringLiteral("qwen3-forced-aligner-0.6b"))) : QString(),
+                ? ModelLocator::directoryFor(ModelKind::Qwen3ForcedAligner, settings) : QString(),
             python);
     }
 

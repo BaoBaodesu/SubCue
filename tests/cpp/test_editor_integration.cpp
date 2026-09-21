@@ -359,6 +359,7 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     QVERIFY(settingsLoader);
     QTRY_COMPARE(settingsLoader->property("status").toInt(), 1);
     QTest::qWait(100);
+    QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("fontFamilyField")));
     QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("aiAssistSection")));
     QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("asrReviewSection")));
     QVERIFY(settingsWindow->findChild<QObject *>(QStringLiteral("aiApiKeyField")));

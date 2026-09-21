@@ -1,4 +1,5 @@
 #include "settings/settings_manager.h"
+#include "settings/model_locator.h"
 
 #include <QtCore/QDir>
 #include <QtCore/QFile>
@@ -55,12 +56,7 @@ QJsonObject SettingsManager::defaults()
         {QStringLiteral("asrCredentialRevision"), 0},
         {QStringLiteral("asrModel"), QStringLiteral("Fun-ASR-Nano-2512")},
         {QStringLiteral("asrProvider"), QStringLiteral("funasr")},
-        {QStringLiteral("qwen3AsrModelsDirectory"),
-         QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("qwen3-asr-0.6b"))},
-        {QStringLiteral("qwen3ForcedAlignerModelsDirectory"),
-         QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("qwen3-forced-aligner-0.6b"))},
-        {QStringLiteral("funAsrModelsDirectory"),
-         QDir(QString::fromUtf8(SUBCUE_PROJECT_MODELS_DIR)).filePath(QStringLiteral("fun-asr-nano-2512"))},
+        {QStringLiteral("modelsRoot"), ModelLocator::compiledDefaultRoot()},
         {QStringLiteral("localAsrPython"), QString::fromUtf8(SUBCUE_PROJECT_INFERENCE_PYTHON)},
         {QStringLiteral("region"), QStringLiteral("beijing")},
         {QStringLiteral("asrApiHost"), QString()},
@@ -133,6 +129,16 @@ QJsonObject SettingsManager::load() const
         result.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));
         result.insert(QStringLiteral("asrVerification"), QJsonObject{});
     }
+    if (!loaded.contains(QStringLiteral("modelsRoot"))) {
+        const QString derived = ModelLocator::derivedRootFromLegacy(loaded);
+        if (!derived.isEmpty()) result.insert(QStringLiteral("modelsRoot"), derived);
+    }
+    result.insert(QStringLiteral("qwen3AsrModelsDirectory"),
+        ModelLocator::directoryFor(ModelKind::Qwen3Asr, result));
+    result.insert(QStringLiteral("qwen3ForcedAlignerModelsDirectory"),
+        ModelLocator::directoryFor(ModelKind::Qwen3ForcedAligner, result));
+    result.insert(QStringLiteral("funAsrModelsDirectory"),
+        ModelLocator::directoryFor(ModelKind::FunAsrNano, result));
     result.insert(QStringLiteral("version"), 3);
     return result;
 }
@@ -143,6 +149,12 @@ bool SettingsManager::save(const QJsonObject &settings, QString *errorMessage) c
     for (auto iterator = safe.begin(); iterator != safe.end(); ++iterator) {
         if (settings.contains(iterator.key())) iterator.value() = settings.value(iterator.key());
     }
+    safe.insert(QStringLiteral("qwen3AsrModelsDirectory"),
+        ModelLocator::directoryFor(ModelKind::Qwen3Asr, safe));
+    safe.insert(QStringLiteral("qwen3ForcedAlignerModelsDirectory"),
+        ModelLocator::directoryFor(ModelKind::Qwen3ForcedAligner, safe));
+    safe.insert(QStringLiteral("funAsrModelsDirectory"),
+        ModelLocator::directoryFor(ModelKind::FunAsrNano, safe));
     safe.insert(QStringLiteral("version"), 3);
     if (!QDir().mkpath(QFileInfo(path_).absolutePath())) {
         if (errorMessage) *errorMessage = QStringLiteral("无法创建设置目录");

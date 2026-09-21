@@ -6,6 +6,7 @@
 #include "asr/local_python_asr_service.h"
 #include "alignment/alignment_pipeline.h"
 #include "roughcut/script_document.h"
+#include "settings/model_locator.h"
 #include "settings/settings_manager.h"
 #include "inference/inference_manager.h"
 
@@ -15,6 +16,7 @@
 #include <QtCore/QFileInfo>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
+#include <QtCore/QProcessEnvironment>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QTimer>
 #include <QtNetwork/QHostAddress>
@@ -119,6 +121,9 @@ private slots:
     void dashscopeHttpErrorAndCancel();
     void factoryKeepsDashScopeDefault();
     void localModelRejectsIncompleteWeight();
+    void modelLocatorPrefersSettingsThenEnv();
+    void modelLocatorMigratesLegacyDirectories();
+    void localModelsAtConfiguredRootAreReady();
     void inferenceManagerContainsWorkerFailure();
     void extractorWritesFlacAndPcm();
     void realQwenFixtureAlignsWhenRequested();
@@ -374,6 +379,60 @@ void AsrTests::localModelRejectsIncompleteWeight()
     weight.write("complete");
     weight.close();
     QVERIFY(LocalPythonAsrService::modelReady(directory.path()));
+}
+
+void AsrTests::modelLocatorPrefersSettingsThenEnv()
+{
+    QTemporaryDir settingsRoot;
+    QTemporaryDir envRoot;
+    QVERIFY(settingsRoot.isValid());
+    QVERIFY(envRoot.isValid());
+    const QByteArray previous = qgetenv("SUBCUE_MODELS_ROOT");
+    qputenv("SUBCUE_MODELS_ROOT", QFile::encodeName(envRoot.path()));
+    const QString fromEnv = ModelLocator::root({});
+    if (previous.isEmpty()) qunsetenv("SUBCUE_MODELS_ROOT");
+    else qputenv("SUBCUE_MODELS_ROOT", previous);
+    QCOMPARE(QDir::cleanPath(fromEnv), QDir::cleanPath(envRoot.path()));
+    QJsonObject settings{{QStringLiteral("modelsRoot"), settingsRoot.path()}};
+    QCOMPARE(QDir::cleanPath(ModelLocator::root(settings)), QDir::cleanPath(settingsRoot.path()));
+    QCOMPARE(ModelLocator::directoryFor(ModelKind::Qwen3Asr, settings),
+        QDir(settingsRoot.path()).filePath(QStringLiteral("qwen3-asr-0.6b")));
+}
+
+void AsrTests::modelLocatorMigratesLegacyDirectories()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString legacy = QDir(directory.path()).filePath(QStringLiteral("qwen3-asr-0.6b"));
+    QJsonObject loaded{{QStringLiteral("qwen3AsrModelsDirectory"), legacy}};
+    QCOMPARE(QDir::cleanPath(ModelLocator::derivedRootFromLegacy(loaded)),
+        QDir::cleanPath(directory.path()));
+
+    const QString settingsPath = directory.filePath(QStringLiteral("settings.json"));
+    QFile file(settingsPath);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QJsonDocument(QJsonObject{
+        {QStringLiteral("version"), 3},
+        {QStringLiteral("qwen3AsrModelsDirectory"), legacy},
+    }).toJson(QJsonDocument::Compact));
+    file.close();
+    const QJsonObject migrated = SettingsManager(settingsPath).load();
+    QCOMPARE(QDir::cleanPath(migrated.value(QStringLiteral("modelsRoot")).toString()),
+        QDir::cleanPath(directory.path()));
+    QCOMPARE(migrated.value(QStringLiteral("qwen3AsrModelsDirectory")).toString(),
+        QDir(directory.path()).filePath(QStringLiteral("qwen3-asr-0.6b")));
+}
+
+void AsrTests::localModelsAtConfiguredRootAreReady()
+{
+    const QString root = ModelLocator::compiledDefaultRoot();
+    if (!QFileInfo::exists(root)) {
+        QSKIP("Configured model root is not present on this machine");
+    }
+    QVERIFY2(ModelLocator::modelReady(ModelLocator::directoryFor(ModelKind::Qwen3Asr)),
+        qPrintable(ModelLocator::directoryFor(ModelKind::Qwen3Asr)));
+    QVERIFY2(ModelLocator::modelReady(ModelLocator::directoryFor(ModelKind::Qwen3ForcedAligner)),
+        qPrintable(ModelLocator::directoryFor(ModelKind::Qwen3ForcedAligner)));
 }
 
 void AsrTests::inferenceManagerContainsWorkerFailure()

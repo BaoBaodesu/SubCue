@@ -87,10 +87,11 @@ QtObject {
     readonly property color playhead: "#FF4D57"
 
     // ── 滚动条 ───────────────────────────────────────────────
-    readonly property color scrollTrack: "#1A1D22"
-    readonly property color scrollThumb: "#444A55"
-    readonly property color scrollThumbHover: "#565E6C"
-    readonly property color scrollThumbPressed: "#656E7E"
+    readonly property color scrollTrack: "#1A1D22"       // 时间轴缩放条底轨
+    readonly property color scrollBarTrack: "#2F3540"    // 列表/设置滑动条轨道
+    readonly property color scrollThumb: "#8B95A5"
+    readonly property color scrollThumbHover: "#A4ADBB"
+    readonly property color scrollThumbPressed: "#B8C0CC"
 
     // ── 状态色（沿用） ───────────────────────────────────────
     readonly property color success: "#66B77B"
@@ -105,5 +106,6 @@ QtObject {
     readonly property int radiusInput: 3
     readonly property int radiusPopup: 4
     readonly property int radiusPanel: 0
-    readonly property int scrollThumbSize: 8
+    readonly property int scrollThumbSize: 10
+    readonly property int scrollBarSize: 14
 }

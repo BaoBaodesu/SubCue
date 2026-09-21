@@ -16,6 +16,7 @@ build/
 .vscode/
 .vs/
 compile_commands.json
+CMakeUserPresets.json
 
 # golden 再生脚本的 Python 缓存
 __pycache__/

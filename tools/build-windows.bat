@@ -1,15 +1,16 @@
 @echo off
 rem SubCue Windows build script: configure, build and run CTest inside the
 rem MSVC x64 developer environment.
-rem Usage: tools\build-windows.bat [debug|release|cuda] [fresh]   (default: release)
-rem   debug|release|cuda  select Debug, Release CPU, or Release CUDA
+rem Usage: tools\build-windows.bat [cuda|debug|release] [fresh]   (default: cuda)
+rem   cuda|debug|release  select Release CUDA (default), Debug, or Release CPU
 rem   fresh          wipe and reconfigure the build directory before building;
 rem                  only needed after toolchain changes or a broken cache
 rem Do NOT set environment variables named CL, LIB or LINK.
 setlocal
 
-set "BUILD_PRESET=windows-release"
+set "BUILD_PRESET=windows-release-cuda"
 if /I "%1"=="debug" set "BUILD_PRESET=windows-debug"
+if /I "%1"=="release" set "BUILD_PRESET=windows-release"
 if /I "%1"=="cuda" set "BUILD_PRESET=windows-release-cuda"
 set "SUBCUE_FRESH="
 if /I "%1"=="fresh" set "SUBCUE_FRESH=1"

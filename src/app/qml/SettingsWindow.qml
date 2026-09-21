@@ -56,8 +56,58 @@ Window {
                 property bool asrOperationBusy: false
                 property bool aiOperationBusy: false
                 property bool clearAiKeyPending: false
+                property bool storageBusy: false
+                property var storageTargets: []
+                property var localModelStatus: []
+                property bool storageExpanded: true
 
                 function clone(value) { return JSON.parse(JSON.stringify(value)) }
+                function formatBytes(bytes) {
+                    if (bytes >= 1073741824)
+                        return (bytes / 1073741824).toFixed(2) + " GiB"
+                    if (bytes >= 1048576)
+                        return (bytes / 1048576).toFixed(1) + " MiB"
+                    if (bytes >= 1024)
+                        return (bytes / 1024).toFixed(1) + " KiB"
+                    return bytes + " B"
+                }
+                function selectedStorageIds() {
+                    const ids = []
+                    for (let i = 0; i < storageTargets.length; ++i)
+                        if (storageTargets[i].selected) ids.push(storageTargets[i].id)
+                    return ids
+                }
+                function selectedStorageSummary() {
+                    let total = 0
+                    const lines = []
+                    for (let i = 0; i < storageTargets.length; ++i) {
+                        if (!storageTargets[i].selected) continue
+                        total += storageTargets[i].bytes
+                        lines.push(storageTargets[i].label + "\n" + storageTargets[i].path)
+                    }
+                    return { "total": total, "text": lines.join("\n\n") }
+                }
+                function keepBuildText() {
+                    for (let i = 0; i < storageTargets.length; ++i) {
+                        if (storageTargets[i].group === "build")
+                            return storageTargets[i].label
+                    }
+                    return ""
+                }
+                readonly property bool allStorageSelected: {
+                    if (storageTargets.length === 0)
+                        return false
+                    for (let i = 0; i < storageTargets.length; ++i)
+                        if (!storageTargets[i].selected)
+                            return false
+                    return true
+                }
+                function setAllStorageSelected(selected) {
+                    const next = []
+                    for (let i = 0; i < storageTargets.length; ++i)
+                        next.push(Object.assign({}, storageTargets[i], { "selected": selected }))
+                    storageTargets = next
+                }
                 function indexById(items, id) {
                     for (let i = 0; i < items.length; ++i)
                         if (items[i].id === id) return i
@@ -95,6 +145,9 @@ Window {
                     asrCredentialStatus.text = savedAsr === "dashscope"
                         ? controller.requestCredentialStatus("SubCue/ASR/dashscope", ++settingsHost.asrCredentialRequest) : "尚未配置"
                     asrStatus.text = controller.verificationStatus("asr")
+                    modelsRoot.text = controller.setting("modelsRoot") || ""
+                    localModelStatus = controller.modelStatus(modelsRoot.text)
+                    controller.requestStorageTargets()
 
                     autoReview.checked = controller.setting("autoReviewEnabled") || false
                     reviewUseSame.checked = controller.setting("reviewUseSameAsr") !== false
@@ -105,7 +158,7 @@ Window {
                     refreshAiKeyStatus()
                     aiStatus.text = "未验证"
 
-                    fontFamily.text = controller.setting("fontFamily") || "Microsoft YaHei"
+                    fontFamily.loadValue(controller.setting("fontFamily") || "Microsoft YaHei")
                     fontSize.value = controller.setting("fontSize1080p") || 52
                     alignment.currentIndex = controller.setting("alignment") === "bottom-left" ? 0
                         : (controller.setting("alignment") === "bottom-right" ? 2 : 1)
@@ -160,6 +213,32 @@ Window {
                             aiStatus.text = result.error || "连接失败"
                         }
                     }
+                    function onStorageTargetsReady(targets) {
+                        settingsWindow.storageBusy = false
+                        const next = []
+                        for (let i = 0; i < targets.length; ++i) {
+                            const item = targets[i]
+                            next.push({
+                                "id": item.id,
+                                "group": item.group,
+                                "label": item.label,
+                                "path": item.path,
+                                "bytes": item.bytes,
+                                "selected": item.group === "cache"
+                            })
+                        }
+                        settingsWindow.storageTargets = next
+                    }
+                    function onStorageCleanupFinished(result) {
+                        settingsWindow.storageBusy = false
+                        if (result.success) {
+                            storageStatus.text = "已清理 " + settingsWindow.formatBytes(result.bytesRemoved || 0)
+                            controller.requestStorageTargets()
+                            localModelStatus = controller.modelStatus(modelsRoot.text)
+                        } else {
+                            storageStatus.text = result.error || "清理失败"
+                        }
+                    }
                 }
 
                 component FieldLabel: Label {
@@ -190,16 +269,28 @@ Window {
                         anchors.fill: parent
                         spacing: 0
 
-                        ScrollView {
+                        Flickable {
+                            id: settingsFlick
+                            objectName: "settingsScroll"
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             clip: true
-                            ScrollBar.vertical: SubScrollBar { }
-                            contentWidth: availableWidth
+                            boundsBehavior: Flickable.StopAtBounds
+                            flickableDirection: Flickable.VerticalFlick
+                            contentWidth: width
+                            contentHeight: settingsGrid.implicitHeight + 24
+                            ScrollBar.vertical: SubScrollBar {
+                                parent: settingsFlick
+                                anchors.top: parent.top
+                                anchors.right: parent.right
+                                anchors.bottom: parent.bottom
+                            }
 
                             GridLayout {
-                                width: Math.max(0, parent.width - 36)
+                                id: settingsGrid
+                                width: Math.max(0, settingsFlick.width - 18 - 22)
                                 x: 18
+                                y: 12
                                 columns: 3
                                 columnSpacing: 10
                                 rowSpacing: 10
@@ -287,7 +378,8 @@ Window {
                                             "asrProvider": asrProvider.currentValue,
                                             "asrModel": asrProvider.currentValue === "dashscope" ? asrModel.currentValue : "",
                                             "region": region.currentText,
-                                            "asrApiHost": asrApiHost.text
+                                            "asrApiHost": asrApiHost.text,
+                                            "modelsRoot": modelsRoot.text
                                         }
                                         settingsWindow.asrOperationBusy = true
                                         asrStatus.text = "正在测试…"
@@ -295,6 +387,40 @@ Window {
                                     }
                                 }
                                 Item { Layout.fillWidth: true }
+
+                                FieldLabel { text: "模型根目录" }
+                                SubTextField {
+                                    id: modelsRoot
+                                    Layout.fillWidth: true
+                                    enabled: !settingsWindow.asrOperationBusy
+                                    placeholderText: "例如 E:\\\\AIModels\\\\ASR\\\\models"
+                                    onTextEdited: {
+                                        invalidateAsr()
+                                        localModelStatus = controller.modelStatus(modelsRoot.text)
+                                    }
+                                }
+                                SubButton {
+                                    text: "浏览"
+                                    enabled: !settingsWindow.asrOperationBusy
+                                    onClicked: modelsRootDialog.open()
+                                }
+                                Repeater {
+                                    model: localModelStatus
+                                    delegate: Item {
+                                        Layout.columnSpan: 3
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 20
+                                        Label {
+                                            anchors.fill: parent
+                                            color: modelData.ready ? Theme.success : Theme.muted
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            elide: Text.ElideMiddle
+                                            text: modelData.name + " · "
+                                                  + (modelData.ready ? "已安装" : "缺失（运行 tools\\\\setup-models.ps1）")
+                                                  + " · " + modelData.directory
+                                        }
+                                    }
+                                }
 
                                 Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
                                 SectionTitle { objectName: "asrReviewSection"; text: "ASR 复核" }
@@ -372,7 +498,7 @@ Window {
                                 Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
                                 SectionTitle { text: "字幕与导出" }
                                 FieldLabel { text: "字体" }
-                                SubTextField { id: fontFamily; Layout.fillWidth: true }
+                                FontPicker { id: fontFamily; objectName: "fontFamilyField"; Layout.fillWidth: true }
                                 Item { Layout.fillWidth: true }
                                 FieldLabel { text: "1080p 字号" }
                                 RowLayout {
@@ -394,6 +520,122 @@ Window {
                                 FieldLabel { text: "输出目录" }
                                 SubTextField { id: outputDirectory; Layout.fillWidth: true; placeholderText: "留空使用媒体目录" }
                                 SubButton { text: "浏览"; onClicked: outputDialog.open() }
+
+                                Rectangle { Layout.columnSpan: 3; Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.divider }
+                                RowLayout {
+                                    Layout.columnSpan: 3
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Label {
+                                        objectName: "storageSection"
+                                        text: "存储与清理"
+                                        color: Theme.text
+                                        font.bold: true
+                                        font.pixelSize: 15
+                                        topPadding: 4
+                                        Layout.fillWidth: true
+                                        Layout.alignment: Qt.AlignVCenter
+                                    }
+                                    SubButton {
+                                        objectName: "expandStorageButton"
+                                        text: "展开"
+                                        enabled: !settingsWindow.storageExpanded
+                                        onClicked: settingsWindow.storageExpanded = true
+                                    }
+                                    SubButton {
+                                        objectName: "collapseStorageButton"
+                                        text: "折叠"
+                                        enabled: settingsWindow.storageExpanded
+                                        onClicked: settingsWindow.storageExpanded = false
+                                    }
+                                }
+                                ColumnLayout {
+                                    Layout.columnSpan: 3
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    visible: settingsWindow.storageExpanded
+
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                        color: Theme.muted
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        text: keepBuildText() !== ""
+                                              ? keepBuildText()
+                                              : "清理应用缓存、测试残留和过时构建。不会删除模型根目录、源码或正式测试夹具。"
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        SubCheckBox {
+                                            id: storageSelectAll
+                                            objectName: "selectAllStorage"
+                                            text: "全选"
+                                            enabled: !settingsWindow.storageBusy && storageTargets.length > 0
+                                            onClicked: settingsWindow.setAllStorageSelected(checked)
+                                        }
+                                        StatusLabel {
+                                            id: storageStatus
+                                            Layout.fillWidth: true
+                                            text: storageTargets.length === 0 ? "没有可清理的项目" : ""
+                                        }
+                                        SubButton {
+                                            objectName: "cleanupSelectedButton"
+                                            text: "清理所选"
+                                            Layout.alignment: Qt.AlignRight
+                                            enabled: !settingsWindow.storageBusy && selectedStorageIds().length > 0
+                                            onClicked: {
+                                                const summary = selectedStorageSummary()
+                                                confirmCleanup.summaryText = summary.text
+                                                confirmCleanup.bytesText = settingsWindow.formatBytes(summary.total)
+                                                confirmCleanup.open()
+                                            }
+                                        }
+                                    }
+                                    Binding {
+                                        target: storageSelectAll
+                                        property: "checked"
+                                        value: settingsWindow.allStorageSelected
+                                        restoreMode: Binding.RestoreBinding
+                                    }
+                                    Repeater {
+                                        model: storageTargets
+                                        delegate: Item {
+                                            Layout.fillWidth: true
+                                            Layout.preferredHeight: 44
+                                            RowLayout {
+                                                anchors.fill: parent
+                                                spacing: 8
+                                                SubCheckBox {
+                                                    checked: modelData.selected
+                                                    enabled: !settingsWindow.storageBusy
+                                                    onToggled: {
+                                                        const next = storageTargets.slice()
+                                                        next[index] = Object.assign({}, next[index], { "selected": checked })
+                                                        storageTargets = next
+                                                    }
+                                                }
+                                                ColumnLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: 0
+                                                    Label {
+                                                        Layout.fillWidth: true
+                                                        color: Theme.text
+                                                        elide: Text.ElideRight
+                                                        text: modelData.label + " · " + settingsWindow.formatBytes(modelData.bytes)
+                                                    }
+                                                    Label {
+                                                        Layout.fillWidth: true
+                                                        color: Theme.muted
+                                                        font.pixelSize: Theme.fontSizeSmall
+                                                        elide: Text.ElideMiddle
+                                                        text: modelData.path
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 Item { Layout.columnSpan: 3; Layout.preferredHeight: 8 }
                             }
                         }
@@ -422,6 +664,7 @@ Window {
                                             "asrModel": asrModel.currentValue,
                                             "region": region.currentText,
                                             "asrApiHost": asrApiHost.text,
+                                            "modelsRoot": modelsRoot.text,
                                             "asrVerification": asrVerification,
                                             "asrConfigRevision": asrConfigRevision,
                                             "asrCredentialRevision": asrCredentialRevision,
@@ -456,6 +699,39 @@ Window {
                     title: "选择输出目录"
                     parentWindow: settingsHost
                     onAccepted: outputDirectory.text = controller.localPath(selectedFolder)
+                }
+                FolderDialog {
+                    id: modelsRootDialog
+                    title: "选择模型根目录"
+                    parentWindow: settingsHost
+                    onAccepted: {
+                        modelsRoot.text = controller.localPath(selectedFolder)
+                        settingsWindow.invalidateAsr()
+                        localModelStatus = controller.modelStatus(modelsRoot.text)
+                    }
+                }
+                Dialog {
+                    id: confirmCleanup
+                    title: "确认清理"
+                    modal: true
+                    parent: settingsHost.contentItem
+                    anchors.centerIn: parent
+                    property string summaryText: ""
+                    property string bytesText: ""
+                    standardButtons: Dialog.Ok | Dialog.Cancel
+                    width: Math.min(520, settingsHost.width - 40)
+                    Label {
+                        width: confirmCleanup.availableWidth
+                        wrapMode: Text.Wrap
+                        color: Theme.text
+                        text: "将删除以下项目，合计 " + confirmCleanup.bytesText + "。此操作不可恢复。\n\n"
+                              + confirmCleanup.summaryText
+                    }
+                    onAccepted: {
+                        settingsWindow.storageBusy = true
+                        storageStatus.text = "正在清理…"
+                        controller.cleanupStorage(selectedStorageIds())
+                    }
                 }
             }
         }

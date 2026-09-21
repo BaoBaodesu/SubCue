@@ -2,20 +2,31 @@
 # Invoked as: cmake -D... -P cmake/PackageWindows.cmake
 #
 # Required -D variables:
-#   SUBCUE_EXE, SUBCUE_INFERENCE_EXE, SUBCUE_PYTHON_ROOT,
-#   SUBCUE_INFERENCE_SITE_PACKAGES, SUBCUE_SOURCE_DIR, SUBCUE_PACKAGE_DIR, QT_BIN_DIR,
+#   SUBCUE_EXE, SUBCUE_SOURCE_DIR, SUBCUE_PACKAGE_DIR, QT_BIN_DIR,
 #   FFMPEG_BIN_DIR, FFMPEG_SHARE_DIR, SUBCUE_BUILD_TYPE
+# Optional when SUBCUE_LOCAL_INFERENCE=ON:
+#   SUBCUE_INFERENCE_EXE, SUBCUE_PYTHON_ROOT, SUBCUE_INFERENCE_SITE_PACKAGES
 
 cmake_minimum_required(VERSION 3.28)
 
+if(NOT DEFINED SUBCUE_LOCAL_INFERENCE)
+    set(SUBCUE_LOCAL_INFERENCE OFF)
+endif()
+
 foreach(_var IN ITEMS
-    SUBCUE_EXE SUBCUE_INFERENCE_EXE SUBCUE_PYTHON_ROOT SUBCUE_INFERENCE_SITE_PACKAGES
-    SUBCUE_SOURCE_DIR SUBCUE_PACKAGE_DIR QT_BIN_DIR
+    SUBCUE_EXE SUBCUE_SOURCE_DIR SUBCUE_PACKAGE_DIR QT_BIN_DIR
     FFMPEG_BIN_DIR FFMPEG_SHARE_DIR SUBCUE_BUILD_TYPE)
     if(NOT ${_var})
         message(FATAL_ERROR "PackageWindows.cmake missing ${_var}")
     endif()
 endforeach()
+if(SUBCUE_LOCAL_INFERENCE)
+    foreach(_var IN ITEMS SUBCUE_INFERENCE_EXE SUBCUE_PYTHON_ROOT SUBCUE_INFERENCE_SITE_PACKAGES)
+        if(NOT ${_var})
+            message(FATAL_ERROR "PackageWindows.cmake missing ${_var} for local inference")
+        endif()
+    endforeach()
+endif()
 
 if(NOT EXISTS "${SUBCUE_EXE}")
     message(FATAL_ERROR "SubCue executable not found: ${SUBCUE_EXE}")
@@ -36,48 +47,51 @@ set(_qt_plugins "${_qt_prefix}/plugins")
 file(REMOVE_RECURSE "${SUBCUE_PACKAGE_DIR}")
 file(MAKE_DIRECTORY "${SUBCUE_PACKAGE_DIR}")
 file(COPY "${SUBCUE_EXE}" DESTINATION "${SUBCUE_PACKAGE_DIR}")
-set(_inference_dir "${SUBCUE_PACKAGE_DIR}/inference")
-set(_inference_runtime "${_inference_dir}/runtime")
-file(MAKE_DIRECTORY "${_inference_runtime}/Lib")
-file(COPY "${SUBCUE_INFERENCE_EXE}" DESTINATION "${_inference_dir}")
-file(COPY "${SUBCUE_SOURCE_DIR}/tools/asr_python_worker.py" DESTINATION "${_inference_dir}")
-file(COPY "${SUBCUE_PYTHON_ROOT}/python312.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
-    DESTINATION "${_inference_dir}")
-file(COPY "${SUBCUE_PYTHON_ROOT}/python312.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
-    DESTINATION "${_inference_runtime}")
-file(COPY "${SUBCUE_PYTHON_ROOT}/DLLs" DESTINATION "${_inference_runtime}")
-foreach(_runtime_dll IN ITEMS vcruntime140.dll vcruntime140_1.dll)
-    if(EXISTS "${SUBCUE_PYTHON_ROOT}/${_runtime_dll}")
-        file(COPY "${SUBCUE_PYTHON_ROOT}/${_runtime_dll}" DESTINATION "${_inference_dir}")
-    endif()
-endforeach()
-file(COPY "${SUBCUE_PYTHON_ROOT}/Lib/" DESTINATION "${_inference_runtime}/Lib"
-    PATTERN "site-packages" EXCLUDE PATTERN "venv" EXCLUDE
-    PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE
-    PATTERN "ensurepip" EXCLUDE PATTERN "idlelib" EXCLUDE
-    PATTERN "lib2to3" EXCLUDE PATTERN "turtledemo" EXCLUDE)
-file(GLOB_RECURSE _development_files LIST_DIRECTORIES false
-    "${SUBCUE_INFERENCE_SITE_PACKAGES}/*.lib")
 set(_development_bytes 0)
-foreach(_file IN LISTS _development_files)
-    file(SIZE "${_file}" _file_size)
-    math(EXPR _development_bytes "${_development_bytes} + ${_file_size}")
-endforeach()
-file(COPY "${SUBCUE_INFERENCE_SITE_PACKAGES}/" DESTINATION "${_inference_runtime}/Lib/site-packages"
-    PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE PATTERN "tests" EXCLUDE
-    PATTERN "test" EXCLUDE PATTERN "*.lib" EXCLUDE PATTERN "*.pdb" EXCLUDE)
-# Torch C++ 头文件只供扩展编译使用，推理运行时无需携带。
-file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/torch/include")
-# Worker 运行时未 import 的转移依赖（qwen-asr 演示 UI / numba JIT、已移除的学习框架），不打进正式包。
-foreach(_unused_python IN ITEMS gradio gradio_client llvmlite numba xgboost sklearn scikit_learn)
-    file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/${_unused_python}")
-    file(GLOB _unused_meta LIST_DIRECTORIES true
-        "${_inference_runtime}/Lib/site-packages/${_unused_python}-*"
-        "${_inference_runtime}/Lib/site-packages/${_unused_python}.*")
-    foreach(_meta IN LISTS _unused_meta)
-        file(REMOVE_RECURSE "${_meta}")
+if(SUBCUE_LOCAL_INFERENCE)
+    set(_inference_dir "${SUBCUE_PACKAGE_DIR}/inference")
+    set(_inference_runtime "${_inference_dir}/runtime")
+    file(MAKE_DIRECTORY "${_inference_runtime}/Lib")
+    file(COPY "${SUBCUE_INFERENCE_EXE}" DESTINATION "${_inference_dir}")
+    file(COPY "${SUBCUE_SOURCE_DIR}/tools/asr_python_worker.py" DESTINATION "${_inference_dir}")
+    file(COPY "${SUBCUE_PYTHON_ROOT}/python312.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
+        DESTINATION "${_inference_dir}")
+    file(COPY "${SUBCUE_PYTHON_ROOT}/python312.dll" "${SUBCUE_PYTHON_ROOT}/python3.dll"
+        DESTINATION "${_inference_runtime}")
+    file(COPY "${SUBCUE_PYTHON_ROOT}/DLLs" DESTINATION "${_inference_runtime}")
+    foreach(_runtime_dll IN ITEMS vcruntime140.dll vcruntime140_1.dll)
+        if(EXISTS "${SUBCUE_PYTHON_ROOT}/${_runtime_dll}")
+            file(COPY "${SUBCUE_PYTHON_ROOT}/${_runtime_dll}" DESTINATION "${_inference_dir}")
+        endif()
     endforeach()
-endforeach()
+    file(COPY "${SUBCUE_PYTHON_ROOT}/Lib/" DESTINATION "${_inference_runtime}/Lib"
+        PATTERN "site-packages" EXCLUDE PATTERN "venv" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE
+        PATTERN "ensurepip" EXCLUDE PATTERN "idlelib" EXCLUDE
+        PATTERN "lib2to3" EXCLUDE PATTERN "turtledemo" EXCLUDE)
+    file(GLOB_RECURSE _development_files LIST_DIRECTORIES false
+        "${SUBCUE_INFERENCE_SITE_PACKAGES}/*.lib")
+    foreach(_file IN LISTS _development_files)
+        file(SIZE "${_file}" _file_size)
+        math(EXPR _development_bytes "${_development_bytes} + ${_file_size}")
+    endforeach()
+    file(COPY "${SUBCUE_INFERENCE_SITE_PACKAGES}/" DESTINATION "${_inference_runtime}/Lib/site-packages"
+        PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE PATTERN "tests" EXCLUDE
+        PATTERN "test" EXCLUDE PATTERN "*.lib" EXCLUDE PATTERN "*.pdb" EXCLUDE)
+    # Torch C++ 头文件只供扩展编译使用，推理运行时无需携带。
+    file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/torch/include")
+    # Worker 运行时未 import 的转移依赖：gradio 演示 UI、已移除的学习框架。
+    # numba/llvmlite 必须保留：qwen_asr 经 librosa.load 加载音频。
+    foreach(_unused_python IN ITEMS gradio gradio_client xgboost sklearn scikit_learn pandas)
+        file(REMOVE_RECURSE "${_inference_runtime}/Lib/site-packages/${_unused_python}")
+        file(GLOB _unused_meta LIST_DIRECTORIES true
+            "${_inference_runtime}/Lib/site-packages/${_unused_python}-*"
+            "${_inference_runtime}/Lib/site-packages/${_unused_python}.*")
+        foreach(_meta IN LISTS _unused_meta)
+            file(REMOVE_RECURSE "${_meta}")
+        endforeach()
+    endforeach()
+endif()
 
 set(_system_root "$ENV{SystemRoot}")
 if(NOT _system_root)
@@ -218,7 +232,7 @@ file(WRITE "${SUBCUE_PACKAGE_DIR}/README.txt"
 ==================
 
 Run SubCue.exe. Qt, FFmpeg, and the MSVC runtime are in this folder.
-Qwen3-ASR and Fun-ASR require a compatible local Python CUDA environment.
+Local Qwen3-ASR and Fun-ASR require the CUDA inference runtime in inference/.
 
 Third-party licenses are in licenses/.
 ")
@@ -289,10 +303,6 @@ endif()
 
 set(_required
     "${SUBCUE_PACKAGE_DIR}/SubCue.exe"
-    "${SUBCUE_PACKAGE_DIR}/inference/SubCueInference.exe"
-    "${SUBCUE_PACKAGE_DIR}/inference/python312.dll"
-    "${SUBCUE_PACKAGE_DIR}/inference/runtime/python312.dll"
-    "${SUBCUE_PACKAGE_DIR}/inference/asr_python_worker.py"
     "${SUBCUE_PACKAGE_DIR}/avcodec-63.dll"
     "${SUBCUE_PACKAGE_DIR}/avformat-63.dll"
     "${SUBCUE_PACKAGE_DIR}/avutil-61.dll"
@@ -301,6 +311,14 @@ set(_required
     "${SUBCUE_PACKAGE_DIR}/licenses/NOTICE.txt"
     "${SUBCUE_PACKAGE_DIR}/licenses/qt/LICENSE.LGPLv3"
 )
+if(SUBCUE_LOCAL_INFERENCE)
+    list(APPEND _required
+        "${SUBCUE_PACKAGE_DIR}/inference/SubCueInference.exe"
+        "${SUBCUE_PACKAGE_DIR}/inference/python312.dll"
+        "${SUBCUE_PACKAGE_DIR}/inference/runtime/python312.dll"
+        "${SUBCUE_PACKAGE_DIR}/inference/asr_python_worker.py"
+    )
+endif()
 foreach(_file IN LISTS _required)
     if(NOT EXISTS "${_file}")
         message(FATAL_ERROR "Package missing required file: ${_file}")
@@ -359,5 +377,9 @@ endforeach()
 file(WRITE "${SUBCUE_PACKAGE_DIR}/package-size.txt"
     "Package bytes: ${_package_bytes}\nExcluded development library bytes: ${_development_bytes}\n")
 file(WRITE "${SUBCUE_PACKAGE_DIR}/package.stamp" "SubCue ${SUBCUE_BUILD_TYPE} package\n")
-# CUDA 便携包必须内置 PyTorch CUDA 与 CUDA 13 三件套，体积会显著超过 610 MiB 政策目标。
-message(STATUS "Windows package ready: ${SUBCUE_PACKAGE_DIR} (${_package_bytes} bytes; ${_development_bytes} development library bytes excluded)")
+if(SUBCUE_LOCAL_INFERENCE)
+    # CUDA 便携包必须内置 PyTorch CUDA 与 CUDA 13 三件套，目标不超过 4.8 GiB。
+    message(STATUS "Windows CUDA package ready: ${SUBCUE_PACKAGE_DIR} (${_package_bytes} bytes; ${_development_bytes} development library bytes excluded)")
+else()
+    message(STATUS "Windows package ready: ${SUBCUE_PACKAGE_DIR} (${_package_bytes} bytes)")
+endif()

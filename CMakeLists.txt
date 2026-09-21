@@ -11,11 +11,29 @@ set(CMAKE_AUTOGEN_PARALLEL 1)
 
 option(SUBCUE_BUILD_APP "Build the Qt Quick application" ON)
 option(SUBCUE_ENABLE_CUDA "Package CUDA runtime for local inference" OFF)
+option(SUBCUE_LOCAL_INFERENCE "Build and package the isolated Python CUDA inference worker" OFF)
 if(SUBCUE_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
 endif()
-set(SUBCUE_PYTHON_ROOT "C:/Users/baobao/AppData/Roaming/uv/python/cpython-3.12-windows-x86_64-none"
-    CACHE PATH "Python 3.12 runtime used only by SubCueInference")
+set(SUBCUE_MODELS_ROOT "" CACHE PATH "External ASR model root directory")
+if(SUBCUE_MODELS_ROOT STREQUAL "")
+    if(DEFINED ENV{SUBCUE_MODELS_ROOT} AND NOT "$ENV{SUBCUE_MODELS_ROOT}" STREQUAL "")
+        set(SUBCUE_MODELS_ROOT "$ENV{SUBCUE_MODELS_ROOT}")
+    elseif(EXISTS "E:/AIModels/ASR/models")
+        set(SUBCUE_MODELS_ROOT "E:/AIModels/ASR/models")
+    else()
+        set(SUBCUE_MODELS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/models")
+    endif()
+endif()
+set(SUBCUE_PYTHON_ROOT "" CACHE PATH "Python 3.12 runtime used only by SubCueInference")
+if(SUBCUE_LOCAL_INFERENCE AND SUBCUE_PYTHON_ROOT STREQUAL "")
+    if(DEFINED ENV{SUBCUE_PYTHON_ROOT} AND NOT "$ENV{SUBCUE_PYTHON_ROOT}" STREQUAL "")
+        set(SUBCUE_PYTHON_ROOT "$ENV{SUBCUE_PYTHON_ROOT}")
+    else()
+        set(SUBCUE_PYTHON_ROOT
+            "C:/Users/baobao/AppData/Roaming/uv/python/cpython-3.12-windows-x86_64-none")
+    endif()
+endif()
 
 set(CMAKE_PREFIX_PATH "C:/Qt/6.10.3/msvc2022_64")
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Network Sql Test)
@@ -94,6 +112,8 @@ qt_add_library(SubCueCore STATIC
     src/core/ai/qwen_omni_provider.h
     src/core/ai/review_audio_encoder.cpp
     src/core/ai/review_audio_encoder.h
+    src/core/asr/asr_provider_catalog.cpp
+    src/core/asr/asr_provider_catalog.h
     src/core/asr/asr_provider_factory.cpp
     src/core/asr/asr_provider_factory.h
     src/core/asr/asr_service.h
@@ -197,8 +217,12 @@ qt_add_library(SubCueCore STATIC
     src/core/preview/preview_renderer.h
     src/core/preview/preview_renderer_factory.cpp
     src/core/preview/software_preview_renderer.cpp
+    src/core/settings/model_locator.cpp
+    src/core/settings/model_locator.h
     src/core/settings/settings_manager.cpp
     src/core/settings/settings_manager.h
+    src/core/settings/storage_cleaner.cpp
+    src/core/settings/storage_cleaner.h
     src/core/subtitle/ass_writer.cpp
     src/core/subtitle/ass_writer.h
     src/core/subtitle/srt_parser.cpp
@@ -240,7 +264,8 @@ target_include_directories(SubCueCore PUBLIC
 )
 target_link_libraries(SubCueCore PUBLIC Qt6::Core Qt6::Gui Qt6::Network Qt6::Quick Qt6::Sql SubCue::FFmpeg)
 target_compile_definitions(SubCueCore PUBLIC
-    SUBCUE_PROJECT_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models"
+    SUBCUE_MODELS_ROOT="${SUBCUE_MODELS_ROOT}"
+    SUBCUE_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
     SUBCUE_PROJECT_INFERENCE_PYTHON="${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Scripts/python.exe"
 )
 if(WIN32)
@@ -249,10 +274,10 @@ endif()
 target_compile_definitions(SubCueCore PRIVATE QT_NO_CAST_FROM_ASCII QT_NO_CAST_TO_ASCII)
 add_library(SubCue::Core ALIAS SubCueCore)
 
-set(Python3_ROOT_DIR "${SUBCUE_PYTHON_ROOT}")
-set(Python3_FIND_STRATEGY LOCATION)
-find_package(Python3 3.12 EXACT COMPONENTS Development QUIET)
-if(Python3_Development_FOUND)
+if(SUBCUE_LOCAL_INFERENCE)
+    set(Python3_ROOT_DIR "${SUBCUE_PYTHON_ROOT}")
+    set(Python3_FIND_STRATEGY LOCATION)
+    find_package(Python3 3.12 EXACT COMPONENTS Development REQUIRED)
     add_executable(SubCueInference src/inference/main.cpp)
     target_link_libraries(SubCueInference PRIVATE Python3::Python)
     target_compile_options(SubCueInference PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
@@ -317,6 +342,7 @@ if(SUBCUE_BUILD_APP)
             src/app/qml/SubScrollBar.qml
             src/app/qml/TimelineZoomBar.qml
             src/app/qml/SubComboBox.qml
+            src/app/qml/FontPicker.qml
             src/app/qml/SubSpinBox.qml
             src/app/qml/SubCheckBox.qml
             src/app/qml/SubMenu.qml
@@ -340,11 +366,11 @@ if(SUBCUE_BUILD_APP)
         SubCue::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
     if(TARGET SubCueInference)
         add_dependencies(SubCue SubCueInference)
+        add_custom_command(TARGET SubCue POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/asr_python_worker.py"
+                "$<TARGET_FILE_DIR:SubCue>/asr_python_worker.py")
     endif()
-    add_custom_command(TARGET SubCue POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/tools/asr_python_worker.py"
-            "$<TARGET_FILE_DIR:SubCue>/asr_python_worker.py")
     if(WIN32)
         target_link_libraries(SubCue PRIVATE dwmapi)
     endif()
@@ -360,13 +386,35 @@ if(SUBCUE_BUILD_APP)
         set_target_properties(SubCue PROPERTIES
             VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:Qt6::Core>;$<IF:$<CONFIG:Debug>,${SUBCUE_FFMPEG_ROOT}/debug/bin,${SUBCUE_FFMPEG_ROOT}/bin>;%PATH%")
         set(SUBCUE_PACKAGE_DIR "${CMAKE_BINARY_DIR}/package")
+        set(SUBCUE_PACKAGE_DEPENDS
+            SubCue
+            "${CMAKE_SOURCE_DIR}/cmake/PackageWindows.cmake"
+            "${CMAKE_SOURCE_DIR}/licenses/NOTICE.txt"
+            "${CMAKE_SOURCE_DIR}/src/app/qml/Main.qml"
+            "${CMAKE_SOURCE_DIR}/src/app/qml/AboutWindow.qml"
+        )
+        set(SUBCUE_PACKAGE_INFERENCE_ARGS
+            "-DSUBCUE_LOCAL_INFERENCE=OFF"
+            "-DSUBCUE_INFERENCE_EXE="
+            "-DSUBCUE_PYTHON_ROOT="
+            "-DSUBCUE_INFERENCE_SITE_PACKAGES="
+        )
+        if(SUBCUE_LOCAL_INFERENCE)
+            list(APPEND SUBCUE_PACKAGE_DEPENDS
+                SubCueInference
+                "${CMAKE_SOURCE_DIR}/tools/asr_python_worker.py")
+            set(SUBCUE_PACKAGE_INFERENCE_ARGS
+                "-DSUBCUE_LOCAL_INFERENCE=ON"
+                "-DSUBCUE_INFERENCE_EXE=$<TARGET_FILE:SubCueInference>"
+                "-DSUBCUE_PYTHON_ROOT=${SUBCUE_PYTHON_ROOT}"
+                "-DSUBCUE_INFERENCE_SITE_PACKAGES=${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Lib/site-packages"
+            )
+        endif()
         add_custom_command(
             OUTPUT "${SUBCUE_PACKAGE_DIR}/package.stamp"
             COMMAND ${CMAKE_COMMAND}
                 "-DSUBCUE_EXE=$<TARGET_FILE:SubCue>"
-                "-DSUBCUE_INFERENCE_EXE=$<TARGET_FILE:SubCueInference>"
-                "-DSUBCUE_PYTHON_ROOT=${SUBCUE_PYTHON_ROOT}"
-                "-DSUBCUE_INFERENCE_SITE_PACKAGES=${CMAKE_CURRENT_SOURCE_DIR}/.venv-inference/Lib/site-packages"
+                ${SUBCUE_PACKAGE_INFERENCE_ARGS}
                 "-DSUBCUE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
                 "-DSUBCUE_PACKAGE_DIR=${SUBCUE_PACKAGE_DIR}"
                 "-DQT_BIN_DIR=$<TARGET_FILE_DIR:Qt6::Core>"
@@ -375,14 +423,7 @@ if(SUBCUE_BUILD_APP)
                 "-DCUDA_BIN_DIR=${CUDAToolkit_BIN_DIR}"
                 "-DSUBCUE_BUILD_TYPE=$<CONFIG>"
                 -P "${CMAKE_SOURCE_DIR}/cmake/PackageWindows.cmake"
-            DEPENDS
-                SubCue
-                SubCueInference
-                "${CMAKE_SOURCE_DIR}/cmake/PackageWindows.cmake"
-                "${CMAKE_SOURCE_DIR}/licenses/NOTICE.txt"
-                "${CMAKE_SOURCE_DIR}/tools/asr_python_worker.py"
-                "${CMAKE_SOURCE_DIR}/src/app/qml/Main.qml"
-                "${CMAKE_SOURCE_DIR}/src/app/qml/AboutWindow.qml"
+            DEPENDS ${SUBCUE_PACKAGE_DEPENDS}
             COMMENT "Assembling portable Windows package"
             VERBATIM
         )

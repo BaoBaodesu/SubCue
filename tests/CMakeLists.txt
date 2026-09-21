@@ -148,6 +148,22 @@ target_compile_definitions(SubCueAsrTests PRIVATE
 target_link_libraries(SubCueAsrTests PRIVATE SubCue::Core Qt6::Test Qt6::Network)
 subcue_register_test(SubCueAsrTests)
 
+qt_add_executable(SubCueStorageCleanerTests
+    cpp/test_storage_cleaner.cpp
+    ${SUBCUE_APP_TEST_SOURCES}
+    ${SUBCUE_APP_TEST_ITEM_SOURCES}
+)
+target_include_directories(SubCueStorageCleanerTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/app
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/core
+)
+target_link_libraries(SubCueStorageCleanerTests PRIVATE SubCue::Core Qt6::Test Qt6::Gui Qt6::Qml Qt6::Quick)
+subcue_register_test(SubCueStorageCleanerTests
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    TIMEOUT 30
+)
+
 qt_add_executable(SubCueAiReviewTests cpp/test_ai_review.cpp)
 target_link_libraries(SubCueAiReviewTests PRIVATE SubCue::Core Qt6::Test Qt6::Network)
 subcue_register_test(SubCueAiReviewTests)
@@ -226,11 +242,14 @@ if(SUBCUE_BUILD_APP AND WIN32)
     if(SUBCUE_ENABLE_CUDA)
         target_compile_definitions(SubCuePackagingTests PRIVATE SUBCUE_PACKAGE_HAS_CUDA=1)
     endif()
+    if(SUBCUE_LOCAL_INFERENCE)
+        target_compile_definitions(SubCuePackagingTests PRIVATE SUBCUE_PACKAGE_HAS_INFERENCE=1)
+    endif()
     add_dependencies(SubCuePackagingTests subcue-windows-package)
     target_link_libraries(SubCuePackagingTests PRIVATE Qt6::Test)
     subcue_register_test(SubCuePackagingTests
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
-        TIMEOUT 60
+        TIMEOUT 300
     )
 endif()
 
