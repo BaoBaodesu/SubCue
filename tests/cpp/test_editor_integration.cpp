@@ -9,6 +9,7 @@
 #include "media/media_probe.h"
 #include "playback/playback_engine.h"
 #include "rough_cut_controller.h"
+#include "roughcut/rough_cut_project.h"
 #include "subtitle/subtitle.h"
 #include "timeline_scene_item.h"
 #include "video_preview_item.h"
@@ -30,6 +31,7 @@
 #include <QtGui/QDragEnterEvent>
 #include <QtGui/QDropEvent>
 #include <QtGui/QGuiApplication>
+#include <QtGui/QInputMethodEvent>
 #include <QtGui/QWheelEvent>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlContext>
@@ -159,6 +161,8 @@ QByteArray jsonChatBody(const QJsonObject &arguments)
         QStringLiteral("Shift+Right"),
         QStringLiteral("3"),
         QStringLiteral("4"),
+        QStringLiteral("Q"),
+        QStringLiteral("W"),
         QStringLiteral("T"),
         QStringLiteral("["),
         QStringLiteral("]"),
@@ -167,11 +171,29 @@ QByteArray jsonChatBody(const QJsonObject &arguments)
         QStringLiteral("Enter"),
         QStringLiteral("Shift+Return"),
         QStringLiteral("Shift+Enter"),
+        QStringLiteral("Ctrl+Return"),
+        QStringLiteral("Ctrl+Enter"),
         QStringLiteral("Up"),
         QStringLiteral("Down"),
         QStringLiteral("Tab"),
+        QStringLiteral("Shift+Up"),
+        QStringLiteral("Shift+Down"),
+        QStringLiteral("Ctrl+Up"),
+        QStringLiteral("Ctrl+Down"),
         QStringLiteral("I"),
         QStringLiteral("O"),
+        QStringLiteral("Shift+I"),
+        QStringLiteral("Shift+O"),
+        QStringLiteral("Home"),
+        QStringLiteral("End"),
+        QStringLiteral("Alt+Left"),
+        QStringLiteral("Alt+Right"),
+        QStringLiteral("Alt+Shift+Left"),
+        QStringLiteral("Alt+Shift+Right"),
+        QStringLiteral("Ctrl+Alt+Left"),
+        QStringLiteral("Ctrl+Alt+Right"),
+        QStringLiteral("Ctrl+Alt+Shift+Left"),
+        QStringLiteral("Ctrl+Alt+Shift+Right"),
         QStringLiteral("Alt+I"),
         QStringLiteral("Alt+O"),
         QStringLiteral("S"),
@@ -184,7 +206,7 @@ QByteArray jsonChatBody(const QJsonObject &arguments)
 [[nodiscard]] QSet<QString> shortcutTokens(const QString &source)
 {
     QSet<QString> tokens;
-    QRegularExpression sequence(QStringLiteral("sequence:\\s*\"([^\"]+)\""));
+    QRegularExpression sequence(QStringLiteral("(?:sequence|keySequence):\\s*\"([^\"]+)\""));
     QRegularExpressionMatchIterator it = sequence.globalMatch(source);
     while (it.hasNext()) {
         const QString token = it.next().captured(1);
@@ -297,6 +319,15 @@ void EditorIntegrationTests::qmlShortcutsMatchFeatureMatrix()
     QCOMPARE(cpp, frozenEditorShortcuts());
     QVERIFY(cppSource.contains(QStringLiteral("createNextScriptCue")));
     QVERIFY(cppSource.contains(QStringLiteral("exportSubtitles")));
+
+    QFile workspaceFile(sourcePath(QStringLiteral("src/app/qml/SubtitleWorkspace.qml")));
+    QVERIFY(workspaceFile.open(QIODevice::ReadOnly | QIODevice::Text));
+    auto editingKeys = frozenEditorShortcuts();
+    editingKeys.remove(QStringLiteral("Ctrl+O"));
+    editingKeys.remove(QStringLiteral("Ctrl+I"));
+    editingKeys.insert(QStringLiteral("Shift+Tab"));
+    editingKeys.insert(QStringLiteral("Ctrl+S"));
+    QCOMPARE(shortcutTokens(QString::fromUtf8(workspaceFile.readAll())), editingKeys);
 }
 
 void EditorIntegrationTests::qmlImportDropAndLayout()
@@ -329,6 +360,7 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
 
     auto context = makeContext(dir);
     AppController controller(context.get());
+    QStringList warnings;
     QQmlApplicationEngine engine;
     engine.addImportPath(dir.path());
     QQmlComponent nativeTheme(&engine);
@@ -338,7 +370,6 @@ void EditorIntegrationTests::qmlImportDropAndLayout()
     theme->setParent(&engine);
     engine.rootContext()->setContextProperty(QStringLiteral("nativeTheme"), theme);
     engine.rootContext()->setContextProperty(QStringLiteral("editor"), &controller);
-    QStringList warnings;
     QObject::connect(&engine, &QQmlEngine::warnings, &engine, [&](const QList<QQmlError> &errors) {
         for (const QQmlError &error : errors) warnings.append(error.toString());
     });
@@ -953,9 +984,13 @@ void EditorIntegrationTests::qmlUnifiedAiSettingsAndWorkspaceScreenshots()
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
 
     auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputAss"), false);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
     AppController editor(context.get());
     RoughCutController roughCut(context.get());
     WorkspaceRouter router(&editor, &roughCut);
+    QStringList warnings;
     QQmlApplicationEngine engine;
     engine.addImportPath(dir.path());
     QQmlComponent nativeTheme(&engine);
@@ -967,7 +1002,6 @@ void EditorIntegrationTests::qmlUnifiedAiSettingsAndWorkspaceScreenshots()
     engine.rootContext()->setContextProperty(QStringLiteral("editor"), &editor);
     engine.rootContext()->setContextProperty(QStringLiteral("roughCut"), &roughCut);
     engine.rootContext()->setContextProperty(QStringLiteral("appRouter"), &router);
-    QStringList warnings;
     QObject::connect(&engine, &QQmlEngine::warnings, &engine, [&](const QList<QQmlError> &errors) {
         for (const QQmlError &error : errors) warnings.append(error.toString());
     });
@@ -980,12 +1014,284 @@ void EditorIntegrationTests::qmlUnifiedAiSettingsAndWorkspaceScreenshots()
     QVERIFY(window->findChild<QObject *>(QStringLiteral("aiReviewMenuButton")));
     QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-workspace-router-%1.png")
         .arg(QGuiApplication::platformName()))));
+    editor.loadMedia(QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav"))));
+    QTRY_VERIFY_WITH_TIMEOUT(!editor.busy(), 8'000);
+    Subtitle first;
+    first.id = QStringLiteral("timeline-a"); first.text = QStringLiteral("时间轴优先：正文与时间可以一次应用，长文字可以查看完整内容。 ").repeated(3);
+    first.start = MediaTime::fromMicroseconds(100'001); first.end = MediaTime::fromMicroseconds(700'001);
+    first.status = QStringLiteral("LOW_CONFIDENCE");
+    Subtitle second = first;
+    second.id = QStringLiteral("timeline-b"); second.text = QStringLiteral("重叠字幕独立显示，工程可以保留编辑结果");
+    second.start = MediaTime::fromMicroseconds(300'001); second.end = MediaTime::fromMicroseconds(800'001);
+    second.status = QStringLiteral("REVIEW");
+    QList<Subtitle> listSample{first, second};
+    for (int index = 0; index < 20; ++index) {
+        Subtitle cue;
+        cue.id = QStringLiteral("list-%1").arg(index);
+        cue.text = QStringList{QStringLiteral("列表优先，连续浏览多条字幕"), QStringLiteral("编号和起止时间固定在左侧"), QStringLiteral("双击正文或按 Enter 打开编辑窗"), QStringLiteral("重叠提示保留在对应字幕行")}.at(index % 4);
+        cue.status = QStringLiteral("UNMATCHED");
+        listSample.append(cue);
+    }
+    editor.applySubtitles(listSample);
+    auto *subtitleList = window->findChild<QObject *>(QStringLiteral("subtitleList"));
+    QVERIFY(subtitleList);
+    QTRY_COMPARE(subtitleList->property("currentIndex").toInt(), 0);
+    QTest::qWait(80);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-list-priority-%1.png").arg(QGuiApplication::platformName()))));
+    QFile timedInput(dir.filePath(QStringLiteral("imported.srt")));
+    QVERIFY(timedInput.open(QIODevice::WriteOnly));
+    QVERIFY(timedInput.write("1\n00:00:00,100 --> 00:00:00,400\nImported cue\n") > 0);
+    timedInput.close();
+    editor.importTimedSubtitles(QUrl::fromLocalFile(timedInput.fileName()));
+    QTRY_COMPARE(subtitleList->property("currentIndex").toInt(), 0);
+    QCOMPARE(editor.selectedCueId(), editor.document()->subtitles().first().id);
+    editor.applySubtitles({first, second});
+    editor.selectCue(0, false);
+    auto *timeline = window->findChild<TimelineSceneItem *>(QStringLiteral("timelineScene"));
+    auto *textEditor = qobject_cast<QQuickItem *>(window->findChild<QObject *>(QStringLiteral("cueTextEditor")));
+    auto *startEditor = window->findChild<QObject *>(QStringLiteral("cueStartTime"));
+    auto *workspace = window->findChild<QObject *>(QStringLiteral("subtitleWorkspace"));
+    QVERIFY(timeline && textEditor && startEditor && workspace);
+    QVERIFY(!textEditor->isVisible());
+    editor.fitTimeline(timeline->width());
+    QTest::qWait(80);
+    QCOMPARE(editor.overlappingCueCount(), 2);
+    QCOMPARE(timeline->visibleCueCount(), 2);
+    QSignalSpy dragging(timeline, &TimelineSceneItem::cueDragStarted);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+        timeline->mapToScene(QPointF(timeline->width() * 0.2, 48)).toPoint());
+    QCOMPARE(dragging.count(), 0);
+    QVERIFY(!editor.property("canUndo").toBool());
+    const QPoint dragStart = timeline->mapToScene(QPointF(timeline->width() * 0.25, 48)).toPoint();
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, dragStart);
+    QTest::mouseMove(window, dragStart + QPoint{40, 0}, 30);
+    QVERIFY(dragging.count() > 0);
+    QVERIFY(!timeline->dragPreview().isEmpty());
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, dragStart + QPoint{40, 0});
+    QVERIFY(timeline->dragPreview().isEmpty());
+    QVERIFY(!editor.property("canUndo").toBool());
+    QTest::qWait(50);
+    const QVariantMap builds = timeline->renderStats();
+    timeline->setFollowDirection(0);
+    for (qint64 position : {qint64{200'000}, qint64{2'000'000}, qint64{400'000}}) {
+        timeline->setPlayheadUs(position);
+        QTest::qWait(30);
+    }
+    QCOMPARE(timeline->renderStats(), builds);
+    editor.seek(400);
+    editor.selectCue(0, false);
+    editor.createOrEditCue();
+    QTest::qWait(30);
+    textEditor->forceActiveFocus(Qt::OtherFocusReason);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-edit-dialog-%1.png").arg(QGuiApplication::platformName()))));
+    QTest::keyClick(window, Qt::Key_A, Qt::ControlModifier);
+    for (const char key : QByteArray("atomic edit")) QTest::keyClick(window, key);
+    QCOMPARE(editor.subtitleModel()->property("count").toInt(), 2);
+    QCOMPARE(editor.currentSubtitleText().contains(QStringLiteral("atomic edit")), false);
+    QCOMPARE(textEditor->property("text").toString(), QStringLiteral("atomic edit"));
+    QTest::keyClick(window, Qt::Key_Return);
+    QTRY_COMPARE(editor.currentSubtitleText().contains(QStringLiteral("atomic edit")), true);
+    editor.undo();
+    QCOMPARE(editor.currentSubtitleText().contains(first.text), true);
+    QCOMPARE(editor.subtitleModel()->property("count").toInt(), 2);
+    editor.createOrEditCue();
+    QTest::qWait(30);
+    textEditor->forceActiveFocus(Qt::OtherFocusReason);
+    QTest::keyClick(window, Qt::Key_A, Qt::ControlModifier);
+    for (const char key : QByteArray("unapplied")) QTest::keyClick(window, key);
+    QTest::keyClick(window, Qt::Key_Escape);
+    QVERIFY(!workspace->property("draftChanged").toBool());
+    QCOMPARE(editor.currentSubtitleText().contains(first.text), true);
+    editor.createOrEditCue();
+    QTest::qWait(30);
+    textEditor->forceActiveFocus(Qt::OtherFocusReason);
+    QInputMethodEvent composing(QStringLiteral("拼音候选"), {});
+    QCoreApplication::sendEvent(textEditor, &composing);
+    QVERIFY(textEditor->property("inputMethodComposing").toBool());
+    QTest::keyClick(window, Qt::Key_Return);
+    QVERIFY(!editor.property("canUndo").toBool());
+    QInputMethodEvent completed;
+    QCoreApplication::sendEvent(textEditor, &completed);
+    QTest::keyClick(window, Qt::Key_Escape);
+    editor.createOrEditCue();
+    QTest::qWait(30);
+    startEditor->setProperty("text", QStringLiteral("invalid"));
+    QVERIFY(QMetaObject::invokeMethod(workspace, "commitPendingCue"));
+    timeline->forceActiveFocus(Qt::OtherFocusReason);
+    QTest::keyClick(window, Qt::Key_2, Qt::ControlModifier);
+    QCOMPARE(router.workspace(), QStringLiteral("subtitle"));
+    QVERIFY(!workspace->property("draftError").toString().isEmpty());
+    QVERIFY(QMetaObject::invokeMethod(workspace, "discardDraft"));
+    timeline->forceActiveFocus(Qt::OtherFocusReason);
+    QTest::keyClick(window, Qt::Key_F1);
+    QTest::qWait(30);
+    QTest::keyClick(window, Qt::Key_Delete);
+    QCOMPARE(editor.subtitleModel()->property("count").toInt(), 2);
+    QTest::keyClick(window, Qt::Key_Escape);
+    window->setMinimumSize(QSize{880, 500});
+    for (const QSize size : {QSize{1440, 900}, QSize{1100, 700}, QSize{1366, 768}, QSize{1092, 614}, QSize{911, 512}}) {
+        window->resize(size);
+        editor.fitTimeline(timeline->width());
+        editor.seek(400);
+        QTest::qWait(80);
+        QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-overlap-%1-%2x%3.png")
+            .arg(QGuiApplication::platformName()).arg(size.width()).arg(size.height()))));
+    }
+    window->resize(1440, 900);
+    QTest::qWait(50);
+    Subtitle plainFirst = first;
+    plainFirst.end = MediaTime::fromMicroseconds(400'001);
+    Subtitle plainSecond = second;
+    plainSecond.start = MediaTime::fromMicroseconds(500'001);
+    editor.applySubtitles({plainFirst, plainSecond});
+    const double stableHeight = timeline->subtitleViewportHeight();
+    plainFirst.start = MediaTime::fromMicroseconds(150'001);
+    plainFirst.end = MediaTime::fromMicroseconds(450'001);
+    timeline->setPreviewCue(plainFirst);
+    QCOMPARE(timeline->subtitleViewportHeight(), stableHeight);
+    plainFirst.end = MediaTime::fromMicroseconds(650'001);
+    timeline->setPreviewCue(plainFirst);
+    QVERIFY(timeline->subtitleViewportHeight() > stableHeight);
+    timeline->setPreviewCue(std::nullopt);
+    QCOMPARE(timeline->subtitleViewportHeight(), stableHeight);
+    QSignalSpy exported(&editor, &AppController::exportFinished);
+    QVERIFY(QMetaObject::invokeMethod(workspace, "requestExport"));
+    QTest::qWait(50);
+    auto *exportButton = qobject_cast<QQuickItem *>(window->findChild<QObject *>(QStringLiteral("subtitleExportConfirm")));
+    QVERIFY(exportButton);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+        exportButton->mapToScene(QPointF(exportButton->width() / 2, exportButton->height() / 2)).toPoint());
+    QTRY_COMPARE(exported.count(), 1);
+    QVERIFY(exported.first().first().toBool());
+    QCOMPARE(QDir(dir.path()).entryList({QStringLiteral("*_字幕文件*")}, QDir::Dirs | QDir::NoDotAndDotDot).size(), 1);
+    auto *exportResult = window->findChild<QObject *>(QStringLiteral("subtitleExportResult"));
+    QVERIFY(exportResult);
+    QVERIFY(QMetaObject::invokeMethod(exportResult, "close"));
+    const QString copiedMedia = dir.filePath(QStringLiteral("字幕视频.mp4"));
+    QVERIFY(QFile::copy(mediaPath(QStringLiteral("cfr_av.mp4")), copiedMedia));
+    editor.loadMedia(QUrl::fromLocalFile(copiedMedia));
+    QTRY_VERIFY_WITH_TIMEOUT(!editor.busy() && editor.hasVideo(), 8'000);
+    editor.applySubtitles({first, second});
+    editor.selectCue(0, false);
+    editor.releasePlayback();
+    editor.claimPlayback();
+    editor.seek(0);
+    editor.navigateOverlap(1);
+    QCOMPARE(editor.positionUs(), qint64(300'001));
+    QVERIFY(editor.currentSubtitleText().contains(second.text));
+    auto *videoPreview = window->findChild<VideoPreviewItem *>(QStringLiteral("videoPreview"));
+    QVERIFY(videoPreview);
+    QTRY_VERIFY2_WITH_TIMEOUT(videoPreview->hasFrame() && videoPreview->framePtsUs() >= 300'001 && videoPreview->framePtsUs() - 300'001 <= 1'000'000 / editor.fps() + 1'000, qPrintable(QStringLiteral("frame=%1 pts=%2 position=%3").arg(videoPreview->hasFrame()).arg(videoPreview->framePtsUs()).arg(editor.positionUs())), 3'000);
+    editor.seek(400);
+    window->resize(1440, 900);
+    editor.fitTimeline(timeline->width());
+    QTest::qWait(100);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-video-%1.png").arg(QGuiApplication::platformName()))));
+    QCOMPARE(editor.selectedCueId(), first.id);
+    QSignalSpy saved(&editor, &AppController::projectSaveFinished);
+    const QString subtitleProject = dir.filePath(QStringLiteral("offline.subcue"));
+    QVERIFY(editor.saveProject(QUrl::fromLocalFile(subtitleProject)));
+    QTRY_COMPARE(saved.count(), 1);
+    QVERIFY(saved.first().first().toBool());
+    auto *subtitleResult = window->findChild<QObject *>(QStringLiteral("operationResultDialog"));
+    QVERIFY(subtitleResult);
+    QVERIFY(QMetaObject::invokeMethod(subtitleResult, "close"));
+    editor.newProject();
+    QVERIFY(QFile::rename(copiedMedia, copiedMedia + QStringLiteral(".moved")));
+    editor.openProject(QUrl::fromLocalFile(subtitleProject));
+    QTRY_VERIFY_WITH_TIMEOUT(!editor.busy(), 8'000);
+    QVERIFY(!editor.hasMedia());
+    QCOMPARE(editor.overlappingCueCount(), 2);
+    QCOMPARE(editor.selectedCueId(), first.id);
+    QCOMPARE(workspace->property("draftId").toString(), first.id);
+    QVERIFY(QMetaObject::invokeMethod(subtitleResult, "close"));
+    QTest::qWait(100);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/subtitle-offline-%1.png").arg(QGuiApplication::platformName()))));
+    QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join(QLatin1Char('\n'))));
     QVERIFY(router.switchTo(QStringLiteral("roughcut")));
     QTest::qWait(200);
     QVERIFY(window->findChild<QObject *>(QStringLiteral("roughCutWorkspace")));
     QVERIFY(window->findChild<QObject *>(QStringLiteral("roughCutAiReviewButton")));
     QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/roughcut-workspace-%1.png")
         .arg(QGuiApplication::platformName()))));
+    roughCut.loadMedia(QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav"))));
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy(), 8'000);
+    auto *playButton = qobject_cast<QQuickItem *>(window->findChild<QObject *>(
+        QStringLiteral("roughCutPlayPause")));
+    QVERIFY(playButton);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+        playButton->mapToScene(QPointF(playButton->width() / 2, playButton->height() / 2)).toPoint());
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.playing(), 1'000);
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.positionMs() > 100, 3'000);
+    roughCut.togglePlay();
+
+    RoughCutProject project;
+    project.mediaPath = mediaPath(QStringLiteral("audio.wav"));
+    project.mediaSha256 = RoughCutProjectSerializer::mediaSha256(project.mediaPath);
+    project.sampleRate = roughCut.sampleRate();
+    project.channels = 1;
+    project.sourceSampleCount = roughCut.durationMs() * project.sampleRate / 1000;
+    project.recording = {{QStringLiteral("p1"), QStringLiteral("预览"), 0, project.sourceSampleCount}};
+    RoughCutSegmentDecision decision;
+    decision.recordingIndex = 0;
+    decision.autoDecision = RoughCutDecision::Keep;
+    project.decisions = {decision};
+    const QString projectPath = dir.filePath(QStringLiteral("preview.subcue-roughcut"));
+    QVERIFY(RoughCutProjectSerializer::save(projectPath, project));
+    roughCut.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy(), 8'000);
+    auto *operationResult = window->findChild<QObject *>(QStringLiteral("operationResultDialog"));
+    QVERIFY(operationResult);
+    QTRY_VERIFY(operationResult->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(operationResult, "close"));
+    auto *sequenceButton = qobject_cast<QQuickItem *>(window->findChild<QObject *>(
+        QStringLiteral("roughCutSequencePlay")));
+    QVERIFY(sequenceButton);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+        sequenceButton->mapToScene(QPointF(sequenceButton->width() / 2,
+            sequenceButton->height() / 2)).toPoint());
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.timelineActive(), 1'000);
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.positionMs() > 100, 3'000);
+    roughCut.stopTimeline();
+    project.mediaPath = mediaPath(QStringLiteral("cfr_av.mp4"));
+    project.mediaSha256 = RoughCutProjectSerializer::mediaSha256(project.mediaPath);
+    const auto probe = MediaProbe::probe(project.mediaPath);
+    QVERIFY(std::holds_alternative<MediaInfo>(probe));
+    const auto info = std::get<MediaInfo>(probe);
+    const auto &audioInfo = info.streams.at(info.audioStreamIndex);
+    project.sampleRate = audioInfo.sampleRate;
+    project.channels = audioInfo.channels;
+    project.sourceSampleCount = audioInfo.duration.microseconds() * project.sampleRate / 1'000'000;
+    project.recording[0].endSample = project.sourceSampleCount;
+    project.state.insert(QStringLiteral("mediaInfo"), mediaInfoToJson(info));
+    QVERIFY(RoughCutProjectSerializer::save(projectPath, project));
+    roughCut.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy() && roughCut.hasVideo(), 8'000);
+    QTRY_VERIFY(operationResult->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(operationResult, "close"));
+    roughCut.seek(100);
+    QTest::qWait(200);
+    for (const int width : {1440, 1100}) {
+        window->resize(width, 700);
+        QTest::qWait(100);
+        QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/roughcut-video-results-%1-%2.png")
+            .arg(QGuiApplication::platformName()).arg(width))));
+    }
+    roughCut.setPlaybackRate(1.5);
+    auto *rateCombo = window->findChild<QObject *>(QStringLiteral("roughCutPlaybackRate"));
+    QVERIFY(rateCombo);
+    QTRY_COMPARE(rateCombo->property("currentIndex").toInt(), 4);
+    FakeAsrService waitingAsr;
+    waitingAsr.blockUntilCancel = true;
+    roughCut.setAnalysisOverrides(&waitingAsr);
+    roughCut.startAnalysis();
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.busy() && waitingAsr.calls > 0, 8'000);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/roughcut-video-task-%1.png")
+        .arg(QGuiApplication::platformName()))));
+    roughCut.cancelAnalysis();
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy(), 8'000);
+    QCOMPARE(roughCut.resultCount(), 1);
 }
 
 void EditorIntegrationTests::appControllerAlignmentCancelWaitsForWorker()
@@ -1193,7 +1499,8 @@ void EditorIntegrationTests::appControllerCreateNextScriptCue()
     controller.createNextScriptCue();
     QCOMPARE(editedRow, 0);
     QCOMPARE(edited, QStringLiteral("下一句"));
-    QVERIFY(controller.document()->subtitles().at(0).isTimed());
+    QVERIFY(!controller.document()->subtitles().at(0).isTimed());
+    QVERIFY(controller.applyCueEdit(unmatched.id, edited, 100'000, controller.durationMs() * 1000));
     QCOMPARE(controller.document()->subtitles().at(0).start.milliseconds(), 100);
 }
 

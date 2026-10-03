@@ -66,7 +66,7 @@ QString failureReason(RoughCutFailureType type)
 QVector<RoughCutSegmentDecision> RoughCutDecisionEngine::decide(
     const QVector<RecognizedPassage> &recording, const QVector<ScriptMatch> &matches,
     const QVector<RoughCutRetakeGroup> &groups, const QVector<bool> &alignmentTrustworthy,
-    const QString &scriptText)
+    const QString &scriptText, bool applyCutProtection)
 {
     QVector<RoughCutSegmentDecision> result;
     result.reserve(recording.size());
@@ -151,7 +151,7 @@ QVector<RoughCutSegmentDecision> RoughCutDecisionEngine::decide(
                 QStringLiteral("连续覆盖率 %1").arg(byRecording.at(index).continuousCoverage, 0, 'f', 0)};
         }
     }
-    protectCuts(recording, &result, scriptText);
+    if (applyCutProtection) protectCuts(recording, &result, scriptText);
     return result;
 }
 

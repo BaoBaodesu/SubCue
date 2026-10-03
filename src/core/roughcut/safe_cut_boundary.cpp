@@ -151,8 +151,22 @@ QVector<RoughCutTimelineClip> SafeCutBoundary::buildTimeline(
     const qint64 handleSamples = msToSamples(handle, sampleRate);
     for (RoughCutTimelineClip &clip : clips) {
         if (clip.decision == RoughCutDecision::Cut) continue;
-        clip.sourceStartSample = std::max<qint64>(0, clip.sourceStartSample - handleSamples);
-        clip.sourceEndSample = std::min(sourceSampleCount, clip.sourceEndSample + handleSamples);
+        qint64 start = std::max<qint64>(0, clip.sourceStartSample - handleSamples);
+        qint64 end = std::min(sourceSampleCount, clip.sourceEndSample + handleSamples);
+        // 手柄只能伸进静音，不能把已剪除的原声重新包进时间线。
+        for (int index = 0; index < recording.size() && index < decisions.size(); ++index) {
+            if (decisions.at(index).effectiveDecision() != RoughCutDecision::Cut) continue;
+            const RecognizedPassage &cut = recording.at(index);
+            if (cut.endSample <= cut.startSample) continue;
+            if (start < cut.endSample && clip.sourceStartSample >= cut.endSample)
+                start = std::max(start, cut.endSample);
+            if (end > cut.startSample && clip.sourceEndSample <= cut.startSample)
+                end = std::min(end, cut.startSample);
+        }
+        if (end > start) {
+            clip.sourceStartSample = start;
+            clip.sourceEndSample = end;
+        }
     }
     for (int index = 1; index < clips.size(); ++index) {
         if (clips[index].sourceStartSample < clips[index - 1].sourceEndSample) {
@@ -160,6 +174,17 @@ QVector<RoughCutTimelineClip> SafeCutBoundary::buildTimeline(
             clips[index - 1].sourceEndSample = mid;
             clips[index].sourceStartSample = mid;
         }
+    }
+    // 扩展后的长度才是时间线长度；保留原间隔，重新累计后续位置。
+    const auto original = RoughCutTimelineEngine::build(
+        recording, decisions, sampleRate, sourceSampleCount, {}, 80, postRoll);
+    qint64 endSample = 0;
+    for (int index = 0; index < clips.size(); ++index) {
+        const qint64 gap = index == 0 ? 0 : std::max<qint64>(0,
+            original[index].timelineStartSample - original[index - 1].timelineStartSample
+            - (original[index - 1].sourceEndSample - original[index - 1].sourceStartSample));
+        clips[index].timelineStartSample = endSample + gap;
+        endSample = clips[index].timelineStartSample + clips[index].sourceEndSample - clips[index].sourceStartSample;
     }
     return clips;
 }

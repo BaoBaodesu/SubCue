@@ -133,6 +133,9 @@ QJsonObject SettingsManager::load() const
         const QString derived = ModelLocator::derivedRootFromLegacy(loaded);
         if (!derived.isEmpty()) result.insert(QStringLiteral("modelsRoot"), derived);
     }
+    const QString resolvedRoot = ModelLocator::root(result);
+    if (result.value(QStringLiteral("modelsRoot")).toString().trimmed().isEmpty() && !resolvedRoot.isEmpty())
+        result.insert(QStringLiteral("modelsRoot"), resolvedRoot);
     result.insert(QStringLiteral("qwen3AsrModelsDirectory"),
         ModelLocator::directoryFor(ModelKind::Qwen3Asr, result));
     result.insert(QStringLiteral("qwen3ForcedAlignerModelsDirectory"),

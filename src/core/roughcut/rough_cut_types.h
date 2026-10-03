@@ -2,6 +2,7 @@
 
 #include <QtCore/QList>
 #include <QtCore/QString>
+#include "media/media_types.h"
 
 #include <cstdint>
 
@@ -12,6 +13,10 @@ struct RoughCutSourceClip final {
     qint64 sourceStartSample = 0;
     qint64 sourceEndSample = 0;
     qint64 timelineStartSample = -1;
+    qint64 allowedStartSample = 0;
+    qint64 allowedEndSample = -1;
+    qint64 protectedStartSample = -1;
+    qint64 protectedEndSample = -1;
 };
 
 struct RoughCutExportRequest final {
@@ -23,6 +28,8 @@ struct RoughCutExportRequest final {
     int frameRateNumerator = 60;
     int frameRateDenominator = 1;
     QList<RoughCutSourceClip> clips;
+    MediaInfo mediaInfo;
+    bool sourceRangesAreFrameAligned = false;
 };
 
 } // namespace subcue

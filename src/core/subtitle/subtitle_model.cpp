@@ -96,4 +96,62 @@ QVariantMap SubtitleModel::get(int row) const
     return result;
 }
 
+
+SubtitleFilterModel::SubtitleFilterModel(QObject *parent) : QSortFilterProxyModel(parent)
+{
+    connect(this, &QAbstractItemModel::modelReset, this, &SubtitleFilterModel::countChanged);
+    connect(this, &QAbstractItemModel::rowsInserted, this, &SubtitleFilterModel::countChanged);
+    connect(this, &QAbstractItemModel::rowsRemoved, this, &SubtitleFilterModel::countChanged);
+}
+
+void SubtitleFilterModel::setSearchText(const QString &text)
+{
+    if (searchText_ == text) return;
+    searchText_ = text;
+    invalidateRowsFilter();
+    emit filterChanged();
+}
+
+void SubtitleFilterModel::setStatusFilter(const QString &status)
+{
+    if (statusFilter_ == status) return;
+    statusFilter_ = status;
+    invalidateRowsFilter();
+    emit filterChanged();
+}
+
+void SubtitleFilterModel::setOverlappingIds(const QSet<QString> &ids)
+{
+    if (overlappingIds_ == ids) return;
+    overlappingIds_ = ids;
+    if (statusFilter_ == QStringLiteral("OVERLAP")) invalidateRowsFilter();
+}
+
+bool SubtitleFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex &parent) const
+{
+    const QModelIndex row = sourceModel()->index(sourceRow, 0, parent);
+    const QString status = row.data(SubtitleModel::StatusRole).toString();
+    const bool timed = row.data(SubtitleModel::TimedRole).toBool();
+    if (statusFilter_ == QStringLiteral("REVIEW") && (!timed ||
+        (status != QStringLiteral("REVIEW") && status != QStringLiteral("LOW_CONFIDENCE")))) return false;
+    if (statusFilter_ == QStringLiteral("UNTIMED") && timed) return false;
+    if (statusFilter_ == QStringLiteral("OVERLAP") &&
+        !overlappingIds_.contains(row.data(SubtitleModel::IdRole).toString())) return false;
+    return searchText_.isEmpty() || row.data(SubtitleModel::TextRole).toString().contains(searchText_, Qt::CaseInsensitive);
+}
+
+QVariantMap SubtitleFilterModel::get(int row) const
+{
+    const QModelIndex source = mapToSource(index(row, 0));
+    const auto *model = qobject_cast<const SubtitleModel *>(sourceModel());
+    return source.isValid() && model ? model->get(source.row()) : QVariantMap{};
+}
+
+int SubtitleFilterModel::rowForId(const QString &id) const
+{
+    for (int row = 0; row < rowCount(); ++row)
+        if (index(row, 0).data(SubtitleModel::IdRole).toString() == id) return row;
+    return -1;
+}
+
 } // namespace subcue

@@ -6,6 +6,8 @@
 #include "rough_cut_result_model.h"
 #include "roughcut/timeline_engine.h"
 #include "roughcut/auxiliary_recognition.h"
+#include "roughcut/rough_cut_project.h"
+#include "media/media_types.h"
 
 #include <QtCore/QByteArray>
 #include <QtCore/QObject>
@@ -18,6 +20,7 @@
 #include <thread>
 
 namespace subcue {
+struct RoughCutExportRequest;
 
 class ApplicationContext;
 class TimelineSceneItem;
@@ -51,6 +54,13 @@ class RoughCutController final : public QObject {
     Q_PROPERTY(QString statusFilter READ statusFilter WRITE setStatusFilter NOTIFY statusFilterChanged)
     Q_PROPERTY(bool modified READ modified NOTIFY modifiedChanged)
     Q_PROPERTY(bool canSave READ canSave NOTIFY canSaveChanged)
+    Q_PROPERTY(bool mediaAvailable READ mediaAvailable NOTIFY mediaChanged)
+    Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY mediaChanged)
+    Q_PROPERTY(double sourceFrameRate READ sourceFrameRate NOTIFY mediaChanged)
+    Q_PROPERTY(bool analysisStale READ analysisStale NOTIFY scriptChanged)
+    Q_PROPERTY(QString xmlExportReason READ xmlExportReason NOTIFY mediaChanged)
+    Q_PROPERTY(QString sequenceFrameRate READ sequenceFrameRate NOTIFY projectChanged)
+    Q_PROPERTY(QVariantMap sessionState READ sessionState NOTIFY projectChanged)
 
 public:
     explicit RoughCutController(ApplicationContext *context, QObject *parent = nullptr);
@@ -79,11 +89,23 @@ public:
     [[nodiscard]] qint64 durationMs() const;
     [[nodiscard]] int resultCount() const { return model_.rowCount(); }
     [[nodiscard]] bool canAiReview() const { return model_.rowCount() > 0 && !busy_; }
-    [[nodiscard]] bool canExport() const noexcept { return !timeline_.isEmpty() && !busy_; }
+    [[nodiscard]] bool canExport() const { return !timeline_.isEmpty() && !busy_ && mediaAvailable() && !analysisStale(); }
     [[nodiscard]] QString statusFilter() const { return filterModel_.statusFilter(); }
     void setStatusFilter(const QString &value) { filterModel_.setStatusFilter(value); }
     [[nodiscard]] bool modified() const noexcept { return modified_; }
-    [[nodiscard]] bool canSave() const noexcept { return !mediaPath_.isEmpty() && !busy_; }
+    [[nodiscard]] bool canSave() const noexcept { return !busy_ && !shuttingDown_; }
+    [[nodiscard]] bool mediaAvailable() const { return playback_.isOpen(); }
+    [[nodiscard]] bool hasVideo() const { return mediaInfo_.videoStreamIndex >= 0; }
+    [[nodiscard]] bool analysisStale() const { return analysisVersion_ > 0 && scriptText_ != projectData_.state.value(QStringLiteral("analysisScriptText")).toString(scriptText_); }
+    [[nodiscard]] QString xmlExportReason() const;
+    [[nodiscard]] double sourceFrameRate() const {
+        if (!hasVideo()) return 0;
+        const auto &video = mediaInfo_.streams.at(mediaInfo_.videoStreamIndex);
+        return video.frameRateDenominator > 0 ? double(video.frameRateNumerator) / video.frameRateDenominator : 0;
+    }
+    [[nodiscard]] QString sequenceFrameRate() const;
+    [[nodiscard]] QVariantMap sessionState() const { return projectData_.state.value(QStringLiteral("session")).toObject().toVariantMap(); }
+    Q_INVOKABLE void setSessionState(const QVariantMap &state) { projectData_.state.insert(QStringLiteral("session"), QJsonObject::fromVariantMap(state)); }
     [[nodiscard]] int sampleRate() const noexcept { return sampleRate_; }
     [[nodiscard]] const QVector<RecognizedPassage> &recording() const noexcept { return model_.recording(); }
     [[nodiscard]] const QVector<RoughCutSegmentDecision> &decisions() const noexcept { return model_.decisions(); }
@@ -94,6 +116,10 @@ public:
     Q_INVOKABLE bool saveProject(const QUrl &url);
     Q_INVOKABLE bool saveCurrentProject();
     Q_INVOKABLE void openProject(const QUrl &url);
+    Q_INVOKABLE void newProject();
+    Q_INVOKABLE void relinkMedia(const QUrl &url);
+    Q_INVOKABLE void setSequenceFrameRate(const QString &rate);
+    Q_INVOKABLE void setPreviewItem(QObject *item);
     void setAnalysisOverrides(IAsrService *asr);
     void releasePlayback();
     void claimPlayback();
@@ -126,6 +152,9 @@ public:
     Q_INVOKABLE void exportWav(const QUrl &url);
 
 signals:
+    void projectSaveFinished(bool success, const QString &path, const QString &message);
+    void projectOpenFinished(bool success, const QString &path, const QString &message);
+    void exportFinished(bool success, const QString &path, const QString &message);
     void mediaChanged();
     void scriptChanged();
     void projectChanged();
@@ -143,6 +172,10 @@ signals:
     void canSaveChanged();
 
 private:
+    [[nodiscard]] RoughCutProject projectSnapshot() const;
+    void applyProject(const RoughCutProject &project, const QString &path, const MediaInfo &info, bool available);
+    void startFrameRateCheck();
+    void stopFrameRateCheck();
     struct Edit final {
         int row = -1;
         std::optional<RoughCutDecision> before;
@@ -156,6 +189,7 @@ private:
     void startWaveformWorker();
     void syncSceneItems();
     void rebuildTimeline();
+    [[nodiscard]] RoughCutExportRequest exportRequest(QString *error) const;
     void applyEdit(const Edit &edit, bool forward);
     void startTimelineClip(int index);
     void setStatus(QString value);
@@ -176,7 +210,12 @@ private:
     QString scriptPath_;
     QString scriptText_;
     QString projectPath_;
-    QString statusText_ = QStringLiteral("请选择完整 WAV。");
+    RoughCutProject projectData_;
+    MediaInfo mediaInfo_;
+    std::thread frameRateWorker_;
+    std::atomic<bool> frameRateCancel_{false};
+    QPointer<class VideoPreviewItem> previewItem_;
+    QString statusText_ = QStringLiteral("请选择音视频素材。");
     int sampleRate_ = 0;
     int channels_ = 0;
     qint64 sourceSampleCount_ = 0;

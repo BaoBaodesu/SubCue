@@ -66,6 +66,7 @@ private:
     };
 
     [[nodiscard]] MediaTime snapTime(MediaTime value, const QString &excludeId) const;
+    [[nodiscard]] bool commitMove(const QString &id, MediaTime start, MediaTime end);
 
     SubtitleDocument *document_;
     SubtitleCommandManager *commands_;

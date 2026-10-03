@@ -6,6 +6,7 @@
 #include "playback/audio_output.h"
 #include "preview/preview_renderer.h"
 #include "subtitle/subtitle.h"
+#include "subtitle/subtitle_model.h"
 #include "timeline_scene_item.h"
 #include "video_preview_item.h"
 
@@ -15,6 +16,7 @@
 #endif
 
 #include <QtCore/QCoreApplication>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QDir>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
@@ -73,16 +75,21 @@ private slots:
     void projectFilesImportReopenAndRemove();
     void invalidImportPreservesCurrentMedia();
     void appControllerAppliesSubtitlesAndOverlayText();
-    void currentSubtitlePrefersDocumentOrderOnOverlap();
+    void currentSubtitleShowsAllOverlapsInDocumentOrder();
     void timelinePlayheadDoesNotDirtyStaticGeometry();
+    void atomicCueEditsOverlapAndStableFiltering();
+    void timelineVisibilityScalesWithViewport();
     void appControllerSettingsRoundTrip();
     void settingsRoundTripIncludesModelsRoot();
     void unifiedAiKeySaveClearAndRollback();
     void saveSettingsDoesNotSendAiHttp();
     void appControllerPreflightReportsAllMissingItems();
     void appControllerExportsSrt();
+    void draftProjectRoundTripAndFailedOpenPreservesEdits();
     void appControllerPlayPauseSeek();
     void wasapiProbeDoesNotCrash();
+    void navigatePendingAndMismatchCues();
+    void multilinePreviewFlagAndExportPreservesModified();
 
 private:
     [[nodiscard]] QString mediaPath(const QString &name) const;
@@ -100,6 +107,35 @@ std::unique_ptr<ApplicationContext> AppControllerTests::makeContext(const QTempo
         dir.filePath(QStringLiteral("settings.json")),
         dir.filePath(QStringLiteral("credentials.dat")),
         AudioDeviceKind::Virtual);
+}
+
+void AppControllerTests::draftProjectRoundTripAndFailedOpenPreservesEdits()
+{
+    QTemporaryDir dir;
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    controller.setScriptText(QStringLiteral("手改文稿\n第二行"));
+    QVERIFY(controller.modified());
+    const auto path = dir.filePath(QStringLiteral("草稿.subcue"));
+    QSignalSpy saved(&controller, &AppController::projectSaveFinished);
+    QVERIFY(controller.saveProject(QUrl::fromLocalFile(path)));
+    QTRY_COMPARE_WITH_TIMEOUT(saved.count(), 1, 8000);
+    QVERIFY(saved.at(0).at(0).toBool());
+    QVERIFY(!controller.modified());
+    controller.newProject();
+    QSignalSpy opened(&controller, &AppController::projectOpenFinished);
+    controller.openProject(QUrl::fromLocalFile(path));
+    QTRY_COMPARE_WITH_TIMEOUT(opened.count(), 1, 8000);
+    QVERIFY(opened.at(0).at(0).toBool());
+    QCOMPARE(controller.scriptText(), QStringLiteral("手改文稿\n第二行"));
+    QVERIFY(!controller.hasMedia());
+    QVERIFY(!controller.modified());
+    controller.setScriptText(QStringLiteral("保留当前编辑"));
+    controller.openProject(QUrl::fromLocalFile(dir.filePath(QStringLiteral("不存在.subcue"))));
+    QTRY_COMPARE_WITH_TIMEOUT(opened.count(), 2, 8000);
+    QVERIFY(!opened.at(1).at(0).toBool());
+    QCOMPARE(controller.scriptText(), QStringLiteral("保留当前编辑"));
+    QVERIFY(controller.modified());
 }
 
 void AppControllerTests::audioOutputTakeFramesAdvancesClockBuffer()
@@ -263,6 +299,7 @@ void AppControllerTests::appControllerImportsDocxFixture()
     const QString path = mediaPath(QStringLiteral("script_sample.docx"));
     QVERIFY(controller.canImportFiles({QUrl::fromLocalFile(path)}));
     controller.importScriptPath(path);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 15000);
     QVERIFY2(controller.scriptText().startsWith(QStringLiteral("Hello 各位观众朋友们好")),
         qPrintable(controller.statusText()));
     QVERIFY(controller.scriptText().split(QLatin1Char('\n')).size() >= 2);
@@ -385,7 +422,7 @@ void AppControllerTests::appControllerAppliesSubtitlesAndOverlayText()
     QCOMPARE(controller.formatTime(3'661'234), QStringLiteral("01:01:01.234"));
 }
 
-void AppControllerTests::currentSubtitlePrefersDocumentOrderOnOverlap()
+void AppControllerTests::currentSubtitleShowsAllOverlapsInDocumentOrder()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
@@ -406,11 +443,86 @@ void AppControllerTests::currentSubtitlePrefersDocumentOrderOnOverlap()
     controller.seek(100);
     QCOMPARE(controller.currentSubtitleText(), QStringLiteral("Covering"));
     controller.seek(1'500);
-    QCOMPARE(controller.currentSubtitleText(), QStringLiteral("First"));
+    QCOMPARE(controller.currentSubtitleText(), QStringLiteral("First\nCovering"));
     controller.seek(2'000);
     QCOMPARE(controller.currentSubtitleText(), QStringLiteral("Covering"));
     controller.seek(3'000);
     QCOMPARE(controller.currentSubtitleText(), QString());
+}
+
+void AppControllerTests::atomicCueEditsOverlapAndStableFiltering()
+{
+    QTemporaryDir dir;
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    controller.loadMedia(QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav"))));
+    QTRY_VERIFY(!controller.busy());
+    Subtitle first;
+    first.id = QStringLiteral("a"); first.text = QStringLiteral("第一条");
+    first.start = MediaTime::fromMicroseconds(100'001); first.end = MediaTime::fromMicroseconds(400'001);
+    first.status = QStringLiteral("MANUAL");
+    Subtitle second = first;
+    second.id = QStringLiteral("b"); second.text = QStringLiteral("第二条");
+    second.start = MediaTime::fromMicroseconds(400'001); second.end = MediaTime::fromMicroseconds(1'100'001);
+    controller.applySubtitles({first, second});
+    QVERIFY(controller.applyCueEdit(QStringLiteral("a"), QStringLiteral("手改"), -1, -1));
+    QCOMPARE(qobject_cast<SubtitleModel *>(controller.subtitleModel())->get(0).value(QStringLiteral("startUs")).toLongLong(), qint64{100'001});
+    controller.undo();
+    QCOMPARE(qobject_cast<SubtitleModel *>(controller.subtitleModel())->get(0).value(QStringLiteral("text")).toString(), first.text);
+    QVERIFY(controller.applyCueEdit(QStringLiteral("a"), QStringLiteral("重叠"), 300'001, 700'001));
+    QCOMPARE(controller.overlappingCueCount(), 2);
+    QCOMPARE(controller.overlapCount(), 1);
+    QVERIFY(!controller.canExport());
+    QCOMPARE(qobject_cast<SubtitleModel *>(controller.subtitleModel())->get(1).value(QStringLiteral("startUs")).toLongLong(), qint64{400'001});
+    qobject_cast<SubtitleFilterModel *>(controller.filteredSubtitleModel())->setSearchText(QStringLiteral("第二"));
+    QCOMPARE(qobject_cast<SubtitleFilterModel *>(controller.filteredSubtitleModel())->get(0).value(QStringLiteral("id")).toString(), QStringLiteral("b"));
+    QVERIFY(controller.applyCueEdit(QStringLiteral("b"), QStringLiteral("第二条修正"), -1, -1));
+    QCOMPARE(qobject_cast<SubtitleModel *>(controller.subtitleModel())->get(0).value(QStringLiteral("text")).toString(), QStringLiteral("重叠"));
+    QVERIFY(!controller.applyCueEdit(QStringLiteral("失效"), QStringLiteral("错误"), -1, -1));
+    QSignalSpy saved(&controller, &AppController::projectSaveFinished);
+    const QString path = dir.filePath(QStringLiteral("overlap.subcue"));
+    QVERIFY(controller.saveProject(QUrl::fromLocalFile(path)));
+    QTRY_COMPARE(saved.count(), 1);
+    QVERIFY(saved.first().first().toBool());
+    controller.openProject(QUrl::fromLocalFile(path));
+    QTRY_VERIFY(!controller.busy());
+    QCOMPARE(controller.overlapCount(), 1);
+    QCOMPARE(controller.overlappingCueCount(), 2);
+    QSignalSpy exported(&controller, &AppController::exportFinished);
+    controller.exportSubtitles(dir.path());
+    QCOMPARE(exported.count(), 1);
+    QVERIFY(!exported.first().first().toBool());
+}
+
+void AppControllerTests::timelineVisibilityScalesWithViewport()
+{
+    TimelineSceneItem item;
+    item.setWidth(1000); item.setHeight(300); item.setDurationUs(1'100'000'000);
+    item.setView(1.0, 50'000);
+    for (const int count : {1000, 10000}) {
+        QList<Subtitle> cues;
+        for (int row = 0; row < count; ++row) {
+            Subtitle cue;
+            cue.id = QString::number(row); cue.text = QStringLiteral("性能样本"); cue.status = QStringLiteral("MATCHED");
+            cue.start = MediaTime::fromMicroseconds(row * qint64{100'000});
+            cue.end = MediaTime::fromMicroseconds(row * qint64{100'000} + 50'000);
+            cues.append(cue);
+        }
+        item.setSubtitles(cues);
+        QVERIFY(item.visibleCueCount() >= 10 && item.visibleCueCount() <= 12);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        for (int sample = 0; sample < 2000; ++sample) QVERIFY(item.visibleCueCount() <= 12);
+        qInfo() << "viewport_query_cues=" << count << "iterations=2000 elapsed_ns=" << elapsed.nsecsElapsed();
+        for (Subtitle &cue : cues) { cue.start = MediaTime::fromMicroseconds(0); cue.end = MediaTime::fromMicroseconds(1'000'000'000); }
+        item.setSubtitles(cues);
+        QVERIFY(item.visibleCueCount() > 0 && item.visibleCueCount() <= 4);
+        item.setSubtitleScrollOffset(item.subtitleContentHeight() - item.subtitleViewportHeight());
+        QVERIFY(item.visibleCueCount() > 0 && item.visibleCueCount() <= 4);
+    }
+    item.consumePaintDirtyForTest();
+    item.setSelectedCueId(QStringLiteral("9999"));
+    QVERIFY(!(item.pendingPaintDirty() & TimelineSceneItem::PaintGeometry));
 }
 
 void AppControllerTests::timelinePlayheadDoesNotDirtyStaticGeometry()
@@ -610,6 +722,87 @@ void AppControllerTests::wasapiProbeDoesNotCrash()
 #else
     QSKIP("WASAPI is Windows-only");
 #endif
+}
+
+void AppControllerTests::navigatePendingAndMismatchCues()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+
+    Subtitle matched;
+    matched.text = QStringLiteral("对齐");
+    matched.start = MediaTime::fromMilliseconds(0);
+    matched.end = MediaTime::fromMilliseconds(1'000);
+    matched.status = QStringLiteral("MATCHED");
+    matched.confidence = 0.9;
+    matched.metadata.insert(QStringLiteral("audioEvidence"), true);
+
+    Subtitle low;
+    low.text = QStringLiteral("待确认");
+    low.start = MediaTime::fromMilliseconds(1'200);
+    low.end = MediaTime::fromMilliseconds(2'000);
+    low.status = QStringLiteral("LOW_CONFIDENCE");
+    low.confidence = 0.2;
+    low.metadata.insert(QStringLiteral("audioEvidence"), true);
+
+    Subtitle review;
+    review.text = QStringLiteral("对不上");
+    review.start = MediaTime::fromMilliseconds(2'200);
+    review.end = MediaTime::fromMilliseconds(3'000);
+    review.status = QStringLiteral("REVIEW");
+    review.metadata.insert(QStringLiteral("audioEvidence"), false);
+
+    Subtitle untimed;
+    untimed.text = QStringLiteral("未定位");
+    untimed.status = QStringLiteral("SKIPPED_NO_AUDIO");
+
+    controller.applySubtitles({matched, low, review, untimed});
+    controller.selectCue(0, false);
+    controller.navigatePendingCue(1);
+    QCOMPARE(controller.selectedCue(), 1);
+    controller.navigatePendingCue(1);
+    QCOMPARE(controller.selectedCue(), 2);
+    controller.navigatePendingCue(1);
+    QCOMPARE(controller.selectedCue(), 3);
+    controller.navigateMismatchCue(1);
+    QCOMPARE(controller.selectedCue(), 1);
+    controller.navigateMismatchCue(1);
+    QCOMPARE(controller.selectedCue(), 2);
+}
+
+void AppControllerTests::multilinePreviewFlagAndExportPreservesModified()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("outputSrt"), true);
+    context->settings.insert(QStringLiteral("outputAss"), false);
+    context->settings.insert(QStringLiteral("outputDirectory"), dir.path());
+    context->settings.insert(QStringLiteral("fontSize1080p"), 52);
+    AppController controller(context.get());
+
+    Subtitle shortCue;
+    shortCue.text = QStringLiteral("短");
+    shortCue.start = MediaTime::fromMilliseconds(0);
+    shortCue.end = MediaTime::fromMilliseconds(1'000);
+    shortCue.status = QStringLiteral("MATCHED");
+
+    Subtitle longCue;
+    longCue.text = QStringLiteral("这是一条需要在节目监视器里折成两行以上的很长很长很长很长很长很长很长很长很长很长的字幕文本内容");
+    longCue.start = MediaTime::fromMilliseconds(1'200);
+    longCue.end = MediaTime::fromMilliseconds(2'200);
+    longCue.status = QStringLiteral("MATCHED");
+
+    controller.applySubtitles({shortCue, longCue});
+    QVERIFY(controller.modified());
+    QVERIFY(!controller.document()->subtitles().at(0).metadata.value(QStringLiteral("multilinePreview")).toBool());
+    QVERIFY(controller.document()->subtitles().at(1).metadata.value(QStringLiteral("multilinePreview")).toBool());
+
+    controller.exportSubtitles();
+    QVERIFY(controller.statusText().contains(QStringLiteral("导出完成")));
+    QVERIFY(controller.modified());
 }
 
 QTEST_MAIN(AppControllerTests)

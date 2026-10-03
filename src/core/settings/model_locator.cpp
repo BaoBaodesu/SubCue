@@ -17,18 +17,26 @@ QString ModelLocator::compiledDefaultRoot()
 
 QString ModelLocator::root(const QJsonObject &settings)
 {
-    const QString fromSettings = QDir::fromNativeSeparators(
-        settings.value(QStringLiteral("modelsRoot")).toString().trimmed());
-    if (!fromSettings.isEmpty()) return QDir::cleanPath(fromSettings);
+    const auto existing = [](const QString &path) {
+        const QString cleaned = QDir::cleanPath(QDir::fromNativeSeparators(path.trimmed()));
+        return !cleaned.isEmpty() && QDir(cleaned).exists() ? cleaned : QString();
+    };
+    const QString configured = settings.value(QStringLiteral("modelsRoot")).toString().trimmed();
+    const QString fromSettings = configured.isEmpty() ? QString()
+        : QDir::cleanPath(QDir::fromNativeSeparators(configured));
+    if (!fromSettings.isEmpty()) return fromSettings;
 
-    const QString fromLegacy = derivedRootFromLegacy(settings);
+    const QString fromLegacy = existing(derivedRootFromLegacy(settings));
     if (!fromLegacy.isEmpty()) return fromLegacy;
 
-    const QString fromEnv = QDir::fromNativeSeparators(
-        QProcessEnvironment::systemEnvironment().value(QStringLiteral("SUBCUE_MODELS_ROOT")).trimmed());
-    if (!fromEnv.isEmpty()) return QDir::cleanPath(fromEnv);
+    const QString fromEnv = existing(QProcessEnvironment::systemEnvironment().value(
+        QStringLiteral("SUBCUE_MODELS_ROOT")));
+    if (!fromEnv.isEmpty()) return fromEnv;
 
-    return QDir::cleanPath(compiledDefaultRoot());
+    const QString compiled = existing(compiledDefaultRoot());
+    if (!compiled.isEmpty()) return compiled;
+
+    return {};
 }
 
 QString ModelLocator::folderName(ModelKind kind)

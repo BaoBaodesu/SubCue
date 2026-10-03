@@ -2,6 +2,7 @@
 
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QProcess>
+#include <QtCore/QThread>
 
 namespace subcue {
 
@@ -24,11 +25,24 @@ InferenceProcessResult InferenceManager::run(
     int timeoutMs,
     const std::function<void(const QByteArray &)> &event)
 {
-    const Lease lease = acquire();
     InferenceProcessResult result;
+    Lease lease(mutex_, std::defer_lock);
+    QElapsedTimer waiting;
+    waiting.start();
+    while (!lease.try_lock()) {
+        if (cancel && cancel->load()) { result.cancelled = true; return result; }
+        if (timeoutMs >= 0 && waiting.elapsed() >= timeoutMs) { result.timedOut = true; return result; }
+        QThread::msleep(50);
+    }
+    if (cancel && cancel->load()) { result.cancelled = true; return result; }
     QProcess process;
     process.start(program, arguments);
-    result.started = process.waitForStarted(10'000);
+    waiting.restart();
+    while (!(result.started = process.waitForStarted(100)) && process.state() == QProcess::Starting) {
+        if (cancel && cancel->load()) { result.cancelled = true; break; }
+        if (waiting.elapsed() >= 10'000) { result.timedOut = true; break; }
+    }
+    if (!result.started && process.state() != QProcess::NotRunning) { process.kill(); process.waitForFinished(); }
     if (!result.started) {
         result.standardError = process.readAllStandardError();
         return result;

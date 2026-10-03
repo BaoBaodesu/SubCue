@@ -9,6 +9,11 @@ Button {
     rightPadding: 16
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fontSize
+    hoverEnabled: true
+    property string shortcutHint: action ? (action.keySequence || String(action.shortcut || "")) : ""
+    ToolTip.visible: hovered && shortcutHint !== ""
+    ToolTip.delay: 600
+    ToolTip.text: shortcutHint !== "" ? (text + "  " + shortcutHint) : text
 
     contentItem: Text {
         text: control.text
@@ -22,7 +27,7 @@ Button {
     background: Rectangle {
         radius: Theme.radiusButton
         border.width: 1
-        border.color: control.enabled
+        border.color: control.visualFocus ? Theme.focusBorder : control.enabled
             ? (control.down ? Theme.buttonPressed : (control.hovered ? Theme.buttonHoverBorder : Theme.buttonBorder))
             : Theme.border
         color: !control.enabled ? Theme.buttonDisabled

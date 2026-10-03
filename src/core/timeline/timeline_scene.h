@@ -25,8 +25,13 @@ struct TimelineCueVisual final {
     QString id;
     QString text;
     TimelineSceneRect rect;
+    QVector<WaveformPeak> waveform;
     bool selected = false;
     bool pending = false;
+    bool audioBlock = false;
+    bool overlapping = false;
+    double waveformX = 0.0;
+    double waveformWidth = 0.0;
     bool operator==(const TimelineCueVisual &) const = default;
 };
 
@@ -41,6 +46,9 @@ struct TimelineSceneMetrics final {
     double rulerHeight = 28.0;
     double subtitleTrackHeight = 54.0;
     double cueVerticalPadding = 7.0;
+    double cueLaneHeight = 54.0;
+    double subtitleScrollOffset = 0.0;
+    bool editable = true;
     double trimHandleWidth = 8.0;
     double playheadHitWidth = 4.0;
 };

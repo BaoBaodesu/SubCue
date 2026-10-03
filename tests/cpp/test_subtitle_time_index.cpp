@@ -38,6 +38,7 @@ class SubtitleTimeIndexTests final : public QObject {
 
 private slots:
     void overlapPrefersDocumentOrder();
+    void preciseOverlapAndAllActiveCues();
     void gapAndBoundaryAreHalfOpen();
     void unorderedTimesStillFollowDocumentOrder();
     void sequentialLookupMatchesRelocate();
@@ -45,6 +46,34 @@ private slots:
     void documentChangeInvalidatesCache();
     void tenThousandCuesStayFasterThanLinearScan();
 };
+
+void SubtitleTimeIndexTests::preciseOverlapAndAllActiveCues()
+{
+    auto first = makeCue(QStringLiteral("a"), 0, 1000, QStringLiteral("A"));
+    auto touching = makeCue(QStringLiteral("b"), 1000, 2000, QStringLiteral("B"));
+    first.end = MediaTime::fromMicroseconds(1'000'001);
+    touching.start = MediaTime::fromMicroseconds(1'000'001);
+    SubtitleTimeIndex index;
+    index.rebuild({first, touching});
+    QVERIFY(index.overlapRanges().isEmpty());
+    QCOMPARE(index.activeDocumentIndices(1'000'000), QVector<int>{0});
+    QCOMPARE(index.activeDocumentIndices(1'000'001), QVector<int>{1});
+    touching.start = MediaTime::fromMicroseconds(1'000'000);
+    index.rebuild({first, touching});
+    QCOMPARE(index.overlappingIds().size(), 2);
+    QCOMPARE(index.overlapRanges().size(), 1);
+    QCOMPARE(index.overlapRanges().first().first, qint64{1'000'000});
+    QCOMPARE(index.overlapRanges().first().second, qint64{1'000'001});
+    QCOMPARE(index.activeDocumentIndices(1'000'000), (QVector<int>{0, 1}));
+    QList<Subtitle> dense;
+    for (int row = 0; row < 10'000; ++row)
+        dense.append(makeCue(QString::number(row), 100, 900, QString::number(row)));
+    index.rebuild(dense);
+    QCOMPARE(index.overlappingIds().size(), 10'000);
+    QCOMPARE(index.overlapRanges().size(), 1);
+    QCOMPARE(index.activeDocumentIndices(500'000).size(), 10'000);
+    QVERIFY(index.activeDocumentIndices(900'000).isEmpty());
+}
 
 void SubtitleTimeIndexTests::overlapPrefersDocumentOrder()
 {

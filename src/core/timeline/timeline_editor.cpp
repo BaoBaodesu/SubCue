@@ -1,5 +1,7 @@
 #include "timeline/timeline_editor.h"
 
+#include <QtCore/QVector>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -43,11 +45,35 @@ NeighborBounds TimelineEditor::neighborBounds(const QString &id) const
     NeighborBounds bounds;
     bounds.previousEnd = MediaTime::fromMicroseconds(0);
     bounds.nextStart = viewport_->timelineDuration();
+    const auto current = document_->subtitle(id);
+    if (!current) {
+        return bounds;
+    }
+    const QList<Subtitle> &list = document_->subtitles();
+    if (current->isTimed()) {
+        const qint64 start = current->start.microseconds();
+        const qint64 end = current->end.microseconds();
+        qint64 previousEnd = 0;
+        qint64 nextStart = bounds.nextStart.microseconds();
+        for (const Subtitle &cue : list) {
+            if (cue.id == id || !cue.isTimed()) {
+                continue;
+            }
+            if (cue.start.microseconds() < start) {
+                previousEnd = std::max(previousEnd, std::min(start, cue.end.microseconds()));
+            }
+            if (cue.end.microseconds() > end) {
+                nextStart = std::min(nextStart, std::max(end, cue.start.microseconds()));
+            }
+        }
+        bounds.previousEnd = MediaTime::fromMicroseconds(previousEnd);
+        bounds.nextStart = MediaTime::fromMicroseconds(nextStart);
+        return bounds;
+    }
     const int index = document_->indexOf(id);
     if (index < 0) {
         return bounds;
     }
-    const QList<Subtitle> &list = document_->subtitles();
     for (int i = index - 1; i >= 0; --i) {
         if (list.at(i).isTimed()) {
             bounds.previousEnd = list.at(i).end;
@@ -119,14 +145,13 @@ bool TimelineEditor::updateDrag(MediaTime delta)
     }
 
     DragState &drag = *drag_;
-    const NeighborBounds bounds = neighborBounds(drag.id);
     if (drag.mode == CueDragMode::TrimStart) {
         const qint64 snapped = snapTime(
             MediaTime::fromMicroseconds(drag.originalStart.microseconds() + delta.microseconds()),
             drag.id).microseconds();
         const qint64 start = clampUs(
             snapped,
-            bounds.previousEnd.microseconds(),
+            std::min(neighborBounds(drag.id).previousEnd.microseconds(), drag.originalStart.microseconds()),
             drag.originalEnd.microseconds() - kMinCueUs);
         drag.previewStart = MediaTime::fromMicroseconds(start);
         drag.previewEnd = drag.originalEnd;
@@ -137,7 +162,7 @@ bool TimelineEditor::updateDrag(MediaTime delta)
         const qint64 end = clampUs(
             snapped,
             drag.originalStart.microseconds() + kMinCueUs,
-            bounds.nextStart.microseconds());
+            std::max(neighborBounds(drag.id).nextStart.microseconds(), drag.originalEnd.microseconds()));
         drag.previewStart = drag.originalStart;
         drag.previewEnd = MediaTime::fromMicroseconds(end);
     } else {
@@ -151,7 +176,7 @@ bool TimelineEditor::updateDrag(MediaTime delta)
                 ? snapStart
                 : snapEndAsStart;
         }
-        // 移动字幕时允许预览跨过其他字幕；只在提交时检查最终位置是否重叠。
+        // 只修改当前字幕，重叠作为可见警示，不移动或削短邻字幕。
         start = clampUs(start, 0, viewport_->timelineDuration().microseconds() - duration);
         drag.previewStart = MediaTime::fromMicroseconds(start);
         drag.previewEnd = MediaTime::fromMicroseconds(start + duration);
@@ -175,6 +200,9 @@ bool TimelineEditor::endDrag()
     if (drag.previewStart == drag.originalStart && drag.previewEnd == drag.originalEnd) {
         return true;
     }
+    if (drag.mode == CueDragMode::Move) {
+        return commitMove(drag.id, drag.previewStart, drag.previewEnd);
+    }
     return setTiming(drag.id, drag.previewStart, drag.previewEnd);
 }
 
@@ -195,13 +223,12 @@ bool TimelineEditor::setTiming(const QString &id, MediaTime start, MediaTime end
         || end.microseconds() > viewport_->timelineDuration().microseconds()) {
         return false;
     }
-    for (const Subtitle &subtitle : document_->subtitles()) {
-        if (subtitle.id != id && subtitle.isTimed()
-            && start < subtitle.end && end > subtitle.start) {
-            return false;
-        }
-    }
     return commands_->setTiming(id, start, end);
+}
+
+bool TimelineEditor::commitMove(const QString &id, MediaTime start, MediaTime end)
+{
+    return setTiming(id, start, end);
 }
 
 bool TimelineEditor::splitAtPlayhead(const QString &id)

@@ -340,6 +340,7 @@ if(SUBCUE_BUILD_APP)
             src/app/qml/SubToolButton.qml
             src/app/qml/SubTextField.qml
             src/app/qml/SubScrollBar.qml
+            src/app/qml/ScriptTextView.qml
             src/app/qml/TimelineZoomBar.qml
             src/app/qml/SubComboBox.qml
             src/app/qml/FontPicker.qml

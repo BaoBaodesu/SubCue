@@ -5,6 +5,8 @@
 #include <QtCore/QUuid>
 #include <QtCore/QVector>
 #include <QtGui/QFontMetricsF>
+#include <QtGui/QStyleHints>
+#include <queue>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QHoverEvent>
 #include <QtGui/QMatrix4x4>
@@ -30,7 +32,14 @@ class TimelineRenderNode final : public QSGNode {
 public:
     QVector<TimelineCueVisual> cues;
     QFont font;
+    qreal devicePixelRatio = 0;
     bool hasPlayhead = false;
+    QSGSimpleRectNode *playheadLine = nullptr;
+    QSGSimpleRectNode *playheadHead = nullptr;
+    QSGNode *selection = nullptr;
+    QHash<QString, QSGSimpleRectNode *> bodies;
+    QHash<QString, QPair<QSGSimpleRectNode *, QSGSimpleRectNode *>> handles;
+    TimelineSceneLayout layout;
 };
 
 QSGSimpleRectNode *makeRect(const QRectF &rect, const QColor &color)
@@ -82,7 +91,90 @@ TimelineSceneItem::TimelineSceneItem(QQuickItem *parent)
     setAcceptedMouseButtons(Qt::LeftButton);
     setAcceptHoverEvents(true);
     setClip(true);
+    connect(this, &QQuickItem::windowChanged, this, [this](QQuickWindow *win) {
+        if (win) connect(win, &QWindow::activeChanged, this, [this, win] { if (!win->isActive()) cancelCueDrag(); });
+    });
     viewport_.setDuration(MediaTime::fromMilliseconds(TimelineViewport::kEmptyTimelineMs));
+    dragScrollTimer_.setInterval(16);
+    connect(&dragScrollTimer_, &QTimer::timeout, this, [this] {
+        if (!draggingCue_) { dragScrollTimer_.stop(); return; }
+        const double delta = lastDragX_ < 24 ? -8.0 : lastDragX_ > width() - 24 ? 8.0 : 0.0;
+        if (delta == 0.0) return;
+        viewport_.scrollBy(delta, width());
+        emit viewChanged();
+        emit cueDragUpdated(lastDragX_ - dragStartX_ + viewport_.scrollOffset() - dragScrollStart_);
+        refresh();
+    });
+}
+
+void TimelineSceneItem::setEditable(bool value)
+{
+    if (editable_ == value) return;
+    if (!value) cancelCueDrag();
+    editable_ = value;
+    emit editableChanged();
+    refreshAppearance();
+}
+
+double TimelineSceneItem::subtitleViewportHeight() const
+{
+    return metrics().subtitleTrackHeight;
+}
+
+void TimelineSceneItem::setSubtitleScrollOffset(double value)
+{
+    value = std::clamp(value, 0.0, std::max(0.0, subtitleContentHeight() - subtitleViewportHeight()));
+    if (qFuzzyCompare(value + 1.0, subtitleScrollOffset_ + 1.0)) return;
+    subtitleScrollOffset_ = value;
+    emit viewChanged();
+    refresh();
+}
+
+QVariantMap TimelineSceneItem::hoveredCue() const
+{
+    const int row = cueRows_.value(hoveredCueId_, -1);
+    if (row >= 0) {
+        const Subtitle &cue = subtitles_.at(row);
+        return {{QStringLiteral("text"), cue.text}, {QStringLiteral("startUs"), cue.start.microseconds()},
+            {QStringLiteral("endUs"), cue.end.microseconds()},
+            {QStringLiteral("review"), cue.status == QStringLiteral("REVIEW") || cue.status == QStringLiteral("LOW_CONFIDENCE")
+                || cue.metadata.value(QStringLiteral("review")).toBool()},
+            {QStringLiteral("overlap"), overlappingIds_.contains(cue.id)}};
+    }
+    return {};
+}
+
+QVariantMap TimelineSceneItem::dragPreview() const
+{
+    if (!previewCue_) return {};
+    const Subtitle &cue = *previewCue_;
+    const int row = cueRows_.value(cue.id, -1);
+    QString target;
+    bool overlap = false;
+    if (cue.start == viewport_.playhead() || cue.end == viewport_.playhead()) target = QStringLiteral("播放头");
+    if (inPoint_ && (cue.start == *inPoint_ || cue.end == *inPoint_)) target = QStringLiteral("入点");
+    if (outPoint_ && (cue.start == *outPoint_ || cue.end == *outPoint_)) target = QStringLiteral("出点");
+    for (const Subtitle &other : subtitles_) {
+        if (other.id == cue.id || !other.isTimed()) continue;
+        if (other.start < cue.end && cue.start < other.end) overlap = true;
+        if (cue.start == other.start || cue.start == other.end || cue.end == other.start || cue.end == other.end)
+            target = QStringLiteral("字幕边界");
+    }
+    return {{QStringLiteral("startUs"), cue.start.microseconds()}, {QStringLiteral("endUs"), cue.end.microseconds()},
+        {QStringLiteral("deltaUs"), row >= 0 ? cue.start.microseconds() - subtitles_.at(row).start.microseconds() : qint64{0}},
+        {QStringLiteral("overlap"), overlap}, {QStringLiteral("target"), target}};
+}
+
+QVariantMap TimelineSceneItem::renderStats() const
+{
+    return {{QStringLiteral("geometry"), geometryBuildCount_.load()},
+        {QStringLiteral("text"), textBuildCount_.load()}, {QStringLiteral("waveform"), waveformBuildCount_.load()}};
+}
+
+void TimelineSceneItem::refreshAppearance()
+{
+    dirty_ |= PaintAppearance | PaintPlayhead;
+    update();
 }
 
 qint64 TimelineSceneItem::durationUs() const noexcept
@@ -263,18 +355,30 @@ void TimelineSceneItem::setSelectedCueId(const QString &id)
     if (selectedCueId_ == id) {
         return;
     }
+    if (cueLanes_.contains(id)) {
+        const double top = cueLanes_.value(id) * 54.0;
+        if (top < subtitleScrollOffset_) setSubtitleScrollOffset(top);
+        else if (top + 54.0 > subtitleScrollOffset_ + subtitleViewportHeight())
+            setSubtitleScrollOffset(top + 54.0 - subtitleViewportHeight());
+    }
     selectedCueId_ = id;
     emit selectedCueIdChanged();
-    refresh();
+    refreshAppearance();
 }
 
-void TimelineSceneItem::addCue(const QString &id, qint64 startUs, qint64 endUs, const QString &text)
+void TimelineSceneItem::addCue(const QString &id, qint64 startUs, qint64 endUs, const QString &text,
+    qint64 sourceStartUs, qint64 sourceEndUs, bool review)
 {
     Subtitle cue;
     cue.id = id.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : id;
     cue.start = MediaTime::fromMicroseconds(startUs);
     cue.end = MediaTime::fromMicroseconds(endUs);
     cue.text = text;
+    if (sourceEndUs > sourceStartUs && sourceStartUs >= 0) {
+        cue.metadata.insert(QStringLiteral("sourceStartUs"), sourceStartUs);
+        cue.metadata.insert(QStringLiteral("sourceEndUs"), sourceEndUs);
+    }
+    if (review) cue.metadata.insert(QStringLiteral("review"), true);
     cue.source = QStringLiteral("manual");
     cue.status = QStringLiteral("MANUAL");
     for (Subtitle &existing : subtitles_) {
@@ -299,6 +403,13 @@ void TimelineSceneItem::clearCues()
     previewCue_.reset();
     cueOrder_.clear();
     cueEndIndex_.clear();
+    cueRows_.clear();
+    cueLanes_.clear();
+    laneCueOrder_.clear();
+    overlappingIds_.clear();
+    laneCount_ = 1;
+    subtitleScrollOffset_ = 0;
+    emit viewChanged();
     refresh();
 }
 
@@ -311,7 +422,7 @@ void TimelineSceneItem::fit()
 
 int TimelineSceneItem::visibleCueCount() const
 {
-    return currentLayout().cues.size();
+    return currentLayout(false).cues.size();
 }
 
 void TimelineSceneItem::setWaveform(std::shared_ptr<const WaveformPyramid> waveform)
@@ -334,7 +445,9 @@ void TimelineSceneItem::rebuildCueIndex()
 {
     cueOrder_.clear();
     cueEndIndex_.clear();
+    cueRows_.clear();
     for (int index = 0; index < subtitles_.size(); ++index) {
+        cueRows_.insert(subtitles_.at(index).id, index);
         if (subtitles_.at(index).isTimed()) cueOrder_.append(index);
     }
     std::stable_sort(cueOrder_.begin(), cueOrder_.end(), [this](int left, int right) {
@@ -344,11 +457,59 @@ void TimelineSceneItem::rebuildCueIndex()
         cueEndIndex_.append(std::max(cueEndIndex_.isEmpty() ? qint64(0) : cueEndIndex_.last(),
             subtitles_.at(index).end.microseconds()));
     }
+    cueLanes_.clear();
+    laneCueOrder_.clear();
+    overlappingIds_.clear();
+    laneCount_ = 1;
+    using EndLane = std::pair<qint64, int>;
+    std::priority_queue<EndLane, std::vector<EndLane>, std::greater<EndLane>> active;
+    std::priority_queue<int, std::vector<int>, std::greater<int>> free;
+    qint64 maximumEnd = -1;
+    QString maximumId;
+    int nextLane = 0;
+    for (int index : cueOrder_) {
+        const Subtitle &cue = subtitles_.at(index);
+        while (!active.empty() && active.top().first <= cue.start.microseconds()) {
+            free.push(active.top().second); active.pop();
+        }
+        const int lane = free.empty() ? nextLane++ : free.top();
+        if (!free.empty()) free.pop();
+        cueLanes_.insert(cue.id, lane);
+        if (laneCueOrder_.size() <= lane) laneCueOrder_.resize(lane + 1);
+        laneCueOrder_[lane].append(index);
+        active.push({cue.end.microseconds(), lane});
+        if (cue.start.microseconds() < maximumEnd) {
+            overlappingIds_.insert(cue.id); overlappingIds_.insert(maximumId);
+        }
+        if (cue.end.microseconds() > maximumEnd) { maximumEnd = cue.end.microseconds(); maximumId = cue.id; }
+    }
+    laneCount_ = std::max(1, nextLane);
+    emit hoveredCueChanged();
+    subtitleScrollOffset_ = std::clamp(subtitleScrollOffset_, 0.0,
+        std::max(0.0, subtitleContentHeight() - subtitleViewportHeight()));
+    emit viewChanged();
+
 }
 
 void TimelineSceneItem::setPreviewCue(std::optional<Subtitle> cue)
 {
     previewCue_ = std::move(cue);
+    if (previewCue_) {
+        // 只有候选范围实际占用同一行时才展开，普通移动不改变波形位置。
+        int lane = 0;
+        for (; lane < laneCueOrder_.size(); ++lane) {
+            const auto &order = laneCueOrder_.at(lane);
+            auto first = std::upper_bound(order.cbegin(), order.cend(), previewCue_->start,
+                [this](MediaTime time, int index) { return time < subtitles_.at(index).end; });
+            while (first != order.cend() && subtitles_.at(*first).id == previewCue_->id) ++first;
+            if (first == order.cend() || subtitles_.at(*first).start >= previewCue_->end) break;
+        }
+        // 视口高度不足时保留原可见行与重叠标记，避免候选块被裁掉。
+        if (lane * 54.0 >= subtitleScrollOffset_ + std::max(54.0, height() - metrics().rulerHeight - 90.0))
+            lane = cueLanes_.value(previewCue_->id);
+        previewCue_->metadata.insert(QStringLiteral("displayLane"), lane);
+    }
+    emit dragPreviewChanged();
     refresh();
 }
 
@@ -366,6 +527,11 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
             clearChildren(root);
             geometry = nullptr;
             root->hasPlayhead = false;
+            root->playheadLine = nullptr;
+            root->playheadHead = nullptr;
+            root->selection = nullptr;
+            root->bodies.clear();
+            root->handles.clear();
         }
     } else {
         root = new TimelineRenderNode;
@@ -391,34 +557,49 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
 
     const quint8 dirty = dirty_;
     dirty_ = PaintNone;
-    if (!(dirty & PaintGeometry) && (dirty & PaintPlayhead) && root->hasPlayhead && geometry != nullptr) {
-        QSGNode *headNode = geometry->lastChild();
-        QSGNode *lineNode = nullptr;
-        if (headNode != nullptr) {
-            lineNode = geometry->firstChild();
-            while (lineNode != nullptr && lineNode->nextSibling() != headNode)
-                lineNode = lineNode->nextSibling();
+    const auto paintSelection = [&] {
+        if (!root->selection) return;
+        clearChildren(root->selection);
+        for (const TimelineCueVisual &cue : root->layout.cues) {
+            if (cue.id != selectedCueId_) continue;
+            const double bottom = root->layout.audioTrack.y + root->layout.audioTrack.height;
+            const double top = cue.rect.y;
+            root->selection->appendChildNode(makeRect(QRectF(cue.rect.x, top, cue.rect.width, bottom - top), selectedCueRangeColor_));
+            root->selection->appendChildNode(makeRect(QRectF(cue.rect.x, top, 1.0, bottom - top), selectedCueBoundaryColor_));
+            root->selection->appendChildNode(makeRect(QRectF(cue.rect.x + cue.rect.width - 1.0, top, 1.0, bottom - top), selectedCueBoundaryColor_));
         }
-        auto *line = dynamic_cast<QSGSimpleRectNode *>(lineNode);
-        auto *head = dynamic_cast<QSGSimpleRectNode *>(headNode);
-        if (line != nullptr && head != nullptr) {
-            const double x = viewport_.xAtTime(viewport_.playhead());
-            const double viewHeight = height();
-            if (x >= -2.0 && x <= width() + 2.0) {
-                line->setRect(QRectF(x, 0.0, 2.0, viewHeight));
-                head->setRect(QRectF(x - 4.0, 0.0, 10.0, 7.0));
-            } else {
-                line->setRect(QRectF());
-                head->setRect(QRectF());
+    };
+    if (!(dirty & PaintGeometry) && root->playheadLine && root->playheadHead) {
+        if (dirty & PaintAppearance) {
+            for (const TimelineCueVisual &cue : root->layout.cues) {
+                const bool selected = cue.id == selectedCueId_;
+                const bool hovered = cue.id == hoveredCueId_;
+                if (auto *body = root->bodies.value(cue.id))
+                    body->setColor(selected ? cueSelectedColor_ : hovered ? cueHoverColor_ : cueColor_);
+                const auto handles = root->handles.value(cue.id);
+                const bool show = editable_ && cue.rect.width >= 24.0 && (selected || hovered);
+                if (handles.first) handles.first->setRect(show ? QRectF(cue.rect.x, cue.rect.y, 3.0, cue.rect.height) : QRectF());
+                if (handles.second) handles.second->setRect(show ? QRectF(cue.rect.x + cue.rect.width - 3.0, cue.rect.y, 3.0, cue.rect.height) : QRectF());
             }
-            return root;
+            paintSelection();
         }
+        const double x = viewport_.xAtTime(viewport_.playhead());
+        const bool visible = x >= -2.0 && x <= width() + 2.0;
+        root->playheadLine->setRect(visible ? QRectF(x, 0.0, 2.0, height()) : QRectF());
+        root->playheadHead->setRect(visible ? QRectF(x - 4.0, 0.0, 10.0, 7.0) : QRectF());
+        return root;
     }
 
     clearChildren(geometry);
-    root->hasPlayhead = false;
-
+    root->selection = nullptr;
+    root->bodies.clear();
+    root->handles.clear();
+    root->playheadLine = nullptr;
+    root->playheadHead = nullptr;
+    ++geometryBuildCount_;
     const TimelineSceneLayout layout = currentLayout();
+    root->layout = layout;
+    if (waveform_) ++waveformBuildCount_;
     geometry->appendChildNode(makeRect(toRect(layout.background), backgroundColor_));
     geometry->appendChildNode(makeRect(toRect(layout.ruler), rulerColor_));
     geometry->appendChildNode(makeRect(toRect(layout.subtitleTrack), subtitleTrackColor_));
@@ -474,21 +655,9 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
         geometry->appendChildNode(makeRect(toRect(layout.inOutRange), rangeColor_));
     }
 
-    if (layout.selectedCueRange.width > 0.0) {
-        geometry->appendChildNode(makeRect(toRect(layout.selectedCueRange), selectedCueRangeColor_));
-        const double left = layout.selectedCueRange.x;
-        const double right = left + layout.selectedCueRange.width;
-        const double top = layout.selectedCueRange.y;
-        const double bottom = top + layout.selectedCueRange.height;
-        geometry->appendChildNode(makeRect(QRectF(left - 1.0, top, 2.0, bottom - top),
-                                           selectedCueBoundaryColor_));
-        geometry->appendChildNode(makeRect(QRectF(right - 1.0, top, 2.0, bottom - top),
-                                           selectedCueBoundaryColor_));
-        geometry->appendChildNode(makeRect(QRectF(left - 4.0, top, 8.0, 3.0), trimHandleColor_));
-        geometry->appendChildNode(makeRect(QRectF(right - 4.0, top, 8.0, 3.0), trimHandleColor_));
-        geometry->appendChildNode(makeRect(QRectF(left - 2.0, bottom - 4.0, 4.0, 4.0), trimHandleColor_));
-        geometry->appendChildNode(makeRect(QRectF(right - 2.0, bottom - 4.0, 4.0, 4.0), trimHandleColor_));
-    }
+    root->selection = new QSGNode;
+    geometry->appendChildNode(root->selection);
+    paintSelection();
 
     if (layout.subtitleTrack.height > 0.0) {
         geometry->appendChildNode(
@@ -517,44 +686,81 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
     for (const TimelineCueVisual &cue : layout.cues) {
         const bool hovered = !cue.selected && cue.id == hoveredCueId_;
         const QColor fill = cue.selected ? cueSelectedColor_ : (hovered ? cueHoverColor_ : cueColor_);
-        geometry->appendChildNode(makeRect(toRect(cue.rect), fill));
+        auto *body = makeRect(toRect(cue.rect), fill);
+        geometry->appendChildNode(body);
+        root->bodies.insert(cue.id, body);
+        if (cue.pending) geometry->appendChildNode(makeRect(QRectF(cue.rect.x, cue.rect.y, cue.rect.width, 2), UiTheme::kWarning));
+        if (cue.overlapping) geometry->appendChildNode(makeRect(QRectF(cue.rect.x, cue.rect.y + 3, 3, cue.rect.height - 3), UiTheme::kWarning));
+        const bool handlesVisible = editable_ && cue.rect.width >= 24.0 && (cue.selected || hovered);
+        auto *left = makeRect(handlesVisible ? QRectF(cue.rect.x, cue.rect.y, 3, cue.rect.height) : QRectF(), trimHandleColor_);
+        auto *right = makeRect(handlesVisible ? QRectF(cue.rect.x + cue.rect.width - 3, cue.rect.y, 3, cue.rect.height) : QRectF(), trimHandleColor_);
+        geometry->appendChildNode(left); geometry->appendChildNode(right);
+        root->handles.insert(cue.id, {left, right});
+    }
+
+    for (const TimelineCueVisual &cue : layout.cues) {
+        if (!cue.audioBlock || layout.audioTrack.height <= 4.0) continue;
+        const double left = std::max(0.0, cue.rect.x);
+        const double right = std::min(viewWidth, cue.rect.x + cue.rect.width);
+        if (right - left < 1.0) continue;
+        const QRectF block(left, layout.audioTrack.y + 3.0, right - left,
+            std::max(1.0, layout.audioTrack.height - 6.0));
+        geometry->appendChildNode(makeRect(block, cue.selected ? cueSelectedColor_ : audioClipColor_));
         if (cue.pending) {
-            geometry->appendChildNode(makeRect(QRectF(cue.rect.x, cue.rect.y, cue.rect.width, 2), UiTheme::kWarning));
+            geometry->appendChildNode(makeRect(QRectF(block.x(), block.y(), block.width(), 3.0), UiTheme::kWarning));
         }
-        if (cue.selected || hovered) {
-            const double handleWidth = 3.0;
-            geometry->appendChildNode(
-                makeRect(QRectF(cue.rect.x, cue.rect.y, handleWidth, cue.rect.height), trimHandleColor_));
-            geometry->appendChildNode(makeRect(
-                QRectF(cue.rect.x + cue.rect.width - handleWidth, cue.rect.y, handleWidth, cue.rect.height),
-                trimHandleColor_));
+        if (cue.waveform.isEmpty()) continue;
+        QVector<QPointF> wave;
+        wave.reserve(cue.waveform.size() * 2);
+        const double middle = block.center().y();
+        const double amplitude = std::max(1.0, block.height() * 0.5 - 2.0) * 0.9;
+        const double span = std::max(1.0, cue.waveformWidth);
+        for (int column = 0; column < cue.waveform.size(); ++column) {
+            const double x = cue.waveformX + (column + 0.5) * span / cue.waveform.size();
+            if (x < left || x > right) continue;
+            const WaveformPeak &peak = cue.waveform.at(column);
+            wave.push_back(QPointF(x, middle - peak.max * amplitude));
+            wave.push_back(QPointF(x, middle - peak.min * amplitude));
         }
+        if (!wave.isEmpty()) geometry->appendChildNode(makeLines(wave, waveformColor_));
     }
 
-    if (layout.playheadVisible) {
-        geometry->appendChildNode(makeRect(QRectF(layout.playheadX, 0.0, 2.0, viewHeight), playheadColor_));
-        geometry->appendChildNode(makeRect(QRectF(layout.playheadX - 4.0, 0.0, 10.0, 7.0), playheadColor_));
-        root->hasPlayhead = true;
-    }
+    root->playheadLine = makeRect(layout.playheadVisible ? QRectF(layout.playheadX, 0.0, 2.0, viewHeight) : QRectF(), playheadColor_);
+    root->playheadHead = makeRect(layout.playheadVisible ? QRectF(layout.playheadX - 4.0, 0.0, 10.0, 7.0) : QRectF(), playheadColor_);
+    geometry->appendChildNode(root->playheadLine);
+    geometry->appendChildNode(root->playheadHead);
+    root->hasPlayhead = true;
 
+    QVector<TimelineCueVisual> textCues = layout.cues;
+    for (auto &cue : textCues) {
+        cue.waveform.clear(); cue.selected = false; cue.audioBlock = false;
+        cue.waveformX = 0; cue.waveformWidth = 0;
+    }
     auto *cueLabels = dynamic_cast<QSGTextNode *>(geometry->nextSibling());
-    if (cueLabels && cueLabels != labels && (root->cues != layout.cues || root->font != rulerFont())) {
+    if (cueLabels && cueLabels != labels && (root->cues != textCues || root->font != rulerFont() || (window() && root->devicePixelRatio != window()->devicePixelRatio()))) {
+        ++textBuildCount_;
         cueLabels->clear();
         cueLabels->setColor(UiTheme::kPrimaryText);
         cueLabels->setRenderType(QSGTextNode::QtRendering);
         for (const TimelineCueVisual &cue : layout.cues) {
             const double left = std::max(0.0, cue.rect.x) + 5.0;
             const double available = std::min(width(), cue.rect.x + cue.rect.width) - left - 5.0;
-            if (available < 12.0) continue;
-            QTextLayout text(QFontMetricsF(rulerFont()).elidedText(cue.text, Qt::ElideRight, available), rulerFont());
+            if (available < 12.0 || cue.rect.height < 20.0) continue;
+            const QString label = (cue.overlapping ? QStringLiteral("⚠ ") : cue.pending ? QStringLiteral("? ") : QString()) + cue.text;
+            QTextLayout text(available >= 160 ? label : QFontMetricsF(rulerFont()).elidedText(label, Qt::ElideRight, available), rulerFont());
+            QTextOption option; option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere); text.setTextOption(option);
             text.beginLayout();
-            QTextLine line = text.createLine();
-            if (line.isValid()) line.setLineWidth(available);
+            for (int row = 0; row < (available >= 160 ? 2 : 1); ++row) {
+                QTextLine line = text.createLine();
+                if (!line.isValid()) break;
+                line.setLineWidth(available); line.setPosition(QPointF(0, row * 15.0));
+            }
             text.endLayout();
             cueLabels->addTextLayout(QPointF(left, cue.rect.y + 6), &text);
         }
-        root->cues = layout.cues;
+        root->cues = std::move(textCues);
         root->font = rulerFont();
+        root->devicePixelRatio = window() ? window()->devicePixelRatio() : 1;
     }
     if (labels != nullptr) {
         if (rulerLabelsNeedRebuild()) {
@@ -568,65 +774,98 @@ QSGNode *TimelineSceneItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeDat
     return root;
 }
 
-void TimelineSceneItem::mousePressEvent(QMouseEvent *event)
+void TimelineSceneItem::cancelCueDrag()
 {
-    const TimelineSceneLayout layout = currentLayout();
-    const TimelineHit hit = TimelineSceneBuilder::hitTest(layout, event->position().x(), event->position().y(), metrics());
-    if (!hit.cueId.isEmpty()) {
-        setSelectedCueId(hit.cueId);
-        draggingCue_ = true;
-        dragStartX_ = event->position().x();
-        emit cueDragStarted(hit.cueId, hit.kind == TimelineHitKind::CueTrimStart ? 1
-            : hit.kind == TimelineHitKind::CueTrimEnd ? 2 : 0);
-        event->accept();
-        return;
-    }
-    viewport_.setPlayhead(viewport_.timeAtX(event->position().x()));
-    emit playheadUsChanged();
-    emit userSeeked(viewport_.playhead().microseconds());
-    event->accept();
-    refreshPlayhead();
-}
-
-void TimelineSceneItem::mouseMoveEvent(QMouseEvent *event)
-{
-    if (draggingCue_) {
-        emit cueDragUpdated(event->position().x() - dragStartX_);
-        event->accept();
-        return;
-    }
-    if (!(event->buttons() & Qt::LeftButton)) {
-        return;
-    }
-    viewport_.setPlayhead(viewport_.timeAtX(event->position().x()));
-    emit playheadUsChanged();
-    emit userSeeked(viewport_.playhead().microseconds());
-    event->accept();
-    refreshPlayhead();
-}
-
-void TimelineSceneItem::mouseReleaseEvent(QMouseEvent *event)
-{
-    if (draggingCue_) {
-        emit cueDragUpdated(event->position().x() - dragStartX_);
-        draggingCue_ = false;
-        emit cueDragFinished(false);
-    }
-    event->accept();
-}
-
-void TimelineSceneItem::mouseUngrabEvent()
-{
+    pressedCueId_.clear();
+    dragScrollTimer_.stop();
     if (draggingCue_) {
         draggingCue_ = false;
         emit cueDragFinished(true);
     }
 }
 
+void TimelineSceneItem::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Escape && (!pressedCueId_.isEmpty() || draggingCue_)) {
+        cancelCueDrag(); event->accept(); return;
+    }
+    QQuickItem::keyPressEvent(event);
+}
+
+void TimelineSceneItem::focusOutEvent(QFocusEvent *event)
+{
+    cancelCueDrag();
+    QQuickItem::focusOutEvent(event);
+}
+
+void TimelineSceneItem::mousePressEvent(QMouseEvent *event)
+{
+    if (interactionGuard_.isCallable() && !interactionGuard_.call().toBool()) {
+        event->accept(); return;
+    }
+    forceActiveFocus(Qt::MouseFocusReason);
+    const TimelineHit hit = TimelineSceneBuilder::hitTest(currentLayout(false), event->position().x(), event->position().y(), metrics());
+    if (!hit.cueId.isEmpty()) {
+        setSelectedCueId(hit.cueId);
+        if (editable_) {
+            pressedCueId_ = hit.cueId;
+            pressedMode_ = hit.kind == TimelineHitKind::CueTrimStart ? 1 : hit.kind == TimelineHitKind::CueTrimEnd ? 2 : 0;
+            dragStartX_ = event->position().x();
+            dragScrollStart_ = viewport_.scrollOffset();
+        } else {
+            viewport_.setPlayhead(viewport_.timeAtX(event->position().x()));
+            emit playheadUsChanged();
+            emit userSeeked(viewport_.playhead().microseconds());
+            refreshPlayhead();
+        }
+        event->accept(); return;
+    }
+    viewport_.setPlayhead(viewport_.timeAtX(event->position().x()));
+    emit playheadUsChanged();
+    emit userSeeked(viewport_.playhead().microseconds());
+    event->accept(); refreshPlayhead();
+}
+
+void TimelineSceneItem::mouseMoveEvent(QMouseEvent *event)
+{
+    lastDragX_ = event->position().x();
+    if (!pressedCueId_.isEmpty() && !draggingCue_ &&
+        std::abs(lastDragX_ - dragStartX_) >= QGuiApplication::styleHints()->startDragDistance()) {
+        draggingCue_ = true;
+        emit cueDragStarted(pressedCueId_, pressedMode_);
+        dragScrollTimer_.start();
+    }
+    if (draggingCue_) {
+        emit cueDragUpdated(lastDragX_ - dragStartX_ + viewport_.scrollOffset() - dragScrollStart_);
+        event->accept(); return;
+    }
+    if (!pressedCueId_.isEmpty() || !(event->buttons() & Qt::LeftButton)) return;
+    viewport_.setPlayhead(viewport_.timeAtX(event->position().x()));
+    emit playheadUsChanged();
+    emit userSeeked(viewport_.playhead().microseconds());
+    event->accept(); refreshPlayhead();
+}
+
+void TimelineSceneItem::mouseReleaseEvent(QMouseEvent *event)
+{
+    dragScrollTimer_.stop();
+    if (draggingCue_) {
+        emit cueDragUpdated(event->position().x() - dragStartX_ + viewport_.scrollOffset() - dragScrollStart_);
+        draggingCue_ = false;
+        emit cueDragFinished(false);
+    }
+    pressedCueId_.clear(); event->accept();
+}
+
+void TimelineSceneItem::mouseUngrabEvent()
+{
+    cancelCueDrag();
+}
+
 void TimelineSceneItem::mouseDoubleClickEvent(QMouseEvent *event)
 {
     mouseUngrabEvent();
-    const TimelineHit hit = TimelineSceneBuilder::hitTest(currentLayout(),
+    const TimelineHit hit = TimelineSceneBuilder::hitTest(currentLayout(false),
         event->position().x(), event->position().y(), metrics());
     if (!hit.cueId.isEmpty()) emit cueEditRequested(hit.cueId);
     event->accept();
@@ -642,7 +881,8 @@ void TimelineSceneItem::hoverLeaveEvent(QHoverEvent *event)
 {
     if (!hoveredCueId_.isEmpty()) {
         hoveredCueId_.clear();
-        refresh();
+        emit hoveredCueChanged();
+        refreshAppearance();
     }
     QQuickItem::hoverLeaveEvent(event);
 }
@@ -652,7 +892,9 @@ void TimelineSceneItem::wheelEvent(QWheelEvent *event)
     // 普通鼠标滚轮没有结束事件，短暂空闲后恢复跟随，避免连续滚动被播放时钟抢回。
     wheelInteraction_.start();
     const double viewWidth = std::max(1.0, width());
-    if (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) {
+    if ((event->modifiers() & Qt::ShiftModifier) && subtitleContentHeight() > subtitleViewportHeight()) {
+        setSubtitleScrollOffset(subtitleScrollOffset_ - event->angleDelta().y() * 0.5);
+    } else if (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) {
         viewport_.adjustZoomPercent(event->angleDelta().y() > 0 ? 10 : -10, viewWidth);
     } else {
         viewport_.scrollBy(-event->angleDelta().y() * 0.75, viewWidth);
@@ -670,6 +912,7 @@ void TimelineSceneItem::geometryChange(const QRectF &newGeometry, const QRectF &
             viewport_.fit(newGeometry.width());
         }
         viewport_.setScrollOffset(viewport_.scrollOffset(), newGeometry.width());
+        setSubtitleScrollOffset(subtitleScrollOffset_);
         emit viewChanged();
         refresh();
     }
@@ -689,25 +932,50 @@ TimelineSceneMetrics TimelineSceneItem::metrics() const
     TimelineSceneMetrics result;
     result.viewportWidth = width();
     result.viewportHeight = height();
+    result.editable = editable_;
+    result.subtitleTrackHeight = std::min(std::max(subtitleContentHeight(), previewCue_ ? (previewCue_->metadata.value(QStringLiteral("displayLane")).toInt() + 1) * 54.0 : 0.0),
+        std::max(54.0, height() - result.rulerHeight - 90.0));
+    result.subtitleScrollOffset = subtitleScrollOffset_;
     return result;
 }
 
-TimelineSceneLayout TimelineSceneItem::currentLayout() const
+TimelineSceneLayout TimelineSceneItem::currentLayout(bool sampleWaveform) const
 {
     QList<Subtitle> visible;
-    const auto first = std::lower_bound(cueEndIndex_.cbegin(), cueEndIndex_.cend(),
-        viewport_.visibleStart().microseconds());
-    const auto last = std::upper_bound(cueOrder_.cbegin(), cueOrder_.cend(),
-        viewport_.visibleEnd(width()), [this](MediaTime time, int index) {
-            return time < subtitles_.at(index).start;
-        });
-    for (qsizetype index = first - cueEndIndex_.cbegin(); index < last - cueOrder_.cbegin(); ++index) {
-        if (previewCue_ && subtitles_.at(cueOrder_.at(index)).id == previewCue_->id) continue;
-        visible.append(subtitles_.at(cueOrder_.at(index)));
+    // 每个派生行内字幕互不重叠，起止均有序；仅查询当前可见行和时间范围。
+    const int firstLane = std::max(0, static_cast<int>(subtitleScrollOffset_ / 54.0));
+    const int lastLane = std::min(static_cast<int>(laneCueOrder_.size()), static_cast<int>(std::ceil((subtitleScrollOffset_ + subtitleViewportHeight()) / 54.0)));
+    for (int lane = firstLane; lane < lastLane; ++lane) {
+        const auto &order = laneCueOrder_.at(lane);
+        const auto first = std::upper_bound(order.cbegin(), order.cend(), viewport_.visibleStart(),
+            [this](MediaTime time, int index) { return time < subtitles_.at(index).end; });
+        const auto last = std::upper_bound(first, order.cend(), viewport_.visibleEnd(width()),
+            [this](MediaTime time, int index) { return time < subtitles_.at(index).start; });
+        for (auto index = first; index != last; ++index) {
+            if (previewCue_ && subtitles_.at(*index).id == previewCue_->id) continue;
+            Subtitle cue = subtitles_.at(*index);
+            cue.metadata.insert(QStringLiteral("displayLane"), lane);
+            cue.metadata.insert(QStringLiteral("displayOverlap"), overlappingIds_.contains(cue.id));
+            visible.append(std::move(cue));
+        }
     }
-    if (previewCue_) visible.append(*previewCue_);
+    if (previewCue_) {
+        Subtitle cue = *previewCue_;
+        int lane = cue.metadata.value(QStringLiteral("displayLane")).toInt();
+        bool overlap = false;
+
+        for (const Subtitle &other : visible) {
+            if (other.start < cue.end && other.end > cue.start) {
+                overlap = true;
+            }
+        }
+        // 按候选范围派生显示行，重叠时才分开显示。
+        cue.metadata.insert(QStringLiteral("displayLane"), lane);
+        cue.metadata.insert(QStringLiteral("displayOverlap"), overlap);
+        visible.append(std::move(cue));
+    }
     return TimelineSceneBuilder::build(
-        viewport_, visible, waveform_.get(), metrics(), selectedCueId_, inPoint_, outPoint_);
+        viewport_, visible, sampleWaveform ? waveform_.get() : nullptr, metrics(), selectedCueId_, inPoint_, outPoint_);
 }
 
 void TimelineSceneItem::refresh()
@@ -724,7 +992,7 @@ void TimelineSceneItem::refreshPlayhead()
 
 void TimelineSceneItem::updateHoveredCue(double x, double y)
 {
-    const TimelineHit hit = TimelineSceneBuilder::hitTest(currentLayout(), x, y, metrics());
+    const TimelineHit hit = TimelineSceneBuilder::hitTest(currentLayout(false), x, y, metrics());
     setCursor(hit.kind == TimelineHitKind::CueTrimStart || hit.kind == TimelineHitKind::CueTrimEnd
         ? Qt::SizeHorCursor : hit.kind == TimelineHitKind::CueBody ? Qt::SizeAllCursor : Qt::ArrowCursor);
     QString hovered;
@@ -736,13 +1004,14 @@ void TimelineSceneItem::updateHoveredCue(double x, double y)
         return;
     }
     hoveredCueId_ = std::move(hovered);
-    refresh();
+    emit hoveredCueChanged();
+    refreshAppearance();
 }
 
 QFont TimelineSceneItem::rulerFont() const
 {
     QFont font = QGuiApplication::font();
-    font.setPixelSize(11);
+    font.setPixelSize(12);
     font.setWeight(QFont::Normal);
     return font;
 }

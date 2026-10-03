@@ -24,10 +24,12 @@ New-Item -ItemType Directory -Force -Path $Root | Out-Null
 $selected = if ($Models.Count -gt 0) { $Models } else { @($manifest.models.id) }
 
 function Test-ModelReady([string]$Directory) {
-    $config = Join-Path $Directory 'config.json'
-    $safetensors = Join-Path $Directory 'model.safetensors'
-    $pt = Join-Path $Directory 'model.pt'
-    return (Test-Path -LiteralPath $config) -and ((Test-Path -LiteralPath $safetensors) -or (Test-Path -LiteralPath $pt))
+    $hasConfig = (Test-Path -LiteralPath (Join-Path $Directory 'config.json')) -or
+        (Test-Path -LiteralPath (Join-Path $Directory 'configuration.json')) -or
+        (Test-Path -LiteralPath (Join-Path $Directory 'config.yaml'))
+    $hasWeights = (Test-Path -LiteralPath (Join-Path $Directory 'model.safetensors')) -or
+        (Test-Path -LiteralPath (Join-Path $Directory 'model.pt'))
+    return $hasConfig -and $hasWeights
 }
 
 function Get-Sha256([string]$Path) {
@@ -44,13 +46,14 @@ foreach ($id in $selected) {
         Write-Host "[跳过] $($entry.id) 已完整，使用 -Force 才会覆盖"
         continue
     }
-    if ((Test-Path -LiteralPath $destination) -and -not $Force) {
-        throw "目标已存在但权重不完整：$destination。确认后使用 -Force。"
-    }
+    $resume = (Test-Path -LiteralPath $destination) -and -not $Force
 
     $staging = Join-Path $Root (Join-Path '.download' $entry.folder)
     if (Test-Path -LiteralPath $staging) {
-        Remove-Item -LiteralPath $staging -Recurse -Force
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $staging) {
+            $staging = Join-Path $Root (Join-Path '.download' ($entry.folder + '-' + [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')))
+        }
     }
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     Write-Host "[下载] $($entry.repo) -> $staging"
@@ -59,23 +62,49 @@ foreach ($id in $selected) {
         throw "modelscope 下载失败：$($entry.repo)"
     }
 
-    foreach ($file in $entry.files) {
-        $path = Join-Path $staging $file.path
+    foreach ($file in @($entry.files)) {
+        $relative = [string]$file.path
+        $expected = [string]$file.sha256
+        $path = Join-Path $staging $relative
         if (-not (Test-Path -LiteralPath $path)) {
-            throw "下载缺少文件：$($file.path)"
+            $path = Join-Path $destination $relative
+        }
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "下载缺少文件：$relative"
         }
         $actual = Get-Sha256 $path
-        if ($actual -ne $file.sha256) {
-            throw "SHA-256 不匹配：$($file.path)`n期望 $($file.sha256)`n实际 $actual"
+        if ($actual -ne $expected) {
+            throw "SHA-256 不匹配：$relative 期望 $expected 实际 $actual"
         }
     }
 
     $parent = Split-Path -Parent $destination
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    if (Test-Path -LiteralPath $destination) {
-        Remove-Item -LiteralPath $destination -Recurse -Force
+    if ($resume) {
+        Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object {
+            $relative = $_.FullName.Substring($staging.Length).TrimStart('\')
+            $target = Join-Path $destination $relative
+            if (Test-Path -LiteralPath $target) { return }
+            $targetParent = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetParent)) {
+                New-Item -ItemType Directory -Force -Path $targetParent | Out-Null
+            }
+            Copy-Item -LiteralPath $_.FullName -Destination $target
+        }
+        Remove-Item -LiteralPath $staging -Recurse -Force
+        $incomplete = Join-Path $destination 'model.pt.incomplete'
+        if ((Test-Path -LiteralPath (Join-Path $destination 'model.pt')) -and (Test-Path -LiteralPath $incomplete)) {
+            Remove-Item -LiteralPath $incomplete -Force
+        }
+    } else {
+        if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+        }
+        Move-Item -LiteralPath $staging -Destination $destination
     }
-    Move-Item -LiteralPath $staging -Destination $destination
+    if (-not (Test-ModelReady $destination)) {
+        throw "下载后权重仍不完整：$destination"
+    }
     Write-Host "[完成] $($entry.id) -> $destination"
 }
 

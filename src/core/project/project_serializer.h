@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 
 #include "project/project.h"
 
@@ -10,8 +11,9 @@ namespace subcue {
 
 class ProjectSerializer final {
 public:
+    [[nodiscard]] static QByteArray fingerprint(const Project &project);
     [[nodiscard]] static bool save(const QString &path, const Project &project,
-                                   QString *errorMessage = nullptr);
+                                   QString *errorMessage = nullptr, const std::atomic<bool> *cancel = nullptr);
     [[nodiscard]] static std::optional<Project> load(const QString &path,
                                                      QString *errorMessage = nullptr);
 };

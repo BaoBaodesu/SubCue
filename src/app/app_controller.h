@@ -12,6 +12,7 @@
 #include "timeline/timeline_editor.h"
 #include "timeline/timeline_viewport.h"
 #include "waveform/waveform_pyramid.h"
+#include "project/project.h"
 
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QJsonObject>
@@ -24,6 +25,7 @@
 #include <QtGui/QImage>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -38,6 +40,11 @@ class VideoPreviewItem;
 class AppController : public QObject {
     Q_OBJECT
     Q_PROPERTY(QObject *subtitleModel READ subtitleModel CONSTANT)
+    Q_PROPERTY(QObject *filteredSubtitleModel READ filteredSubtitleModel CONSTANT)
+    Q_PROPERTY(QString selectedCueId READ selectedCueId NOTIFY selectedCueChanged)
+    Q_PROPERTY(int overlapCount READ overlapCount NOTIFY overlapChanged)
+    Q_PROPERTY(int overlappingCueCount READ overlappingCueCount NOTIFY overlapChanged)
+    Q_PROPERTY(QVariantList currentSubtitleItems READ currentSubtitleItems NOTIFY currentSubtitleChanged)
     Q_PROPERTY(QVariantList projectFiles READ projectFiles NOTIFY projectFilesChanged)
     Q_PROPERTY(QString mediaPath READ mediaPath NOTIFY mediaChanged)
     Q_PROPERTY(QString mediaName READ mediaName NOTIFY mediaChanged)
@@ -64,6 +71,11 @@ class AppController : public QObject {
     Q_PROPERTY(bool canExport READ canExport NOTIFY canExportChanged)
     Q_PROPERTY(bool canReview READ canReview NOTIFY canReviewChanged)
     Q_PROPERTY(bool canOmniReview READ canOmniReview NOTIFY canOmniReviewChanged)
+    Q_PROPERTY(bool modified READ modified NOTIFY modifiedChanged)
+    Q_PROPERTY(QString projectPath READ projectPath NOTIFY projectChanged)
+    Q_PROPERTY(bool canSave READ canSave NOTIFY busyChanged)
+    Q_PROPERTY(bool mediaAvailable READ hasMedia NOTIFY mediaChanged)
+    Q_PROPERTY(QVariantMap sessionState READ sessionState NOTIFY projectChanged)
     Q_PROPERTY(int selectedCue READ selectedCue NOTIFY selectedCueChanged)
     Q_PROPERTY(QString scriptText READ scriptText WRITE setScriptText NOTIFY scriptTextChanged)
     Q_PROPERTY(bool snapEnabled READ snapEnabled NOTIFY snapEnabledChanged)
@@ -89,6 +101,15 @@ public:
     ~AppController() override;
 
     [[nodiscard]] QObject *subtitleModel() const;
+    [[nodiscard]] QObject *filteredSubtitleModel() const { return const_cast<SubtitleFilterModel *>(&filteredModel_); }
+    [[nodiscard]] QString selectedCueId() const { return selectedCueId_; }
+    [[nodiscard]] int overlapCount() const { return static_cast<int>(subtitleIndex_.overlapRanges().size()); }
+    [[nodiscard]] int overlappingCueCount() const { return static_cast<int>(subtitleIndex_.overlappingIds().size()); }
+    [[nodiscard]] QVariantList currentSubtitleItems() const { return currentSubtitleItems_; }
+    Q_INVOKABLE bool cueOverlaps(const QString &id) const { return subtitleIndex_.overlappingIds().contains(id); }
+    Q_INVOKABLE int cueRowForId(const QString &id) const { return document_.indexOf(id); }
+    Q_INVOKABLE bool applyCueEdit(const QString &id, const QString &text, qint64 startUs, qint64 endUs);
+    Q_INVOKABLE void navigateOverlap(int delta);
     [[nodiscard]] QVariantList projectFiles() const { return projectFiles_; }
     [[nodiscard]] SubtitleDocument *document() noexcept { return &document_; }
     [[nodiscard]] SubtitleCommandManager *commands() noexcept { return &commands_; }
@@ -120,6 +141,11 @@ public:
     [[nodiscard]] bool canExport() const;
     [[nodiscard]] bool canReview() const { return alignmentCompleted_; }
     [[nodiscard]] bool canOmniReview() const;
+    [[nodiscard]] bool modified() const noexcept { return modified_; }
+    [[nodiscard]] QString projectPath() const { return projectPath_; }
+    [[nodiscard]] bool canSave() const { return !busy_ && !shuttingDown_; }
+    [[nodiscard]] QVariantMap sessionState() const { return projectData_.state.value(QStringLiteral("session")).toObject().toVariantMap(); }
+    Q_INVOKABLE void setSessionState(const QVariantMap &state) { projectData_.state.insert(QStringLiteral("session"), QJsonObject::fromVariantMap(state)); }
     [[nodiscard]] int selectedCue() const;
     [[nodiscard]] QString scriptText() const;
     void setScriptText(const QString &value);
@@ -144,6 +170,12 @@ public:
     Q_INVOKABLE void setPreviewItem(QObject *item);
     Q_INVOKABLE void setTimelineItem(QObject *item);
     Q_INVOKABLE void loadMedia(const QUrl &url);
+    Q_INVOKABLE void newProject();
+    Q_INVOKABLE bool saveProject(const QUrl &url);
+    Q_INVOKABLE bool saveCurrentProject();
+    Q_INVOKABLE void openProject(const QUrl &url);
+    Q_INVOKABLE void relinkMedia(const QUrl &url);
+    Q_INVOKABLE void importTimedSubtitles(const QUrl &url);
     Q_INVOKABLE void loadMediaPath(const QString &path);
     Q_INVOKABLE void importScript(const QUrl &url);
     Q_INVOKABLE void importScriptPath(const QString &path);
@@ -175,16 +207,23 @@ public:
     Q_INVOKABLE int frameDeltaMs(int frames) const;
     Q_INVOKABLE void selectCue(int row, bool seekToCue = true);
     Q_INVOKABLE void navigateCue(int delta);
+    Q_INVOKABLE void navigatePendingCue(int delta);
+    Q_INVOKABLE void navigateMismatchCue(int delta);
+    Q_INVOKABLE void seekToCurrentStart();
+    Q_INVOKABLE void seekToCurrentEnd();
+    Q_INVOKABLE void seekToTimelineStart();
+    Q_INVOKABLE void seekToTimelineEnd();
+    Q_INVOKABLE void nudgeCurrentStart(int frames);
+    Q_INVOKABLE void nudgeCurrentEnd(int frames);
     Q_INVOKABLE void setCueText(int row, const QString &text);
     Q_INVOKABLE void locateCue(int row);
     Q_INVOKABLE void locateCueAt(const QString &id, qint64 startMs);
     Q_INVOKABLE void confirmCue(int row);
+    Q_INVOKABLE void confirmCurrentCue();
+    Q_INVOKABLE void clearModified();
     Q_INVOKABLE void undo() { commands_.undo(); }
     Q_INVOKABLE void redo() { commands_.redo(); }
-    Q_INVOKABLE void deleteCue() {
-        if (selectedCue_ >= 0 && selectedCue_ < document_.count())
-            commands_.remove(document_.subtitles().at(selectedCue_).id);
-    }
+    Q_INVOKABLE void deleteCue();
     Q_INVOKABLE void createOrEditCue();
     Q_INVOKABLE void splitCurrentCue();
     Q_INVOKABLE void joinAroundPlayhead();
@@ -222,6 +261,9 @@ public:
     void claimPlayback();
 
 signals:
+    void projectChanged();
+    void projectSaveFinished(bool success, const QString &path, const QString &message);
+    void projectOpenFinished(bool success, const QString &path, const QString &message);
     void asrModelsReady(int requestId, const QVariantList &models);
     void credentialStatusReady(const QString &credentialId, const QString &status, int requestId);
     void projectFilesChanged();
@@ -234,6 +276,7 @@ signals:
     void canExportChanged();
     void canReviewChanged();
     void canOmniReviewChanged();
+    void modifiedChanged();
     void selectedCueChanged();
     void scriptTextChanged();
     void snapEnabledChanged();
@@ -243,6 +286,8 @@ signals:
     void settingsChanged();
     void previewChanged();
     void editCueRequested(int row, const QString &text);
+    void cueDraftRequested(const QString &id, const QString &text, qint64 startUs, qint64 endUs);
+    void overlapChanged();
     void alignmentPreflightFailed(const QVariantList &issues);
     void aiConnectionTestFinished(const QVariantMap &result);
     void asrConnectionTestFinished(const QVariantMap &result);
@@ -251,15 +296,26 @@ signals:
     void storageCleanupFinished(const QVariantMap &result);
 
 private:
+    [[nodiscard]] Project projectSnapshot() const;
+    [[nodiscard]] QByteArray projectFingerprint() const;
+    void applyProject(const Project &project, const QString &path, bool available);
     void rememberProjectFile(const QString &path, const QString &type, qint64 durationMs = 0);
     void setStatus(const QString &text);
     void setBusy(bool value);
     void setCanExport(bool value);
+    void setModified(bool value);
+    void stampMultilineFlag(Subtitle *subtitle) const;
+    void refreshMultilineFlags();
+    [[nodiscard]] bool textWrapsToMultipleLines(const QString &text) const;
+    [[nodiscard]] bool cueNeedsConfirm(const Subtitle &cue) const;
+    [[nodiscard]] bool cueMismatchesAudio(const Subtitle &cue) const;
+    [[nodiscard]] int findCueRow(int delta, const std::function<bool(const Subtitle &)> &predicate) const;
     void onTick();
     void updatePositionFromClock();
     void updateCurrentSubtitle();
     void pushPreviewFrame();
     void syncTimelineItem();
+    void onDocumentChanged();
     void stopWaveformWorker();
     void startWaveformWorker(const QString &path);
     void stopAlignmentWorker();
@@ -286,6 +342,7 @@ private:
     SubtitleDocument document_;
     SubtitleTimeIndex subtitleIndex_;
     SubtitleModel model_;
+    SubtitleFilterModel filteredModel_;
     SubtitleCommandManager commands_;
     TimelineViewport viewport_;
     SnapEngine snap_;
@@ -312,11 +369,16 @@ private:
     MediaInfo mediaInfo_;
     QStringList lastOutputPaths_;
     QVariantList projectFiles_;
+    Project projectData_;
+    QString projectPath_;
+    QByteArray savedFingerprint_;
 
     QString mediaPath_;
     QString statusText_ = QStringLiteral("就绪");
     QString scriptText_;
     QString currentSubtitle_;
+    QString selectedCueId_;
+    QVariantList currentSubtitleItems_;
     qint64 durationUs_ = 0;
     qint64 positionUs_ = 0;
     qint64 inPointMs_ = -1;
@@ -337,6 +399,8 @@ private:
     bool hasVideo_ = false;
     bool shuttingDown_ = false;
     bool ownsSharedAudio_ = true;
+    bool modified_ = false;
+    bool refreshingMultiline_ = false;
     quint64 mediaGeneration_ = 0;
     quint64 scriptGeneration_ = 0;
     quint64 alignmentEvidenceGeneration_ = 0;

@@ -208,7 +208,7 @@ Item {
 
     Popup {
         id: popup
-        parent: Overlay.overlay ? Overlay.overlay : control
+        parent: control.Overlay.overlay ? control.Overlay.overlay : control
         padding: 8
         modal: false
         focus: true

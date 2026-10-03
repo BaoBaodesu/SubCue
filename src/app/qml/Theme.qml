@@ -88,10 +88,10 @@ QtObject {
 
     // ── 滚动条 ───────────────────────────────────────────────
     readonly property color scrollTrack: "#1A1D22"       // 时间轴缩放条底轨
-    readonly property color scrollBarTrack: "#2F3540"    // 列表/设置滑动条轨道
-    readonly property color scrollThumb: "#8B95A5"
-    readonly property color scrollThumbHover: "#A4ADBB"
-    readonly property color scrollThumbPressed: "#B8C0CC"
+    readonly property color scrollBarTrack: "#3E4654"    // 列表/设置滑动条轨道，需从面板底色上分开
+    readonly property color scrollThumb: "#D0D6E0"
+    readonly property color scrollThumbHover: "#E6EAF0"
+    readonly property color scrollThumbPressed: "#F4F6F8"
 
     // ── 状态色（沿用） ───────────────────────────────────────
     readonly property color success: "#66B77B"

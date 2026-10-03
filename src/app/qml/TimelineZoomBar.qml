@@ -9,7 +9,8 @@ Rectangle {
     LayoutMirroring.enabled: false
     LayoutMirroring.childrenInherit: true
     readonly property bool interacting: mouse.pressed
-    readonly property real totalMs: Math.max(1, timeline.durationUs / 1000)
+    // durationUs 为 0 时视口内部仍按 60 秒排版。滑轨若当成 1 毫秒，滑块会被算到最右侧且拖不动。
+    readonly property real totalMs: timeline.durationUs > 0 ? timeline.durationUs / 1000 : 60000
     readonly property real startRatio: Math.max(0, Math.min(1, timeline.scrollOffset / timeline.pixelsPerMs / totalMs))
     readonly property real endRatio: Math.max(startRatio, Math.min(1, (timeline.scrollOffset + timeline.width) / timeline.pixelsPerMs / totalMs))
     readonly property real spanRatio: Math.max(0, Math.min(1, endRatio - startRatio))

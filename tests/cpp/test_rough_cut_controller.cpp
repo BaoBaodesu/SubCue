@@ -58,8 +58,11 @@ private slots:
     void reanalysisKeepsOldResultsUntilSuccess();
     void unsavedStateTracksEditsSaveAndUndo();
     void saveFailsDoesNotClearModified();
+    void offlineProjectRelinksWithoutLosingDecisions();
     void workspaceSwitchTransfersPlaybackWithoutAutoPlay();
+    void sourceAndTimelinePreviewAdvance();
     void reviewFilterAndExportGuards();
+    void cloudAnalysisRequiresSavedCredential();
 
 private:
     [[nodiscard]] QString writeWav(const QString &path) const
@@ -184,6 +187,9 @@ void RoughCutControllerTests::reanalysisKeepsOldResultsUntilSuccess()
     QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(controller.statusText().startsWith(QStringLiteral("分析完成")));
     QVERIFY(!controller.canUndo());
+    QVERIFY(controller.resultCount() > 0);
+    QVERIFY(controller.canAiReview());
+    QVERIFY(controller.canExport());
 }
 
 void RoughCutControllerTests::unsavedStateTracksEditsSaveAndUndo()
@@ -193,7 +199,7 @@ void RoughCutControllerTests::unsavedStateTracksEditsSaveAndUndo()
     auto context = makeContext(dir);
     RoughCutController controller(context.get());
     QVERIFY(!controller.modified());
-    QVERIFY(!controller.canSave());
+    QVERIFY(controller.canSave());
 
     const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
     QVERIFY(!wav.isEmpty());
@@ -222,6 +228,45 @@ void RoughCutControllerTests::unsavedStateTracksEditsSaveAndUndo()
     QVERIFY(controller.saveCurrentProject());
     QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(!controller.modified());
+}
+
+void RoughCutControllerTests::offlineProjectRelinksWithoutLosingDecisions()
+{
+    QTemporaryDir dir;
+    auto context = makeContext(dir);
+    RoughCutController controller(context.get());
+    const QString wav = writeWav(dir.filePath(QStringLiteral("原素材.wav")));
+    const QString projectPath = writeProject(dir, wav);
+    QVERIFY(!projectPath.isEmpty());
+    controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8000);
+    QVERIFY(controller.mediaAvailable());
+    controller.setDecision(0, QStringLiteral("REVIEW"));
+    QVERIFY(controller.saveCurrentProject());
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8000);
+    controller.newProject();
+    const QString moved = dir.filePath(QStringLiteral("移动后.wav"));
+    QVERIFY(QFile::rename(wav, moved));
+    controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8000);
+    QVERIFY(!controller.mediaAvailable());
+    QCOMPARE(controller.resultCount(), 1);
+    QCOMPARE(controller.decisions().at(0).userDecision, std::optional(RoughCutDecision::Review));
+    QVERIFY(!controller.canUndo());
+    QVERIFY(!controller.modified());
+    controller.relinkMedia(QUrl::fromLocalFile(moved));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8000);
+    QVERIFY(controller.mediaAvailable());
+    QVERIFY(controller.modified());
+    QCOMPARE(controller.decisions().at(0).userDecision, std::optional(RoughCutDecision::Review));
+    const auto unchanged = controller.mediaPath();
+    QFile different(dir.filePath(QStringLiteral("不同.wav")));
+    QVERIFY(different.open(QIODevice::WriteOnly));
+    different.write("different-content"); different.close();
+    controller.relinkMedia(QUrl::fromLocalFile(different.fileName()));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8000);
+    QCOMPARE(controller.mediaPath(), unchanged);
+    QCOMPARE(controller.resultCount(), 1);
 }
 
 void RoughCutControllerTests::saveFailsDoesNotClearModified()
@@ -270,6 +315,51 @@ void RoughCutControllerTests::workspaceSwitchTransfersPlaybackWithoutAutoPlay()
     QVERIFY(!editor.playing());
     QVERIFY(router.switchTo(QStringLiteral("roughcut")));
     QVERIFY(!roughCut.playing());
+}
+
+void RoughCutControllerTests::sourceAndTimelinePreviewAdvance()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController editor(context.get());
+    RoughCutController roughCut(context.get());
+    WorkspaceRouter router(&editor, &roughCut);
+    QVERIFY(router.switchTo(QStringLiteral("roughcut")));
+
+    const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
+    QVERIFY(!wav.isEmpty());
+    roughCut.loadMedia(QUrl::fromLocalFile(wav));
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy(), 8'000);
+    roughCut.togglePlay();
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.positionMs() > 100, 3'000);
+    roughCut.togglePlay();
+    roughCut.seek(roughCut.durationMs());
+    roughCut.togglePlay();
+    QVERIFY2(roughCut.positionMs() < 700, qPrintable(QString::number(roughCut.positionMs())));
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.positionMs() > 100, 3'000);
+    roughCut.togglePlay();
+
+    roughCut.openProject(QUrl::fromLocalFile(writeProject(dir, wav)));
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.busy(), 8'000);
+    roughCut.playTimeline();
+    QVERIFY(roughCut.timelineActive());
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.positionMs() > 100, 3'000);
+    roughCut.stopTimeline();
+    roughCut.seekTimeline(roughCut.durationMs());
+    roughCut.playTimeline();
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.timelineActive() && roughCut.positionMs() > 100
+        && roughCut.positionMs() < 700, 3'000);
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.timelineActive(), 3'000);
+    roughCut.playTimeline();
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.timelineActive() && roughCut.positionMs() > 100
+        && roughCut.positionMs() < 700, 3'000);
+    roughCut.stopTimeline();
+    roughCut.seek(0);
+    roughCut.togglePlay();
+    QTRY_VERIFY_WITH_TIMEOUT(!roughCut.playing(), 3'000);
+    roughCut.togglePlay();
+    QTRY_VERIFY_WITH_TIMEOUT(roughCut.positionMs() > 100 && roughCut.positionMs() < 700, 3'000);
 }
 
 void RoughCutControllerTests::reviewFilterAndExportGuards()
@@ -325,6 +415,34 @@ void RoughCutControllerTests::reviewFilterAndExportGuards()
     QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     QVERIFY(!controller.cancelling());
     QVERIFY(controller.busyTaskTitle().isEmpty());
+    QVERIFY(controller.canExport());
+}
+
+void RoughCutControllerTests::cloudAnalysisRequiresSavedCredential()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
+    QVERIFY(!wav.isEmpty());
+    auto context = makeContext(dir);
+    context->settings.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));
+    RoughCutController controller(context.get());
+    controller.loadMedia(QUrl::fromLocalFile(wav));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    controller.setScriptText(QStringLiteral("第一句。"));
+    controller.startAnalysis();
+    QVERIFY(!controller.busy());
+    QCOMPARE(controller.statusText(), QStringLiteral("云端 ASR API Key 尚未配置，请在设置中保存凭据。"));
+    QCOMPARE(controller.resultCount(), 0);
+
+    FakeAsrService asr;
+    asr.transcript.words = {{1, QStringLiteral("第一句"), 0, 400}};
+    controller.setAnalysisOverrides(&asr);
+    controller.startAnalysis();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY(controller.statusText().startsWith(QStringLiteral("分析完成")));
+    QVERIFY(controller.resultCount() > 0);
+    QVERIFY(controller.canAiReview());
     QVERIFY(controller.canExport());
 }
 

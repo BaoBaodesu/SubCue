@@ -1,8 +1,19 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Layouts
 
 Menu {
     id: control
+    property bool countedPopup: false
+    function updatePopupCount(opened) {
+        const win = control.parent ? control.parent.Window.window : null
+        if (!win || typeof win.popupDepth === "undefined" || countedPopup === opened) return
+        win.popupDepth = Math.max(0, win.popupDepth + (opened ? 1 : -1))
+        countedPopup = opened
+    }
+    Component.onDestruction: updatePopupCount(false)
+
+    onVisibleChanged: updatePopupCount(visible)
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fontSize
 
@@ -21,14 +32,18 @@ Menu {
         font.family: Theme.fontFamily
         font.pixelSize: Theme.fontSize
 
-        contentItem: Text {
-            text: menuItem.text
-            font: menuItem.font
-            elide: Text.ElideRight
-            verticalAlignment: Text.AlignVCenter
-            color: !menuItem.enabled ? Theme.disabledText
-                 : menuItem.highlighted ? Theme.text
-                 : Theme.menuButtonText
+        contentItem: RowLayout {
+            spacing: 16
+            Text {
+                Layout.fillWidth: true
+                text: menuItem.text; font: menuItem.font; elide: Text.ElideRight
+                color: menuItem.enabled ? Theme.text : Theme.disabledText
+            }
+            Text {
+                text: menuItem.action ? (menuItem.action.keySequence || String(menuItem.action.shortcut || "")) : ""
+                font.family: "Consolas"; font.pixelSize: 12
+                color: menuItem.enabled ? Theme.secondaryText : Theme.disabledText
+            }
         }
 
         background: Rectangle {

@@ -2,6 +2,8 @@
 
 #include <QtCore/QFile>
 #include <QtCore/QTemporaryDir>
+#include <QtSql/QSqlDatabase>
+#include <QtSql/QSqlQuery>
 #include <QtTest/QTest>
 
 #include <atomic>
@@ -17,6 +19,9 @@ private slots:
     void savesUnanalyzedMediaAndScript();
     void savesAnalysisWithoutModelVersion();
     void mediaSha256CancelStopsBeforeCompletion();
+    void migratesLegacyVersionsWithoutWriting_data();
+    void migratesLegacyVersionsWithoutWriting();
+    void rejectsFutureVersionAndMissingTable();
 };
 
 void RoughCutProjectTests::roundTripPreservesManualDecision()
@@ -56,7 +61,7 @@ void RoughCutProjectTests::roundTripPreservesManualDecision()
     decision.reason = QStringLiteral("人工确认");
     decision.evidence = {QStringLiteral("边界可信")};
     decision.takeGroupId = 2;
-    decision.replacementRecordingIndex = 2;
+    decision.replacementRecordingIndex = -1;
     decision.bestTake = true;
     decision.failureType = RoughCutFailureType::Interrupted;
     decision.modelProbability = 0.96;
@@ -86,7 +91,7 @@ void RoughCutProjectTests::roundTripPreservesManualDecision()
     QCOMPARE(loaded->recording.constFirst().scriptTokenStart, 12);
     QCOMPARE(loaded->recording.constFirst().scriptTokenEnd, 20);
     QVERIFY(loaded->recording.constFirst().preciseTiming);
-    QCOMPARE(loaded->decisions.constFirst().replacementRecordingIndex, 2);
+    QCOMPARE(loaded->decisions.constFirst().replacementRecordingIndex, -1);
     QVERIFY(loaded->decisions.constFirst().bestTake);
     QCOMPARE(loaded->decisions.constFirst().failureType, RoughCutFailureType::Interrupted);
     QCOMPARE(loaded->decisions.constFirst().modelProbability, 0.96);
@@ -203,6 +208,72 @@ void RoughCutProjectTests::mediaSha256CancelStopsBeforeCompletion()
     cancel = false;
     const QByteArray full = RoughCutProjectSerializer::mediaSha256(path, &error);
     QCOMPARE(full.size(), 32);
+}
+
+void RoughCutProjectTests::migratesLegacyVersionsWithoutWriting_data()
+{
+    QTest::addColumn<int>("version");
+    for (int version = 1; version <= 5; ++version)
+        QTest::newRow(qPrintable(QStringLiteral("v%1").arg(version))) << version;
+}
+
+void RoughCutProjectTests::migratesLegacyVersionsWithoutWriting()
+{
+    QFETCH(int, version);
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("legacy.subcue-roughcut"));
+    RoughCutProject project;
+    project.sourceSampleCount = 2000;
+    project.sampleRate = 48000;
+    project.recording = {{QStringLiteral("p1"), QStringLiteral("旧工程"), 0, 1000}};
+    RoughCutSegmentDecision decision;
+    decision.recordingIndex = 0;
+    decision.userDecision = RoughCutDecision::Keep;
+    project.decisions = {decision};
+    QString error;
+    QVERIFY2(RoughCutProjectSerializer::save(path, project, &error), qPrintable(error));
+    {
+        auto database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("migration-test"));
+        database.setDatabaseName(path);
+        QVERIFY(database.open());
+        QSqlQuery query(database);
+        QVERIFY(query.exec(QStringLiteral("UPDATE metadata SET value=%1 WHERE key='schemaVersion'").arg(version)));
+        QVERIFY(query.exec(QStringLiteral("DELETE FROM metadata WHERE key='state'")));
+        if (version == 1)
+            QVERIFY(query.exec(QStringLiteral("CREATE TABLE segments AS SELECT * FROM analysis_segments")));
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("migration-test"));
+    const QByteArray before = RoughCutProjectSerializer::mediaSha256(path);
+    const auto loaded = RoughCutProjectSerializer::load(path, &error);
+    QVERIFY2(loaded.has_value(), qPrintable(error));
+    QCOMPARE(loaded->recording.size(), 1);
+    QCOMPARE(loaded->decisions.first().userDecision, std::optional(RoughCutDecision::Keep));
+    QVERIFY(loaded->state.value(QStringLiteral("legacyEvidenceMissing")).toBool());
+    QCOMPARE(RoughCutProjectSerializer::mediaSha256(path), before);
+}
+
+void RoughCutProjectTests::rejectsFutureVersionAndMissingTable()
+{
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("corrupt.subcue-roughcut"));
+    QVERIFY(RoughCutProjectSerializer::save(path, RoughCutProject{}));
+    {
+        auto database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("corrupt-test"));
+        database.setDatabaseName(path);
+        QVERIFY(database.open());
+        QSqlQuery query(database);
+        QVERIFY(query.exec(QStringLiteral("UPDATE metadata SET value=99 WHERE key='schemaVersion'")));
+        QString error;
+        QVERIFY(!RoughCutProjectSerializer::load(path, &error));
+        QVERIFY(error.contains(QStringLiteral("版本")));
+        QVERIFY(query.exec(QStringLiteral("UPDATE metadata SET value=6 WHERE key='schemaVersion'")));
+        QVERIFY(query.exec(QStringLiteral("DROP TABLE analysis_segments")));
+        QVERIFY(!RoughCutProjectSerializer::load(path, &error));
+        QVERIFY(!error.isEmpty());
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("corrupt-test"));
 }
 
 QTEST_GUILESS_MAIN(RoughCutProjectTests)

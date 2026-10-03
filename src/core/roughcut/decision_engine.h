@@ -37,7 +37,7 @@ public:
         const QVector<ScriptMatch> &matches,
         const QVector<RoughCutRetakeGroup> &groups,
         const QVector<bool> &alignmentTrustworthy = {},
-        const QString &scriptText = {});
+        const QString &scriptText = {}, bool applyCutProtection = true);
     static void protectCuts(const QVector<RecognizedPassage> &recording,
                             QVector<RoughCutSegmentDecision> *decisions,
                             const QString &scriptText = {});

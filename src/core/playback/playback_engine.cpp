@@ -353,7 +353,8 @@ void PlaybackEngine::requestHwRuntimeFailure()
 
 MediaTime PlaybackEngine::position() const
 {
-    return clock_.now();
+    const MediaTime current = clock_.now();
+    return current.isValidRange() || !open_.load() ? current : clockStart_;
 }
 
 quint64 PlaybackEngine::generation() const

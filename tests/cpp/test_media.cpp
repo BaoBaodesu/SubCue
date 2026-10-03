@@ -2,6 +2,7 @@
 #include "media/ffmpeg_error.h"
 #include "media/ffmpeg_time.h"
 #include "media/media_engine.h"
+#include "media/media_probe.h"
 
 #include <QtCore/QDir>
 #include <QtTest/QTest>
@@ -19,6 +20,7 @@ private slots:
     void boundedQueueHonorsCapacityAndGeneration();
     void probesAudioVideoAndVfr();
     void rejectsCorruptMedia();
+    void verifiesCfrTimestampsAndCancellation();
     void decodesAndConvertsVideo();
     void decodesAndResamplesAudio();
 
@@ -88,6 +90,20 @@ void MediaTests::probesAudioVideoAndVfr()
     result = engine.probe(mediaPath(QStringLiteral("vfr.mp4")));
     QVERIFY(std::holds_alternative<MediaInfo>(result));
     QCOMPARE(std::get<MediaInfo>(result).variableFrameRate, true);
+}
+
+void MediaTests::verifiesCfrTimestampsAndCancellation()
+{
+    auto result = MediaProbe::verifyFrameRate(mediaPath(QStringLiteral("cfr_av.mp4")), nullptr);
+    QVERIFY(std::holds_alternative<MediaInfo>(result));
+    QVERIFY(std::get<MediaInfo>(result).cfrVerified);
+    result = MediaProbe::verifyFrameRate(mediaPath(QStringLiteral("vfr.mp4")), nullptr);
+    QVERIFY(std::holds_alternative<MediaInfo>(result));
+    QVERIFY(std::get<MediaInfo>(result).variableFrameRate);
+    QVERIFY(!std::get<MediaInfo>(result).cfrVerified);
+    std::atomic<bool> cancel = true;
+    result = MediaProbe::verifyFrameRate(mediaPath(QStringLiteral("cfr_av.mp4")), &cancel);
+    QVERIFY(std::holds_alternative<AppError>(result));
 }
 
 void MediaTests::rejectsCorruptMedia()

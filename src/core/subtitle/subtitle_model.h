@@ -3,6 +3,8 @@
 #include "subtitle/subtitle_document.h"
 
 #include <QtCore/QAbstractListModel>
+#include <QtCore/QSortFilterProxyModel>
+#include <QtCore/QSet>
 
 namespace subcue {
 
@@ -45,6 +47,32 @@ signals:
 
 private:
     SubtitleDocument *document_;
+};
+
+
+class SubtitleFilterModel final : public QSortFilterProxyModel {
+    Q_OBJECT
+    Q_PROPERTY(int count READ rowCount NOTIFY countChanged)
+    Q_PROPERTY(QString searchText READ searchText WRITE setSearchText NOTIFY filterChanged)
+    Q_PROPERTY(QString statusFilter READ statusFilter WRITE setStatusFilter NOTIFY filterChanged)
+public:
+    explicit SubtitleFilterModel(QObject *parent = nullptr);
+    QString searchText() const { return searchText_; }
+    QString statusFilter() const { return statusFilter_; }
+    void setSearchText(const QString &text);
+    void setStatusFilter(const QString &status);
+    void setOverlappingIds(const QSet<QString> &ids);
+    Q_INVOKABLE QVariantMap get(int row) const;
+    Q_INVOKABLE int rowForId(const QString &id) const;
+signals:
+    void countChanged();
+    void filterChanged();
+protected:
+    bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
+private:
+    QString searchText_;
+    QString statusFilter_ = QStringLiteral("ALL");
+    QSet<QString> overlappingIds_;
 };
 
 } // namespace subcue

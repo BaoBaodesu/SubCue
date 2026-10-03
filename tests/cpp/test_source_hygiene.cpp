@@ -36,6 +36,8 @@ namespace {
         QStringLiteral("Shift+Right"),
         QStringLiteral("3"),
         QStringLiteral("4"),
+        QStringLiteral("Q"),
+        QStringLiteral("W"),
         QStringLiteral("T"),
         QStringLiteral("["),
         QStringLiteral("]"),
@@ -44,11 +46,29 @@ namespace {
         QStringLiteral("Enter"),
         QStringLiteral("Shift+Return"),
         QStringLiteral("Shift+Enter"),
+        QStringLiteral("Ctrl+Return"),
+        QStringLiteral("Ctrl+Enter"),
         QStringLiteral("Up"),
         QStringLiteral("Down"),
         QStringLiteral("Tab"),
+        QStringLiteral("Shift+Up"),
+        QStringLiteral("Shift+Down"),
+        QStringLiteral("Ctrl+Up"),
+        QStringLiteral("Ctrl+Down"),
         QStringLiteral("I"),
         QStringLiteral("O"),
+        QStringLiteral("Shift+I"),
+        QStringLiteral("Shift+O"),
+        QStringLiteral("Home"),
+        QStringLiteral("End"),
+        QStringLiteral("Alt+Left"),
+        QStringLiteral("Alt+Right"),
+        QStringLiteral("Alt+Shift+Left"),
+        QStringLiteral("Alt+Shift+Right"),
+        QStringLiteral("Ctrl+Alt+Left"),
+        QStringLiteral("Ctrl+Alt+Right"),
+        QStringLiteral("Ctrl+Alt+Shift+Left"),
+        QStringLiteral("Ctrl+Alt+Shift+Right"),
         QStringLiteral("Alt+I"),
         QStringLiteral("Alt+O"),
         QStringLiteral("S"),
@@ -61,7 +81,7 @@ namespace {
 [[nodiscard]] QSet<QString> shortcutTokens(const QString &source)
 {
     QSet<QString> tokens;
-    QRegularExpression sequence(QStringLiteral("sequence:\\s*\"([^\"]+)\""));
+    QRegularExpression sequence(QStringLiteral("(?:sequence|keySequence):\\s*\"([^\"]+)\""));
     QRegularExpressionMatchIterator it = sequence.globalMatch(source);
     while (it.hasNext()) {
         const QString token = it.next().captured(1);
@@ -244,6 +264,19 @@ void SourceHygieneTests::qmlKeepsFrozenShortcutMatrix()
     QCOMPARE(shortcutTokens(source), frozenEditorShortcuts());
     QVERIFY(source.contains(QStringLiteral("createNextScriptCue")));
     QVERIFY(source.contains(QStringLiteral("exportSubtitles")));
+
+    const QString workspace = readText(QStringLiteral("src/app/qml/SubtitleWorkspace.qml"));
+    QVERIFY(!workspace.isEmpty());
+    auto editingKeys = frozenEditorShortcuts();
+    editingKeys.remove(QStringLiteral("Ctrl+O"));
+    editingKeys.remove(QStringLiteral("Ctrl+I"));
+    editingKeys.insert(QStringLiteral("Shift+Tab"));
+    editingKeys.insert(QStringLiteral("Ctrl+S"));
+    QCOMPARE(shortcutTokens(workspace), editingKeys);
+    const auto fileKeys = shortcutTokens(readText(QStringLiteral("src/app/qml/AppRouter.qml")));
+    for (const auto &key : {QStringLiteral("Ctrl+O"), QStringLiteral("Ctrl+S"), QStringLiteral("Ctrl+Shift+S"),
+                           QStringLiteral("Ctrl+N"), QStringLiteral("F1"), QStringLiteral("F6")})
+        QVERIFY2(fileKeys.contains(key), qPrintable(key));
 
     const QString settings = readText(QStringLiteral("src/app/qml/SettingsWindow.qml"));
     QVERIFY(!settings.contains(QStringLiteral("ffmpeg.exe")));

@@ -76,7 +76,16 @@ void TimelineViewport::setZoomPercent(int percent, double viewportWidth)
 
 void TimelineViewport::adjustZoomPercent(int delta, double viewportWidth)
 {
-    setZoomPercent(zoomPercent() + delta, viewportWidth);
+    if (delta == 0) {
+        return;
+    }
+    // 步进对齐到 100%，否则缩到最小再放大时会停在 13、23… 而跨过 100。
+    const int step = std::abs(delta);
+    const double gridIndex = static_cast<double>(zoomPercent() - 100) / static_cast<double>(step);
+    const int next = delta > 0
+        ? 100 + (static_cast<int>(std::floor(gridIndex)) + 1) * step
+        : 100 + (static_cast<int>(std::ceil(gridIndex)) - 1) * step;
+    setZoomPercent(next, viewportWidth);
 }
 
 void TimelineViewport::fit(double viewportWidth)

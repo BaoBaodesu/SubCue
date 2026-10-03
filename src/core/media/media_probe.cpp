@@ -3,9 +3,12 @@
 #include "media/ffmpeg_error.h"
 #include "media/ffmpeg_raii.h"
 #include "media/ffmpeg_time.h"
+#include "media/demuxer.h"
+#include "media/decoder.h"
 
 extern "C" {
 #include <libavutil/dict.h>
+#include <libavutil/display.h>
 }
 
 #include <QtCore/QFile>
@@ -89,6 +92,15 @@ ProbeResult MediaProbe::probe(const QString &path)
         streamInfo.channels = parameters->ch_layout.nb_channels;
         streamInfo.averageFrameRate = rationalValue(stream->avg_frame_rate);
         streamInfo.realFrameRate = rationalValue(stream->r_frame_rate);
+        const AVRational rate = stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+        streamInfo.frameRateNumerator = rate.num;
+        streamInfo.frameRateDenominator = rate.den > 0 ? rate.den : 1;
+        streamInfo.startTime = stream->start_time == AV_NOPTS_VALUE ? MediaTime{}
+            : mediaTimeFromTimestamp(stream->start_time, stream->time_base);
+        if (parameters->sample_aspect_ratio.num > 0 && parameters->sample_aspect_ratio.den > 0) {
+            streamInfo.pixelAspectNumerator = parameters->sample_aspect_ratio.num;
+            streamInfo.pixelAspectDenominator = parameters->sample_aspect_ratio.den;
+        }
         streamInfo.variableFrameRate = streamInfo.type == MediaStreamType::Video
             && streamInfo.averageFrameRate > 0.0
             && streamInfo.realFrameRate > 0.0
@@ -97,6 +109,73 @@ ProbeResult MediaProbe::probe(const QString &path)
         info.streams.push_back(std::move(streamInfo));
     }
     return info;
+}
+
+ProbeResult MediaProbe::verifyFrameRate(const QString &path, const std::atomic<bool> *cancel)
+{
+    ProbeResult result = probe(path);
+    if (std::holds_alternative<AppError>(result)) return result;
+    MediaInfo info = std::get<MediaInfo>(result);
+    if (info.videoStreamIndex < 0) return info;
+    AppError error(ErrorDomain::Media, 0, QString());
+    Demuxer demuxer;
+    Decoder decoder;
+    if (!demuxer.open(path, &error)) return error;
+    const AVStream *stream = demuxer.stream(info.videoStreamIndex);
+    if (!stream || !decoder.open(*stream, &error)) return error;
+    if (stream->codecpar->field_order > AV_FIELD_PROGRESSIVE)
+        return AppError(ErrorDomain::Validation, 1, QStringLiteral("暂不支持隔行视频 XML，请先转换为逐行固定帧率素材。"));
+    const auto *display = av_packet_side_data_get(stream->codecpar->coded_side_data,
+        stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+    if (display && display->size >= 9 * sizeof(int32_t)
+        && std::abs(std::remainder(av_display_rotation_get(reinterpret_cast<const int32_t *>(display->data)), 360.0)) > 0.01)
+        return AppError(ErrorDomain::Validation, 1, QStringLiteral("暂不支持带旋转元数据的视频 XML，请先转换为正确方向的素材。"));
+    const auto &video = info.streams.at(info.videoStreamIndex);
+    if (video.frameRateNumerator <= 0 || video.frameRateDenominator <= 0)
+        return AppError(ErrorDomain::Validation, 1, QStringLiteral("无法确认源视频帧率。"));
+    const AVRational period{video.frameRateDenominator, video.frameRateNumerator};
+    FramePtr frame = makeFrame();
+    qint64 first = AV_NOPTS_VALUE;
+    qint64 count = 0;
+    // 完整扫描只保留时间戳与计数，不保留帧历史。
+    bool draining = false;
+    while (!cancel || !cancel->load()) {
+        if (!draining) {
+            PacketPtr packet = demuxer.readPacket(&error);
+            if (!packet) { if (error.code() != 0) return error; draining = true; (void)decoder.send(nullptr); }
+            else {
+                if (packet->stream_index != info.videoStreamIndex) continue;
+                const int sent = decoder.send(packet.get());
+                if (sent < 0) return makeFfmpegError(ErrorDomain::Decoder, sent, QStringLiteral("帧率检查解码失败"));
+            }
+        }
+        for (;;) {
+            const int received = decoder.receive(frame.get());
+            if (received == AVERROR(EAGAIN)) break;
+            if (received == AVERROR_EOF) {
+                if (count <= 1) return AppError(ErrorDomain::Validation, 1, QStringLiteral("视频帧数不足，无法确认固定帧率。"));
+                info.cfrVerified = true;
+                info.variableFrameRate = false;
+                return info;
+            }
+            if (received < 0) return makeFfmpegError(ErrorDomain::Decoder, received, QStringLiteral("帧率检查失败"));
+            if (frame->flags & AV_FRAME_FLAG_INTERLACED)
+                return AppError(ErrorDomain::Validation, 1, QStringLiteral("暂不支持隔行视频 XML，请先转换为逐行素材。"));
+            const qint64 pts = frame->best_effort_timestamp;
+            av_frame_unref(frame.get());
+            if (pts == AV_NOPTS_VALUE)
+                return AppError(ErrorDomain::Validation, 1, QStringLiteral("视频缺少时间戳，无法确认固定帧率。"));
+            if (first == AV_NOPTS_VALUE) first = pts;
+            if (std::abs(pts - first - av_rescale_q(count, period, stream->time_base)) > 1) {
+                info.variableFrameRate = true;
+                info.cfrVerified = false;
+                return info;
+            }
+            ++count;
+        }
+        if (draining) break;
+    }
+    return AppError(ErrorDomain::Media, AVERROR_EXIT, QStringLiteral("帧率检查已取消。"));
 }
 
 } // namespace subcue

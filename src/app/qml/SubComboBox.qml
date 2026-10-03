@@ -4,7 +4,17 @@ import QtQuick.Controls
 // 深色组合框：字段统一输入底色，Popup 深色、选中行用选区蓝。
 ComboBox {
     id: control
-    implicitHeight: 28
+    property bool countedPopup: false
+    function updatePopupCount(opened) {
+        const win = control.Window.window
+        if (!win || typeof win.popupDepth === "undefined" || countedPopup === opened) return
+        win.popupDepth = Math.max(0, win.popupDepth + (opened ? 1 : -1))
+        countedPopup = opened
+    }
+    Component.onDestruction: updatePopupCount(false)
+
+    implicitHeight: 30
+    Connections { target: control.popup; function onVisibleChanged() { control.updatePopupCount(control.popup.visible) } }
     leftPadding: 10
     rightPadding: 26
     font.family: Theme.fontFamily

@@ -12,6 +12,8 @@ public:
     [[nodiscard]] static bool validate(const RoughCutExportRequest &request,
                                        QString *errorMessage = nullptr);
     [[nodiscard]] static QByteArray build(const RoughCutExportRequest &request);
+    [[nodiscard]] static QList<RoughCutSourceClip> conformSourceRanges(const RoughCutExportRequest &request,
+                                                                    QString *errorMessage = nullptr);
     [[nodiscard]] static bool save(const QString &path, const RoughCutExportRequest &request,
                                    QString *errorMessage = nullptr);
 };

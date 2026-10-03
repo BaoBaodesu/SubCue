@@ -216,6 +216,20 @@ private slots:
         QCOMPARE(leftover.at(0).toString(), QStringLiteral("custom"));
     }
 
+    void cancelledSaveKeepsOriginalFile()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath(QStringLiteral("保存.subcue"));
+        QFile original(path);
+        QVERIFY(original.open(QIODevice::WriteOnly));
+        original.write("original"); original.close();
+        std::atomic<bool> cancel = true;
+        QString error;
+        QVERIFY(!ProjectSerializer::save(path, Project{}, &error, &cancel));
+        QCOMPARE(readFile(path), QByteArray("original"));
+        QVERIFY(!error.isEmpty());
+    }
+
     void projectRoundTrip()
     {
         QTemporaryDir directory;
@@ -230,6 +244,12 @@ private slots:
                                    {QStringLiteral("edgeSha256"), QStringLiteral("abc")}};
         Subtitle subtitle = makeSubtitle(QStringLiteral("stable-project-id"),
                                          QStringLiteral("工程字幕"), 2'080, 3'424);
+        subtitle.candidateText = QStringLiteral("独立候选字段");
+        subtitle.ambiguity = 0.25;
+        subtitle.skipReason = QStringLiteral("待核对");
+        source.state = {{QStringLiteral("scriptText"), QStringLiteral("手改文稿")},
+            {QStringLiteral("session"), QJsonObject{{QStringLiteral("positionUs"), 1000000}}},
+            {QStringLiteral("assets"), QJsonArray{QJsonObject{{QStringLiteral("path"), source.mediaPath}}}}};
         subtitle.startWordId = 7;
         subtitle.endWordId = 9;
         subtitle.metadata = {{QStringLiteral("candidateText"), QStringLiteral("候选")},
@@ -244,7 +264,7 @@ private slots:
         QString error;
         QVERIFY2(ProjectSerializer::save(projectPath, source, &error), qPrintable(error));
         const QJsonObject json = QJsonDocument::fromJson(readFile(projectPath)).object();
-        QCOMPARE(json.value(QStringLiteral("schemaVersion")).toInt(), 1);
+        QCOMPARE(json.value(QStringLiteral("schemaVersion")).toInt(), Project::CurrentSchemaVersion);
         QCOMPARE(json.value(QStringLiteral("media")).toObject()
                      .value(QStringLiteral("path")).toString(),
                  QStringLiteral("media/episode.mp4"));
@@ -257,6 +277,10 @@ private slots:
         QCOMPARE(loaded->tracks.at(0).subtitles.at(0).id, QStringLiteral("stable-project-id"));
         QCOMPARE(loaded->tracks.at(0).subtitles.at(0).start.microseconds(), 2'080'000);
         QCOMPARE(loaded->tracks.at(0).subtitles.at(0).startWordId, 7);
+        QCOMPARE(loaded->tracks.at(0).subtitles.at(0).candidateText, subtitle.candidateText);
+        QCOMPARE(loaded->tracks.at(0).subtitles.at(0).ambiguity, subtitle.ambiguity);
+        QCOMPARE(loaded->tracks.at(0).subtitles.at(0).skipReason, subtitle.skipReason);
+        QCOMPARE(loaded->state, source.state);
         QCOMPARE(loaded->tracks.at(0).subtitles.at(0).metadata
                      .value(QStringLiteral("candidateText")).toString(), QStringLiteral("候选"));
         QVERIFY(!loaded->tracks.at(0).subtitles.at(1).isTimed());

@@ -1,4 +1,9 @@
 #include "app_controller.h"
+#include "common/file_path_guard.h"
+#include "project/project_serializer.h"
+#include "roughcut/rough_cut_project.h"
+#include <QtCore/QJsonDocument>
+#include <QtCore/QStringDecoder>
 
 #include "application_context.h"
 #include "timeline_scene_item.h"
@@ -37,6 +42,9 @@
 #include <QtCore/QVariantMap>
 #include <QtCore/QUuid>
 #include <QtGui/QDesktopServices>
+#include <QtGui/QFont>
+#include <QtGui/QFontMetrics>
+#include <QtGui/QUndoStack>
 
 #include <algorithm>
 #include <cmath>
@@ -78,7 +86,13 @@ QString readTextFile(const QString &path, QString *errorMessage)
     if (bytes.startsWith("\xEF\xBB\xBF")) {
         bytes.remove(0, 3);
     }
-    return QString::fromUtf8(bytes);
+    QStringDecoder decoder(QStringDecoder::Utf8);
+    const QString text = decoder.decode(bytes);
+    if (decoder.hasError()) {
+        if (errorMessage) *errorMessage = QStringLiteral("文稿不是有效 UTF-8，请转换编码后导入。");
+        return {};
+    }
+    return text;
 }
 
 QString aiCredentialId(const QString &providerId)
@@ -90,8 +104,13 @@ QVariantMap providerResult(const ProviderTestResult &result)
 {
     QVariantMap output;
     if (std::holds_alternative<AppError>(result)) {
+        const AppError &error = std::get<AppError>(result);
+        QString message = error.userMessage();
+        if (!error.technicalDetails().isEmpty()) {
+            message += QStringLiteral(" ") + error.technicalDetails();
+        }
         output.insert(QStringLiteral("success"), false);
-        output.insert(QStringLiteral("error"), std::get<AppError>(result).userMessage());
+        output.insert(QStringLiteral("error"), message);
         return output;
     }
     const ConnectionTestResult connected = std::get<ConnectionTestResult>(result);
@@ -115,6 +134,8 @@ AppController::AppController(ApplicationContext *context, QObject *parent)
       editor_(&document_, &commands_, &viewport_, &snap_)
 {
     Q_ASSERT(context_ != nullptr);
+    filteredModel_.setSourceModel(&model_);
+    savedFingerprint_ = projectFingerprint();
     context_->registerAudioClient(&playback_);
     backgroundTasks_.setMaxThreadCount(3);
     tickTimer_.setInterval(10);
@@ -122,34 +143,21 @@ AppController::AppController(ApplicationContext *context, QObject *parent)
     connect(commands_.stack(), &QUndoStack::indexChanged, this, [this] {
         setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
             [](const Subtitle &cue) { return cue.isExportable(); }));
+        if (commands_.stack()->count() > 0) {
+            setModified(true);
+        }
         if (selectedCue_ >= document_.count()) {
             selectedCue_ = document_.count() - 1;
+            selectedCueId_ = selectedCue_ >= 0 ? document_.subtitles().at(selectedCue_).id : QString();
             emit selectedCueChanged();
             syncTimelineItem();
         }
     });
     QObject::connect(&tickTimer_, &QTimer::timeout, this, &AppController::onTick);
-    QObject::connect(&document_, &SubtitleDocument::reset, this, [this] {
-        subtitleIndex_.rebuild(document_.subtitles());
-        syncTimelineItem();
-        updateCurrentSubtitle();
-        emit selectedCueChanged();
-    });
-    QObject::connect(&document_, &SubtitleDocument::inserted, this, [this] {
-        subtitleIndex_.rebuild(document_.subtitles());
-        syncTimelineItem();
-        updateCurrentSubtitle();
-    });
-    QObject::connect(&document_, &SubtitleDocument::removed, this, [this] {
-        subtitleIndex_.rebuild(document_.subtitles());
-        syncTimelineItem();
-        updateCurrentSubtitle();
-    });
-    QObject::connect(&document_, &SubtitleDocument::changed, this, [this](int) {
-        subtitleIndex_.rebuild(document_.subtitles());
-        syncTimelineItem();
-        updateCurrentSubtitle();
-    });
+    connect(&document_, &SubtitleDocument::reset, this, &AppController::onDocumentChanged);
+    connect(&document_, &SubtitleDocument::inserted, this, &AppController::onDocumentChanged);
+    connect(&document_, &SubtitleDocument::removed, this, &AppController::onDocumentChanged);
+    connect(&document_, &SubtitleDocument::changed, this, &AppController::onDocumentChanged);
     setStatus(context_->credentialMigrationError.isEmpty()
         ? QStringLiteral("就绪")
         : QStringLiteral("旧凭据迁移失败：%1").arg(context_->credentialMigrationError));
@@ -172,7 +180,7 @@ QString AppController::mediaName() const
     return mediaPath_.isEmpty() ? QStringLiteral("未选择媒体") : QFileInfo(mediaPath_).fileName();
 }
 
-bool AppController::hasMedia() const { return !mediaPath_.isEmpty(); }
+bool AppController::hasMedia() const { return playback_.isOpen(); }
 
 bool AppController::hasVideo() const { return hasVideo_; }
 
@@ -201,7 +209,7 @@ QString AppController::statusText() const { return statusText_; }
 
 bool AppController::busy() const { return busy_; }
 
-bool AppController::canExport() const { return canExport_; }
+bool AppController::canExport() const { return canExport_ && overlapCount() == 0; }
 
 bool AppController::canOmniReview() const
 {
@@ -219,13 +227,15 @@ void AppController::setScriptText(const QString &value)
     }
     scriptText_ = value;
     ++scriptGeneration_;
-    invalidateAlignmentEvidence();
+    // 文稿修改使分析过期，但旧字幕仍保留对应词级证据，直到新分析成功替换。
+    ++alignmentEvidenceGeneration_;
     if (alignmentCompleted_) {
         alignmentCompleted_ = false;
         emit canReviewChanged();
         emit canOmniReviewChanged();
     }
     emit scriptTextChanged();
+    setModified(true);
 }
 
 bool AppController::snapEnabled() const { return snap_.isEnabled(); }
@@ -254,34 +264,34 @@ QString AppController::currentSubtitleText() const { return currentSubtitle_; }
 
 QString AppController::subtitleFontFamily() const
 {
-    return context_->settings.value(QStringLiteral("fontFamily")).toString();
+    return setting(QStringLiteral("fontFamily")).toString();
 }
 
 int AppController::subtitleFontSize() const
 {
-    return context_->settings.value(QStringLiteral("fontSize1080p")).toInt();
+    return setting(QStringLiteral("fontSize1080p")).toInt();
 }
 
 QString AppController::subtitleFontColor() const
 {
-    const QString value = context_->settings.value(QStringLiteral("fontColor")).toString();
+    const QString value = setting(QStringLiteral("fontColor")).toString();
     return value.isEmpty() ? QStringLiteral("#FFFFFF") : value;
 }
 
 QString AppController::subtitleOutlineColor() const
 {
-    const QString value = context_->settings.value(QStringLiteral("outlineColor")).toString();
+    const QString value = setting(QStringLiteral("outlineColor")).toString();
     return value.isEmpty() ? QStringLiteral("#000000") : value;
 }
 
 QString AppController::subtitleAlignment() const
 {
-    return context_->settings.value(QStringLiteral("alignment")).toString();
+    return setting(QStringLiteral("alignment")).toString();
 }
 
 int AppController::subtitleBottomMargin() const
 {
-    return context_->settings.value(QStringLiteral("bottomMargin1080p")).toInt();
+    return setting(QStringLiteral("bottomMargin1080p")).toInt();
 }
 
 QString AppController::audioBackendId() const
@@ -308,7 +318,12 @@ void AppController::setTimelineItem(QObject *item)
     }
     timelineItem_ = qobject_cast<TimelineSceneItem *>(item);
     if (timelineItem_) {
+        connect(timelineItem_, &TimelineSceneItem::selectedCueIdChanged, this, [this] {
+            const int row = document_.indexOf(timelineItem_->selectedCueId());
+            if (row >= 0 && row != selectedCue_) selectCue(row, false);
+        });
         connect(timelineItem_, &TimelineSceneItem::cueDragStarted, this, [this](const QString &id, int mode) {
+            if (busy_) return;
             selectCue(document_.indexOf(id), false);
             (void)editor_.beginDrag(id, static_cast<CueDragMode>(mode));
         });
@@ -406,6 +421,14 @@ void AppController::loadMediaPath(const QString &path)
     setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
                             [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
 
+    if (!sameFilePath(mediaPath_, path)) {
+        commands_.clear();
+        document_.setSubtitles({});
+        selectedCue_ = -1;
+        projectPath_.clear();
+        projectData_ = {};
+        emit projectChanged();
+    }
     mediaPath_ = QFileInfo(path).canonicalFilePath();
     mediaInfo_ = info;
     durationUs_ = std::max<qint64>(0, info.duration.microseconds());
@@ -440,6 +463,7 @@ void AppController::loadMediaPath(const QString &path)
     }
 
     startWaveformWorker(path);
+    setModified(true);
     rememberProjectFile(mediaPath_, hasVideo_ ? QStringLiteral("视频") : QStringLiteral("音频"), durationMs());
     emitMediaChanged();
     emit positionChanged();
@@ -451,6 +475,286 @@ void AppController::loadMediaPath(const QString &path)
     }
 }
 
+Project AppController::projectSnapshot() const
+{
+    Project project = projectData_;
+    project.mediaPath = mediaPath_;
+    if (project.tracks.isEmpty()) project.tracks.append({QStringLiteral("main"), QStringLiteral("字幕"), {}, {}});
+    for (auto &track : project.tracks) track.subtitles.clear();
+    for (const auto &cue : document_.subtitles())
+        project.tracks[std::clamp(cue.track, 0, int(project.tracks.size()) - 1)].subtitles.append(cue);
+    project.state.insert(QStringLiteral("scriptText"), scriptText_);
+    project.state.insert(QStringLiteral("assets"), QJsonArray::fromVariantList(projectFiles_));
+    QJsonArray words;
+    for (const TranscriptWord &word : alignmentWords_)
+        words.append(QJsonObject{{QStringLiteral("id"), word.id}, {QStringLiteral("text"), word.text},
+            {QStringLiteral("startMs"), word.startMs}, {QStringLiteral("endMs"), word.endMs},
+            {QStringLiteral("preciseTiming"), word.preciseTiming}});
+    project.state.insert(QStringLiteral("words"), words);
+    project.state.insert(QStringLiteral("alignmentCompleted"), alignmentCompleted_);
+    QJsonObject style;
+    for (const QString &key : {QStringLiteral("fontFamily"), QStringLiteral("fontSize1080p"),
+            QStringLiteral("fontColor"), QStringLiteral("outlineColor"), QStringLiteral("alignment"),
+            QStringLiteral("bottomMargin1080p"), QStringLiteral("outlineSize"), QStringLiteral("shadow")})
+        style.insert(key, QJsonValue::fromVariant(setting(key)));
+    project.state.insert(QStringLiteral("exportStyle"), style);
+    QJsonObject session = project.state.value(QStringLiteral("session")).toObject();
+    const QJsonObject positionState{
+        {QStringLiteral("positionUs"), positionUs_}, {QStringLiteral("selectedCue"), selectedCue_},
+        {QStringLiteral("selectedCueId"), selectedCueId_},
+        {QStringLiteral("pixelsPerMs"), pixelsPerMs()}, {QStringLiteral("scrollOffset"), scrollOffset()},
+        {QStringLiteral("snap"), snapEnabled()}, {QStringLiteral("inPointMs"), inPointMs_},
+        {QStringLiteral("outPointMs"), outPointMs_}, {QStringLiteral("playbackRate"), playbackRate_},
+        {QStringLiteral("durationUs"), durationUs_}, {QStringLiteral("fps"), fps_},
+        {QStringLiteral("hasVideo"), hasVideo_}};
+    for (auto it = positionState.begin(); it != positionState.end(); ++it) session.insert(it.key(), it.value());
+    project.state.insert(QStringLiteral("session"), session);
+    return project;
+}
+
+QByteArray AppController::projectFingerprint() const
+{
+    return ProjectSerializer::fingerprint(projectSnapshot());
+}
+
+bool AppController::saveProject(const QUrl &url)
+{
+    if (!canSave()) return false;
+    const QString path = localPath(url);
+    QString error;
+    QStringList inputs{mediaPath_};
+    for (const QVariant &asset : projectFiles_) inputs.append(asset.toMap().value(QStringLiteral("path")).toString());
+    if (!safeOutputPath(path, inputs, &error)) {
+        setStatus(error);
+        emit projectSaveFinished(false, path, error);
+        return false;
+    }
+    Project project = projectSnapshot();
+    const QByteArray fingerprint = ProjectSerializer::fingerprint(project);
+    const QPointer<AppController> self(this);
+    auto *cancel = &backgroundCancel_;
+    backgroundCancel_ = false;
+    setBusy(true);
+    backgroundTasks_.start([self, cancel, path, project = std::move(project), fingerprint]() mutable {
+        QString message;
+        bool success = !cancel->load();
+        if (success && QFileInfo::exists(project.mediaPath)) {
+            const QFileInfo media(project.mediaPath);
+            if (project.mediaFingerprint.value(QStringLiteral("size")).toInteger() != media.size()
+                || project.mediaFingerprint.value(QStringLiteral("mtime")).toInteger()
+                    != media.lastModified().toMSecsSinceEpoch()
+                || project.mediaFingerprint.value(QStringLiteral("sha256")).toString().isEmpty()) {
+                const QByteArray hash = RoughCutProjectSerializer::mediaSha256(project.mediaPath, &message, cancel);
+                success = hash.size() == 32;
+                const QString expected = project.mediaFingerprint.value(QStringLiteral("sha256")).toString();
+                if (success && !expected.isEmpty() && QString::fromLatin1(hash.toHex()) != expected) {
+                    success = false;
+                    message = QStringLiteral("源素材内容已变化，请重新定位原素材或导入新素材。");
+                }
+                if (success) project.mediaFingerprint = {
+                    {QStringLiteral("sha256"), QString::fromLatin1(hash.toHex())},
+                    {QStringLiteral("size"), media.size()},
+                    {QStringLiteral("mtime"), media.lastModified().toMSecsSinceEpoch()}};
+            }
+        }
+        if (success) success = !cancel->load() && ProjectSerializer::save(path, project, &message, cancel);
+        if (!success && message.isEmpty()) message = QStringLiteral("保存已取消。");
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, project = std::move(project),
+                fingerprint, success, message] {
+            if (!self || self->shuttingDown_) return;
+            if (success) {
+                self->projectData_.mediaFingerprint = project.mediaFingerprint;
+                self->projectPath_ = QFileInfo(path).absoluteFilePath();
+                self->savedFingerprint_ = fingerprint;
+                self->setModified(self->projectFingerprint() != fingerprint);
+                emit self->projectChanged();
+            }
+            self->setBusy(false);
+            self->setStatus(success ? QStringLiteral("字幕工程已保存：%1").arg(path) : message);
+            emit self->projectSaveFinished(success, path, self->statusText_);
+        }, Qt::QueuedConnection);
+    });
+    return true;
+}
+
+bool AppController::saveCurrentProject()
+{
+    return !projectPath_.isEmpty() && saveProject(QUrl::fromLocalFile(projectPath_));
+}
+
+void AppController::applyProject(const Project &project, const QString &path, bool available)
+{
+    stop();
+    stopAlignmentWorker();
+    stopOmniReviewWorker();
+    stopWaveformWorker();
+    ++mediaGeneration_;
+    ++scriptGeneration_;
+    playback_.close();
+    waveform_.reset();
+    if (timelineItem_) timelineItem_->setWaveform({});
+    if (previewItem_) previewItem_->clearFrame();
+    mediaPath_.clear();
+    mediaInfo_ = {};
+    hasVideo_ = false;
+    durationUs_ = 0;
+    setBusy(false);
+    if (available && !project.mediaPath.isEmpty()) loadMediaPath(project.mediaPath);
+    mediaPath_ = project.mediaPath;
+    projectData_ = project;
+    projectPath_ = path;
+    scriptText_ = project.state.value(QStringLiteral("scriptText")).toString();
+    projectFiles_ = project.state.value(QStringLiteral("assets")).toArray().toVariantList();
+    QList<Subtitle> cues;
+    for (const SubtitleTrack &track : project.tracks) cues.append(track.subtitles);
+    commands_.clear();
+    document_.setSubtitles(cues);
+    alignmentWords_.clear();
+    for (const QJsonValue &value : project.state.value(QStringLiteral("words")).toArray()) {
+        const QJsonObject word = value.toObject();
+        alignmentWords_.append({word.value(QStringLiteral("id")).toInteger(),
+            word.value(QStringLiteral("text")).toString(), word.value(QStringLiteral("startMs")).toInteger(),
+            word.value(QStringLiteral("endMs")).toInteger(), word.value(QStringLiteral("preciseTiming")).toBool()});
+    }
+    alignmentCompleted_ = project.state.value(QStringLiteral("alignmentCompleted")).toBool();
+    const QJsonObject session = project.state.value(QStringLiteral("session")).toObject();
+    if (!playback_.isOpen()) {
+        durationUs_ = session.value(QStringLiteral("durationUs")).toInteger();
+        hasVideo_ = session.value(QStringLiteral("hasVideo")).toBool();
+        fps_ = session.value(QStringLiteral("fps")).toDouble(25.0);
+        viewport_.setDuration(MediaTime::fromMicroseconds(durationUs_));
+        viewport_.setHasMedia(!mediaPath_.isEmpty());
+    }
+    selectedCue_ = std::clamp(session.value(QStringLiteral("selectedCue")).toInt(-1), -1, int(cues.size()) - 1);
+    if (session.contains(QStringLiteral("selectedCueId")))
+        selectedCue_ = document_.indexOf(session.value(QStringLiteral("selectedCueId")).toString());
+    selectedCueId_ = selectedCue_ >= 0 ? document_.subtitles().at(selectedCue_).id : QString();
+    inPointMs_ = session.value(QStringLiteral("inPointMs")).toInteger(-1);
+    outPointMs_ = session.value(QStringLiteral("outPointMs")).toInteger(-1);
+    snap_.setEnabled(session.value(QStringLiteral("snap")).toBool(true));
+    syncTimelineView(session.value(QStringLiteral("pixelsPerMs")).toDouble(0.1),
+        session.value(QStringLiteral("scrollOffset")).toDouble());
+    setPlaybackRate(session.value(QStringLiteral("playbackRate")).toDouble(1.0));
+    seekUs(std::clamp(session.value(QStringLiteral("positionUs")).toInteger(), qint64(0), durationUs_));
+    setCanExport(std::any_of(cues.cbegin(), cues.cend(), [](const Subtitle &cue) { return cue.isExportable(); }));
+    savedFingerprint_ = projectFingerprint();
+    setModified(false);
+    emit projectChanged();
+    emit projectFilesChanged();
+    emit scriptTextChanged();
+    emit selectedCueChanged();
+    emit settingsChanged();
+    emit rangeChanged();
+    emit snapEnabledChanged();
+    emit canReviewChanged();
+    emitMediaChanged();
+    syncTimelineItem();
+}
+
+void AppController::newProject()
+{
+    if (busy_ || shuttingDown_) return;
+    applyProject(Project{}, {}, false);
+    setStatus(QStringLiteral("新建字幕工程。"));
+}
+
+void AppController::openProject(const QUrl &url)
+{
+    if (busy_ || shuttingDown_) return;
+    const QString path = localPath(url);
+    const QPointer<AppController> self(this);
+    auto *cancel = &backgroundCancel_;
+    backgroundCancel_ = false;
+    setBusy(true);
+    backgroundTasks_.start([self, cancel, path] {
+        QString message;
+        auto project = ProjectSerializer::load(path, &message);
+        bool available = false;
+        if (project && !project->mediaPath.isEmpty() && QFileInfo::exists(project->mediaPath)) {
+            const QByteArray hash = RoughCutProjectSerializer::mediaSha256(project->mediaPath, &message, cancel);
+            const QString expected = project->mediaFingerprint.value(QStringLiteral("sha256")).toString();
+            available = hash.size() == 32 && (expected.isEmpty() || QString::fromLatin1(hash.toHex()) == expected);
+            if (available) {
+                project->mediaFingerprint.insert(QStringLiteral("sha256"), QString::fromLatin1(hash.toHex()));
+                const QFileInfo media(project->mediaPath);
+                project->mediaFingerprint.insert(QStringLiteral("size"), media.size());
+                project->mediaFingerprint.insert(QStringLiteral("mtime"), media.lastModified().toMSecsSinceEpoch());
+            }
+        }
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, project = std::move(project), available, message] {
+            if (!self || self->shuttingDown_) return;
+            if (!project) {
+                self->setBusy(false);
+                self->setStatus(message);
+                emit self->projectOpenFinished(false, path, message);
+                return;
+            }
+            if (self->backgroundCancel_.load()) {
+                self->setBusy(false);
+                emit self->projectOpenFinished(false, path, QStringLiteral("工程打开已取消。"));
+                return;
+            }
+            self->applyProject(*project, QFileInfo(path).absoluteFilePath(), available);
+            self->setStatus(!project->mediaPath.isEmpty() && !self->hasMedia()
+                ? QStringLiteral("工程已打开，素材离线，请重新定位。")
+                : QStringLiteral("字幕工程已打开：%1").arg(path));
+            emit self->projectOpenFinished(true, path, self->statusText_);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void AppController::relinkMedia(const QUrl &url)
+{
+    if (busy_ || shuttingDown_ || projectData_.mediaFingerprint.value(QStringLiteral("sha256")).toString().isEmpty()) {
+        setStatus(QStringLiteral("工程没有可验证的素材身份，请导入新素材。"));
+        return;
+    }
+    const QString path = localPath(url);
+    const Project project = projectSnapshot();
+    const QString projectPath = projectPath_;
+    const QPointer<AppController> self(this);
+    auto *cancel = &backgroundCancel_;
+    backgroundCancel_ = false;
+    setBusy(true);
+    backgroundTasks_.start([self, cancel, path, project, projectPath]() mutable {
+        QString message;
+        const QByteArray hash = RoughCutProjectSerializer::mediaSha256(path, &message, cancel);
+        const bool same = hash.size() == 32 && QString::fromLatin1(hash.toHex())
+            == project.mediaFingerprint.value(QStringLiteral("sha256")).toString();
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, project = Project(project), projectPath, same, message]() mutable {
+            if (!self || self->shuttingDown_) return;
+            self->setBusy(false);
+            if (!same) {
+                self->setStatus(message.isEmpty() ? QStringLiteral("素材内容不同，不能作为重定位使用。") : message);
+                return;
+            }
+            const QByteArray saved = self->savedFingerprint_;
+            project.mediaPath = QFileInfo(path).absoluteFilePath();
+            self->applyProject(project, projectPath, true);
+            self->savedFingerprint_ = saved;
+            self->setModified(true);
+            self->setStatus(QStringLiteral("素材已重新定位，请保存工程。"));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void AppController::importTimedSubtitles(const QUrl &url)
+{
+    if (busy_) return;
+    QString message;
+    const QString text = readTextFile(localPath(url), &message);
+    const auto cues = message.isEmpty() ? SrtParser::parseTimed(text, &message) : std::nullopt;
+    if (!cues) { setStatus(message); return; }
+    commands_.clear();
+    document_.setSubtitles(*cues);
+    if (!cues->isEmpty()) selectCue(0, false);
+    setCanExport(!cues->isEmpty());
+    setModified(true);
+    setStatus(QStringLiteral("已按时间码导入字幕。"));
+}
 void AppController::importScript(const QUrl &url)
 {
     importScriptPath(localPath(url));
@@ -460,16 +764,29 @@ void AppController::importScriptPath(const QString &path)
 {
     const QString suffix = QFileInfo(path).suffix().toLower();
     QStringList lines;
+    if (busy_) return;
     if (suffix == QLatin1String("docx")) {
-        const ScriptDocumentResult result = ScriptDocumentImporter::loadDocx(path);
-        if (std::holds_alternative<AppError>(result)) {
-            setStatus(QStringLiteral("文稿导入失败：%1").arg(std::get<AppError>(result).userMessage()));
-            return;
-        }
-        for (const ScriptLine &line : std::get<ScriptDocument>(result).lines) {
-            lines.append(line.text);
-        }
-        lines = TxtImporter::parse(lines.join(QLatin1Char('\n')));
+        backgroundCancel_ = false;
+        setBusy(true);
+        setStatus(QStringLiteral("正在导入 DOCX 文稿…"));
+        const QPointer<AppController> self(this);
+        auto *cancel = &backgroundCancel_;
+        backgroundTasks_.start([self, cancel, path] {
+            const auto result = ScriptDocumentImporter::loadDocx(path, {}, cancel);
+            if (!self) return;
+            QMetaObject::invokeMethod(self.data(), [self, path, result, cancelled = cancel->load()] {
+                if (!self || self->shuttingDown_) return;
+                self->setBusy(false);
+                if (cancelled) { self->setStatus(QStringLiteral("文稿导入已取消。")); return; }
+                if (std::holds_alternative<AppError>(result)) { self->setStatus(std::get<AppError>(result).userMessage()); return; }
+                QStringList lines;
+                for (const auto &line : std::get<ScriptDocument>(result).lines) lines.append(line.text);
+                self->setScriptText(TxtImporter::parse(lines.join(QLatin1Char('\n'))).join(QLatin1Char('\n')));
+                self->rememberProjectFile(path, QStringLiteral("文稿"));
+                self->setStatus(QStringLiteral("已导入文稿：%1").arg(QFileInfo(path).fileName()));
+            }, Qt::QueuedConnection);
+        });
+        return;
     } else {
         QString error;
         const QString content = readTextFile(path, &error);
@@ -563,6 +880,7 @@ void AppController::rememberProjectFile(const QString &path, const QString &type
         {QStringLiteral("name"), QFileInfo(path).fileName()},
         {QStringLiteral("type"), type},
         {QStringLiteral("durationMs"), durationMs}});
+    setModified(true);
     emit projectFilesChanged();
 }
 
@@ -578,6 +896,7 @@ void AppController::removeProjectFile(int row)
 {
     if (row < 0 || row >= projectFiles_.size()) return;
     projectFiles_.removeAt(row);
+    setModified(true);
     emit projectFilesChanged();
     setStatus(QStringLiteral("已从项目素材中移除引用，磁盘文件保留。"));
 }
@@ -759,12 +1078,6 @@ void AppController::startAlignmentRun(bool review)
     if (busy_) {
         return;
     }
-    if (!review && alignmentCompleted_) {
-        alignmentCompleted_ = false;
-        emit canReviewChanged();
-        emit canOmniReviewChanged();
-    }
-    invalidateAlignmentEvidence();
     const QStringList lines = TxtImporter::parse(QString(scriptText_).replace(QStringLiteral("\\n"), QStringLiteral("\n")));
     if (mediaPath_.isEmpty() || lines.isEmpty()) {
         QVariantList values;
@@ -894,6 +1207,7 @@ void AppController::cancelAlignment()
     }
     alignmentCancel_ = true;
     omniReviewCancel_ = true;
+    backgroundCancel_ = true;
     alignmentProgressText_ = QStringLiteral("正在取消…");
     emit alignmentProgressChanged();
     setStatus(alignmentProgressText_);
@@ -901,6 +1215,13 @@ void AppController::cancelAlignment()
 
 void AppController::exportSubtitles(const QString &outputDirectory)
 {
+    if (busy_ || overlapCount() > 0) {
+        setStatus(busy_ ? QStringLiteral("任务运行中，请先完成或取消任务。")
+            : QStringLiteral("有 %1 处字幕重叠，涉及 %2 条字幕。请定位并处理后导出。")
+                .arg(overlapCount()).arg(overlappingCueCount()));
+        emit exportFinished(false, statusText_, {});
+        return;
+    }
     AlignmentResult current;
     current.subtitles.reserve(document_.count());
     for (const Subtitle &subtitle : document_.subtitles()) {
@@ -913,6 +1234,8 @@ void AppController::exportSubtitles(const QString &outputDirectory)
     }
 
     QJsonObject settings = context_->settings;
+    const QJsonObject style = projectData_.state.value(QStringLiteral("exportStyle")).toObject();
+    for (auto it = style.begin(); it != style.end(); ++it) settings.insert(it.key(), it.value());
     if (!outputDirectory.trimmed().isEmpty()) {
         settings.insert(QStringLiteral("outputDirectory"), outputDirectory.trimmed());
     }
@@ -1019,6 +1342,7 @@ void AppController::seekUs(qint64 positionUs)
     if (playback_.isOpen()) {
         playback_.seek(MediaTime::fromMicroseconds(positionUs_));
         playback_.pump();
+        if (ownsSharedAudio_ && !tickTimer_.isActive()) tickTimer_.start();
     }
     emit positionChanged();
     updateCurrentSubtitle();
@@ -1044,6 +1368,7 @@ void AppController::selectCue(int row, bool seekToCue)
         return;
     }
     selectedCue_ = row;
+    selectedCueId_ = document_.subtitles().at(row).id;
     emit selectedCueChanged();
     const Subtitle &subtitle = document_.subtitles().at(row);
     if (seekToCue && subtitle.isTimed()) {
@@ -1069,15 +1394,94 @@ void AppController::navigateCue(int delta)
     selectCue(row);
 }
 
+void AppController::navigatePendingCue(int delta)
+{
+    const int row = findCueRow(delta, [this](const Subtitle &cue) { return cueNeedsConfirm(cue); });
+    if (row < 0) {
+        setStatus(QStringLiteral("没有待确认的字幕。"));
+        return;
+    }
+    selectCue(row);
+}
+
+void AppController::navigateMismatchCue(int delta)
+{
+    const int row = findCueRow(delta, [this](const Subtitle &cue) { return cueMismatchesAudio(cue); });
+    if (row < 0) {
+        setStatus(QStringLiteral("没有音频与字幕对不上的字幕块。"));
+        return;
+    }
+    selectCue(row);
+}
+
+void AppController::seekToCurrentStart()
+{
+    const int row = activeRow();
+    if (row < 0) {
+        return;
+    }
+    const Subtitle &cue = document_.subtitles().at(row);
+    if (cue.isTimed()) {
+        seekUs(cue.start.microseconds());
+    }
+}
+
+void AppController::seekToCurrentEnd()
+{
+    const int row = activeRow();
+    if (row < 0) {
+        return;
+    }
+    const Subtitle &cue = document_.subtitles().at(row);
+    if (cue.isTimed()) {
+        seekUs(cue.end.microseconds());
+    }
+}
+
+void AppController::seekToTimelineStart()
+{
+    seekUs(0);
+}
+
+void AppController::seekToTimelineEnd()
+{
+    seekUs(durationUs_ > 0 ? durationUs_ : TimelineViewport::kEmptyTimelineMs * 1000);
+}
+
+void AppController::nudgeCurrentStart(int frames)
+{
+    const int row = activeRow();
+    if (row < 0 || frames == 0) {
+        return;
+    }
+    const Subtitle &cue = document_.subtitles().at(row);
+    if (!cue.isTimed()) {
+        return;
+    }
+    const qint64 startUs = std::clamp(cue.start.microseconds() + static_cast<qint64>(std::llround(frames * 1000000.0 / std::max(1.0, fps_))), qint64{0}, cue.end.microseconds() - 250000);
+    (void)applyCueEdit(cue.id, cue.text, startUs, cue.end.microseconds());
+}
+
+void AppController::nudgeCurrentEnd(int frames)
+{
+    const int row = activeRow();
+    if (row < 0 || frames == 0) {
+        return;
+    }
+    const Subtitle &cue = document_.subtitles().at(row);
+    if (!cue.isTimed()) {
+        return;
+    }
+    const qint64 endUs = std::clamp(cue.end.microseconds() + static_cast<qint64>(std::llround(frames * 1000000.0 / std::max(1.0, fps_))), cue.start.microseconds() + 250000, durationUs_);
+    (void)applyCueEdit(cue.id, cue.text, cue.start.microseconds(), endUs);
+}
+
 void AppController::setCueText(int row, const QString &text)
 {
     if (row < 0 || row >= document_.count()) {
         return;
     }
-    const Subtitle &current = document_.subtitles().at(row);
-    commands_.editText(current.id, QString(text).replace(QLatin1Char('\n'), QLatin1Char(' '))
-        .replace(QLatin1Char('\r'), QLatin1Char(' ')).trimmed());
-    updateCurrentSubtitle();
+    (void)applyCueEdit(document_.subtitles().at(row).id, text, -1, -1);
 }
 
 void AppController::locateCue(int row)
@@ -1090,10 +1494,9 @@ void AppController::locateCueAt(const QString &id, qint64 startMs)
 {
     const int row = document_.indexOf(id);
     if (busy_ || row < 0 || document_.subtitles().at(row).isTimed()) return;
-    const auto bounds = editor_.neighborBounds(id);
-    const qint64 endMs = std::min({startMs + 2'000, bounds.nextStart.milliseconds(), timelineDurationMs()});
-    if (startMs < bounds.previousEnd.milliseconds() || endMs - startMs < 250) {
-        setStatus(QStringLiteral("此处没有至少 250ms 的可用空间，请放到相邻字幕之间。"));
+    const qint64 endMs = std::min(startMs + 2'000, timelineDurationMs());
+    if (startMs < 0 || endMs - startMs < 250) {
+        setStatus(QStringLiteral("此处超出素材范围，或不足 250ms。"));
         return;
     }
     if (setTimingMs(row, startMs, endMs)) {
@@ -1104,23 +1507,43 @@ void AppController::locateCueAt(const QString &id, qint64 startMs)
 
 void AppController::confirmCue(int row)
 {
+    if (busy_) return;
     if (row < 0 || row >= document_.count()) return;
     const Subtitle cue = document_.subtitles().at(row);
     if (cue.isTimed()) (void)commands_.setTiming(cue.id, cue.start, cue.end);
 }
 
+void AppController::confirmCurrentCue()
+{
+    const int row = activeRow();
+    if (row >= 0 && row < document_.count() && document_.subtitles().at(row).isTimed()) {
+        confirmCue(row);
+    }
+    navigatePendingCue(1);
+}
+
+void AppController::clearModified()
+{
+    setModified(false);
+}
+
+void AppController::deleteCue()
+{
+    if (busy_) return;
+    if (selectedCue_ >= 0 && selectedCue_ < document_.count())
+        commands_.remove(document_.subtitles().at(selectedCue_).id);
+}
+
 void AppController::createNextScriptCue()
 {
+    if (busy_) return;
     for (int row = 0; row < document_.count(); ++row) {
-        const Subtitle subtitle = document_.subtitles().at(row);
-        if (subtitle.isTimed()) {
-            continue;
-        }
-        const std::pair<qint64, qint64> range = defaultNewRange(row);
-        if (setTimingMs(row, range.first, range.second)) {
-            selectCue(row, false);
-            emit editCueRequested(row, subtitle.text);
-        }
+        const Subtitle cue = document_.subtitles().at(row);
+        if (cue.isTimed()) continue;
+        const auto range = defaultNewRange(row);
+        selectCue(row, false);
+        emit cueDraftRequested(cue.id, cue.text, range.first * 1000, range.second * 1000);
+        emit editCueRequested(row, cue.text);
         return;
     }
     setStatus(QStringLiteral("没有尚未打轴的文稿。"));
@@ -1128,38 +1551,100 @@ void AppController::createNextScriptCue()
 
 void AppController::createOrEditCue()
 {
+    if (busy_) return;
     const int row = activeRow();
     if (row >= 0 && row < document_.count()) {
-        selectedCue_ = row;
-        emit selectedCueChanged();
-        emit editCueRequested(row, document_.subtitles().at(row).text);
+        selectCue(row, false);
+        const Subtitle &cue = document_.subtitles().at(row);
+        emit cueDraftRequested(cue.id, cue.text,
+            cue.isTimed() ? cue.start.microseconds() : -1,
+            cue.isTimed() ? cue.end.microseconds() : -1);
+        emit editCueRequested(row, cue.text);
         return;
     }
-    if (durationUs_ <= 0) {
-        return;
+    const auto range = defaultNewRange(document_.count());
+    emit cueDraftRequested({}, {}, durationUs_ > 0 ? range.first * 1000 : -1,
+        durationUs_ > 0 ? range.second * 1000 : -1);
+    emit editCueRequested(-1, {});
+}
+
+bool AppController::applyCueEdit(const QString &id, const QString &text, qint64 startUs, qint64 endUs)
+{
+    if (busy_ || shuttingDown_) { setStatus(QStringLiteral("任务运行中，不能应用字幕修改。")); return false; }
+    const auto original = document_.subtitle(id);
+    if (!id.isEmpty() && !original) { setStatus(QStringLiteral("字幕已不存在，请重新选择。")); return false; }
+    const QString normalized = QString(text).replace(QStringLiteral("\r\n"), QStringLiteral("\n"))
+        .replace(QLatin1Char('\r'), QLatin1Char('\n')).trimmed();
+    if (normalized.isEmpty()) { setStatus(QStringLiteral("字幕文字不能为空。")); return false; }
+    const bool timing = startUs != -1 || endUs != -1;
+    const bool changedTiming = timing && (!original || !original->isTimed()
+        || original->start.microseconds() != startUs || original->end.microseconds() != endUs);
+    if (timing && (startUs < 0 || endUs <= startUs ||
+        (changedTiming && endUs - startUs < TimelineEditor::kMinCueUs) ||
+        (changedTiming && (durationUs_ <= 0 || endUs > durationUs_)))) {
+        setStatus(QStringLiteral("起止时间无效：开始不得小于零，时长至少 250ms，并须位于素材范围内。"));
+        return false;
     }
-    const std::pair<qint64, qint64> range = defaultNewRange(document_.count());
-    Subtitle subtitle;
-    subtitle.start = MediaTime::fromMilliseconds(range.first);
-    subtitle.end = MediaTime::fromMilliseconds(range.second);
-    subtitle.source = QStringLiteral("manual");
-    subtitle.status = QStringLiteral("MANUAL");
-    if (subtitle.end.microseconds() - subtitle.start.microseconds() < TimelineEditor::kMinCueUs) {
-        setStatus(QStringLiteral("当前位置没有足够空间创建字幕。"));
-        return;
+    if (original && original->text == normalized && !changedTiming) return true;
+    Subtitle updated = original.value_or(Subtitle{});
+    updated.text = normalized;
+    if (timing) {
+        updated.start = MediaTime::fromMicroseconds(startUs);
+        updated.end = MediaTime::fromMicroseconds(endUs);
     }
-    const int index = document_.count();
-    if (!commands_.create(index, subtitle)) {
-        return;
+    if (updated.isTimed() || timing) {
+        updated.status = QStringLiteral("MANUAL");
+        updated.source = QStringLiteral("manual");
+        updated.metadata.insert(QStringLiteral("manualConfirmed"), true);
     }
-    selectedCue_ = index;
+    stampMultilineFlag(&updated);
+    const bool applied = original ? commands_.replaceMany({updated}, QStringLiteral("修改字幕"))
+        : commands_.create(document_.count(), updated);
+    if (applied) {
+        selectCue(document_.indexOf(updated.id), false);
+        setStatus(cueOverlaps(updated.id) ? QStringLiteral("已应用；当前字幕与其他字幕重叠，导出前需处理。")
+            : QStringLiteral("字幕修改已应用。"));
+    }
+    return applied;
+}
+
+void AppController::navigateOverlap(int delta)
+{
+    const auto &ranges = subtitleIndex_.overlapRanges();
+    if (ranges.isEmpty()) return;
+    qint64 target = delta > 0 ? ranges.first().first : ranges.last().first;
+    if (delta > 0) {
+        for (const auto &range : ranges) if (range.first > positionUs_) { target = range.first; break; }
+    } else {
+        for (auto it = ranges.crbegin(); it != ranges.crend(); ++it)
+            if (it->first < positionUs_) { target = it->first; break; }
+    }
+    stop();
+    seekUs(target);
+    const auto active = subtitleIndex_.activeDocumentIndices(target);
+    if (!active.isEmpty()) selectCue(active.first(), false);
+    if (timelineItem_) timelineItem_->ensureTimeVisible(target);
+}
+
+void AppController::onDocumentChanged()
+{
+    subtitleIndex_.rebuild(document_.subtitles());
+    filteredModel_.setOverlappingIds(subtitleIndex_.overlappingIds());
+    selectedCue_ = document_.indexOf(selectedCueId_);
+    if (selectedCue_ < 0) selectedCueId_.clear();
     emit selectedCueChanged();
-    emit editCueRequested(index, subtitle.text);
-    setCanExport(true);
+    emit overlapChanged();
+    emit canExportChanged();
+    setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
+        [](const Subtitle &cue) { return cue.isExportable(); }));
+    syncTimelineItem();
+    updateCurrentSubtitle();
+    setModified(true);
 }
 
 void AppController::splitCurrentCue()
 {
+    if (busy_) return;
     const int row = activeRow();
     if (row < 0) {
         setStatus(QStringLiteral("播放头必须位于字幕内部，且两侧至少保留 250ms。"));
@@ -1176,6 +1661,7 @@ void AppController::splitCurrentCue()
 
 void AppController::joinAroundPlayhead()
 {
+    if (busy_) return;
     viewport_.setPlayhead(MediaTime::fromMicroseconds(positionUs_));
     if (!editor_.joinAroundPlayhead()) {
         setStatus(QStringLiteral("播放头两侧没有可衔接的字幕，或调整后短于 250ms。"));
@@ -1187,44 +1673,48 @@ void AppController::joinAroundPlayhead()
 
 void AppController::setCurrentStart()
 {
+    if (busy_) return;
     const int row = activeRow();
     if (row < 0) {
         return;
     }
     const Subtitle &subtitle = document_.subtitles().at(row);
-    (void)setTimingMs(row, positionMs(), subtitle.end.milliseconds());
+    (void)applyCueEdit(subtitle.id, subtitle.text, positionUs_, subtitle.end.microseconds());
 }
 
 void AppController::setCurrentEnd()
 {
+    if (busy_) return;
     const int row = activeRow();
     if (row < 0) {
         return;
     }
     const Subtitle &subtitle = document_.subtitles().at(row);
-    (void)setTimingMs(row, subtitle.start.milliseconds(), positionMs());
+    (void)applyCueEdit(subtitle.id, subtitle.text, subtitle.start.microseconds(), positionUs_);
 }
 
 void AppController::setFollowingStart()
 {
+    if (busy_) return;
     const auto [before, after] = rowsAroundPlayhead();
     Q_UNUSED(before);
     if (after < 0) {
         return;
     }
     const Subtitle &subtitle = document_.subtitles().at(after);
-    (void)setTimingMs(after, positionMs(), subtitle.end.milliseconds());
+    (void)applyCueEdit(subtitle.id, subtitle.text, positionUs_, subtitle.end.microseconds());
 }
 
 void AppController::setPreviousEnd()
 {
+    if (busy_) return;
     const auto [before, after] = rowsAroundPlayhead();
     Q_UNUSED(after);
     if (before < 0) {
         return;
     }
     const Subtitle &subtitle = document_.subtitles().at(before);
-    (void)setTimingMs(before, subtitle.start.milliseconds(), positionMs());
+    (void)applyCueEdit(subtitle.id, subtitle.text, subtitle.start.microseconds(), positionUs_);
 }
 
 void AppController::toggleSnap()
@@ -1309,7 +1799,8 @@ QString AppController::formatTime(qint64 ms) const
 
 QVariant AppController::setting(const QString &key) const
 {
-    return context_->settings.value(key);
+    const QJsonObject style = projectData_.state.value(QStringLiteral("exportStyle")).toObject();
+    return style.contains(key) ? style.value(key).toVariant() : context_->settings.value(key).toVariant();
 }
 
 QVariantList AppController::asrProviders() const
@@ -1492,8 +1983,14 @@ bool AppController::saveSettings(
     context_->settings.insert(QStringLiteral("legacyAiCredentialIds"), QJsonArray{});
     (void)context_->settingsManager.save(context_->settings);
     context_->settings = context_->settingsManager.load();
+    QJsonObject style = projectData_.state.value(QStringLiteral("exportStyle")).toObject();
+    for (auto it = values.cbegin(); it != values.cend(); ++it)
+        if (style.contains(it.key())) style.insert(it.key(), QJsonValue::fromVariant(it.value()));
+    projectData_.state.insert(QStringLiteral("exportStyle"), style);
+    setModified(true);
     emit settingsChanged();
     emit canOmniReviewChanged();
+    refreshMultilineFlags();
     setStatus(QStringLiteral("设置已保存。"));
     return true;
 }
@@ -1688,15 +2185,22 @@ void AppController::claimPlayback()
     device->setPlaybackRate(playbackRate_);
     playback_.setAudioDevice(device, kAudioPreRollMs);
     device->pause();
+    if (!tickTimer_.isActive()) tickTimer_.start();
 }
 
 void AppController::applySubtitles(const QList<Subtitle> &subtitles)
 {
-    document_.setSubtitles(subtitles);
-    selectedCue_ = subtitles.isEmpty() ? -1 : 0;
+    QList<Subtitle> stamped = subtitles;
+    for (Subtitle &subtitle : stamped) {
+        stampMultilineFlag(&subtitle);
+    }
+    document_.setSubtitles(stamped);
+    selectedCue_ = stamped.isEmpty() ? -1 : 0;
+    selectedCueId_ = stamped.isEmpty() ? QString() : stamped.first().id;
     emit selectedCueChanged();
-    setCanExport(std::any_of(subtitles.cbegin(), subtitles.cend(),
+    setCanExport(std::any_of(stamped.cbegin(), stamped.cend(),
                              [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
+    setModified(true);
     updateCurrentSubtitle();
     syncTimelineItem();
 }
@@ -1727,6 +2231,112 @@ void AppController::setCanExport(bool value)
     }
     canExport_ = value;
     emit canExportChanged();
+}
+
+void AppController::setModified(bool value)
+{
+    if (value) value = projectFingerprint() != savedFingerprint_;
+    if (value == modified_) {
+        return;
+    }
+    modified_ = value;
+    emit modifiedChanged();
+}
+
+void AppController::stampMultilineFlag(Subtitle *subtitle) const
+{
+    if (!subtitle) {
+        return;
+    }
+    subtitle->metadata.insert(QStringLiteral("multilinePreview"),
+        textWrapsToMultipleLines(subtitle->text));
+}
+
+void AppController::refreshMultilineFlags()
+{
+    if (refreshingMultiline_ || document_.count() <= 0) {
+        return;
+    }
+    refreshingMultiline_ = true;
+    for (int index = 0; index < document_.count(); ++index) {
+        Subtitle cue = document_.subtitles().at(index);
+        const bool flag = textWrapsToMultipleLines(cue.text);
+        if (cue.metadata.contains(QStringLiteral("multilinePreview"))
+            && cue.metadata.value(QStringLiteral("multilinePreview")).toBool() == flag) {
+            continue;
+        }
+        cue.metadata.insert(QStringLiteral("multilinePreview"), flag);
+        document_.replaceSubtitle(cue.id, cue);
+    }
+    refreshingMultiline_ = false;
+}
+
+bool AppController::textWrapsToMultipleLines(const QString &text) const
+{
+    if (text.contains(QLatin1Char('\n')) || text.contains(QLatin1Char('\r'))
+        || text.contains(QStringLiteral("\\n"))) {
+        return true;
+    }
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) {
+        return false;
+    }
+    const int pixelSize = std::max(10, subtitleFontSize());
+    const int wrapWidth = 1860;
+    const int charsPerLine = std::max(8, wrapWidth / pixelSize);
+    if (trimmed.size() > charsPerLine) {
+        return true;
+    }
+    QFont font(subtitleFontFamily());
+    font.setPixelSize(pixelSize);
+    font.setBold(true);
+    const QFontMetrics metrics(font);
+    if (metrics.horizontalAdvance(QStringLiteral("测")) <= 0) {
+        return false;
+    }
+    const QRect bounds = metrics.boundingRect(QRect(0, 0, wrapWidth, 100000),
+        Qt::TextWordWrap | Qt::AlignHCenter, trimmed);
+    return bounds.height() >= metrics.lineSpacing() * 2;
+}
+
+bool AppController::cueNeedsConfirm(const Subtitle &cue) const
+{
+    return !cue.isTimed()
+        || cue.status == QLatin1String("LOW_CONFIDENCE")
+        || cue.status == QLatin1String("REVIEW");
+}
+
+bool AppController::cueMismatchesAudio(const Subtitle &cue) const
+{
+    if (!cue.isTimed()) {
+        return false;
+    }
+    if (cue.status == QLatin1String("LOW_CONFIDENCE")
+        || cue.status == QLatin1String("REVIEW")) {
+        return true;
+    }
+    if (cue.metadata.contains(QStringLiteral("audioEvidence"))
+        && !cue.metadata.value(QStringLiteral("audioEvidence")).toBool()) {
+        return true;
+    }
+    const QString omni = cue.metadata.value(QStringLiteral("omniReviewStatus")).toString();
+    return omni == QLatin1String("review") || omni == QLatin1String("suggested");
+}
+
+int AppController::findCueRow(int delta, const std::function<bool(const Subtitle &)> &predicate) const
+{
+    if (document_.count() <= 0 || delta == 0) {
+        return -1;
+    }
+    const int count = document_.count();
+    const int start = selectedCue_ < 0 ? (delta > 0 ? -1 : count) : selectedCue_;
+    for (int step = 1; step <= count; ++step) {
+        const int row = (start + delta * step + count * (step + 1)) % count;
+        if (predicate(document_.subtitles().at(row))) {
+            return row;
+        }
+    }
+    return -1;
 }
 
 void AppController::onTick()
@@ -1790,11 +2400,17 @@ void AppController::updatePositionFromClock()
 
 void AppController::updateCurrentSubtitle()
 {
-    QString text;
-    const int index = subtitleIndex_.lookup(positionMs(), direction_);
-    if (index >= 0 && index < document_.count()) text = document_.subtitles().at(index).text;
-    if (text != currentSubtitle_) {
+    QStringList texts;
+    QVariantList items;
+    for (int index : subtitleIndex_.activeDocumentIndices(positionUs_)) {
+        const Subtitle &cue = document_.subtitles().at(index);
+        texts.append(cue.text);
+        items.append(QVariantMap{{QStringLiteral("id"), cue.id}, {QStringLiteral("text"), cue.text}});
+    }
+    const QString text = texts.join(QLatin1Char('\n'));
+    if (text != currentSubtitle_ || items != currentSubtitleItems_) {
         currentSubtitle_ = text;
+        currentSubtitleItems_ = items;
         emit currentSubtitleChanged();
     }
 }
@@ -2004,6 +2620,8 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
     lastOutputPaths_ = output.outputPaths;
     mediaInfo_ = output.mediaInfo;
     alignmentWords_ = output.words;
+    projectData_.state.insert(QStringLiteral("analysisScriptText"), scriptText_);
+    projectData_.state.insert(QStringLiteral("analysisSettings"), context_->settings);
     ++alignmentEvidenceGeneration_;
     setBusy(false);
     setCanExport(!output.result.exportableSubtitles().isEmpty());
@@ -2017,6 +2635,7 @@ void AppController::finishAlignment(quint64 generation, AlignmentRunResult resul
                   .arg(output.result.exportableSubtitles().size())
                   .arg(output.result.lowCount())
                   .arg(output.result.skippedCount()));
+    setModified(true);
     reviewRun_ = false;
     if (!completedReview && context_->settings.value(QStringLiteral("autoReviewEnabled")).toBool()) {
         QMetaObject::invokeMethod(this, &AppController::startReview, Qt::QueuedConnection);
@@ -2094,9 +2713,9 @@ bool AppController::setTimingMs(int row, qint64 startMs, qint64 endMs)
         return false;
     }
     const Subtitle &subtitle = document_.subtitles().at(row);
-    if (!editor_.setTiming(subtitle.id, MediaTime::fromMilliseconds(startMs),
+    if (busy_ || !editor_.setTiming(subtitle.id, MediaTime::fromMilliseconds(startMs),
                            MediaTime::fromMilliseconds(endMs))) {
-        setStatus(QStringLiteral("字幕时长不能短于 250ms。"));
+        setStatus(QStringLiteral("字幕起止时间超出素材范围，或时长短于 250ms。"));
         return false;
     }
     setCanExport(true);
@@ -2111,15 +2730,8 @@ std::pair<qint64, qint64> AppController::defaultNewRange(int row) const
         return {inPointMs_, outPointMs_};
     }
     const qint64 position = positionMs();
-    qint64 following = durationMs();
-    for (int index = row; index < document_.count(); ++index) {
-        const Subtitle &subtitle = document_.subtitles().at(index);
-        if (subtitle.isTimed() && subtitle.start.milliseconds() > position) {
-            following = subtitle.start.milliseconds();
-            break;
-        }
-    }
-    return {position, std::min({durationMs(), position + 2'000, following})};
+    Q_UNUSED(row);
+    return {position, std::min(durationMs(), position + 2'000)};
 }
 
 std::pair<int, int> AppController::rowsAroundPlayhead() const

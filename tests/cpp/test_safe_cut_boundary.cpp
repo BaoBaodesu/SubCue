@@ -62,8 +62,12 @@ void SafeCutBoundaryTests::timelineAddsRecoverableHandle()
     };
     const auto clips = SafeCutBoundary::buildTimeline(recording, decisions, 16'000, 64'000, settings);
     QCOMPARE(clips.size(), 2);
-    QVERIFY(clips.at(0).sourceEndSample > recording.at(0).endSample
-            || clips.at(0).sourceStartSample <= recording.at(0).startSample);
+    QCOMPARE(clips.at(0).decision, RoughCutDecision::Keep);
+    QCOMPARE(clips.at(1).decision, RoughCutDecision::Keep);
+    QVERIFY(clips.at(0).sourceEndSample <= recording.at(1).startSample);
+    QVERIFY(clips.at(1).sourceStartSample >= recording.at(1).endSample);
+    QVERIFY(clips.at(1).timelineStartSample >= clips.at(0).timelineStartSample
+        + clips.at(0).sourceEndSample - clips.at(0).sourceStartSample);
 }
 
 QTEST_MAIN(SafeCutBoundaryTests)

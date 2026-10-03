@@ -14,6 +14,7 @@ ScrollBar {
         implicitWidth: Theme.scrollBarSize
         implicitHeight: Theme.scrollBarSize
         radius: 5
+        opacity: 1
         visible: control.size < 1.0 && control.policy !== ScrollBar.AlwaysOff
         color: Theme.scrollBarTrack
     }
@@ -22,6 +23,7 @@ ScrollBar {
         implicitWidth: Theme.scrollThumbSize
         implicitHeight: Theme.scrollThumbSize
         radius: 4
+        opacity: 1
         visible: control.size < 1.0 && control.policy !== ScrollBar.AlwaysOff
         color: control.pressed ? Theme.scrollThumbPressed
              : control.hovered ? Theme.scrollThumbHover

@@ -16,11 +16,13 @@ struct SubtitleTrack final {
 };
 
 struct Project final {
-    int schemaVersion = 1;
+    static constexpr int CurrentSchemaVersion = 2;
+    int schemaVersion = CurrentSchemaVersion;
     QString mediaPath;
     QJsonObject mediaFingerprint;
     QList<SubtitleTrack> tracks;
     QJsonObject metadata;
+    QJsonObject state;
 };
 
 } // namespace subcue

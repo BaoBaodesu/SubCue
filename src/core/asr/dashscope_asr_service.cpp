@@ -330,21 +330,26 @@ AsrResult DashScopeAsrService::transcribe(const AsrRequest &request)
     }
     const MediaInfo &info = std::get<MediaInfo>(probed);
     const QVector<AudioChunkWindow> windows = AudioChunkPlanner::plan(info.duration.seconds());
-    QVector<PreparedAudioChunk> chunks;
-    chunks.reserve(windows.size());
-    for (const AudioChunkWindow &window : windows) {
-        if (asrCancelled(request.cancel)) {
-            return asrCancelledError();
+    QVector<TranscriptWord> merged;
+    for (int index = 0; index < windows.size(); ++index) {
+        if (asrCancelled(request.cancel)) return asrCancelledError();
+        auto extracted = AudioChunkExtractor::extract(request.mediaPath, windows.at(index), request.cancel, true);
+        if (std::holds_alternative<AppError>(extracted)) return std::get<AppError>(extracted);
+        PreparedAudioChunk chunk = std::get<PreparedAudioChunk>(std::move(extracted));
+        chunk.pcm16kMono.clear();
+        const AsrResult local = transcribeFlac(chunk.flac, request.cancel);
+        if (std::holds_alternative<AppError>(local)) return local;
+        for (TranscriptWord word : std::get<Transcript>(local).words) {
+            word.startMs += windows.at(index).startMs;
+            word.endMs += windows.at(index).startMs;
+            if (!isOverlapDuplicate(word, merged)) merged.append(std::move(word));
         }
-        MediaResult<PreparedAudioChunk> extracted =
-            AudioChunkExtractor::extract(request.mediaPath, window, request.cancel, true);
-        if (std::holds_alternative<AppError>(extracted)) {
-            return std::get<AppError>(extracted);
-        }
-        chunks.push_back(std::get<PreparedAudioChunk>(std::move(extracted)));
+        if (request.progress) request.progress(index + 1, windows.size());
     }
-    qCInfo(subcueAsrLog) << "dashscope chunks" << chunks.size();
-    return transcribePreparedChunks(chunks, request.cancel, request.progress);
+    Transcript transcript;
+    transcript.words = std::move(merged);
+    transcript.sortAndReindex();
+    return transcript;
 }
 
 } // namespace subcue

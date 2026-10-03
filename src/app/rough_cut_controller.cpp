@@ -1,4 +1,9 @@
 #include "rough_cut_controller.h"
+#include "common/file_path_guard.h"
+#include "video_preview_item.h"
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonArray>
+#include <QtCore/QDateTime>
 
 #include "ai/ai_review_service.h"
 #include "ai/ai_review_settings.h"
@@ -10,6 +15,9 @@
 #include "asr/audio_chunk_extractor.h"
 #include "asr/http_client.h"
 #include "media/media_probe.h"
+#include "media/demuxer.h"
+#include "media/decoder.h"
+#include "media/ffmpeg_error.h"
 #include "roughcut/retake_detector.h"
 #include "roughcut/alignment_evidence.h"
 #include "roughcut/safe_cut_boundary.h"
@@ -50,6 +58,48 @@ QString transcriptText(const Transcript &transcript, qint64 startMs, qint64 endM
     return result.trimmed();
 }
 
+std::variant<qint64, AppError> audioEndSample(const QString &path, int sampleRate, const std::atomic<bool> *cancel)
+{
+    AppError error(ErrorDomain::Media, 0, QString());
+    Demuxer demuxer;
+    Decoder decoder;
+    if (!demuxer.open(path, &error)) return error;
+    const int index = demuxer.bestStream(AVMEDIA_TYPE_AUDIO);
+    const auto *stream = demuxer.stream(index);
+    if (!stream || !decoder.open(*stream, &error)) return error;
+    auto frame = makeFrame();
+    if (!frame) return AppError(ErrorDomain::Media, 1, QStringLiteral("无法分配音频帧"));
+    qint64 end = 0;
+    bool draining = false;
+    for (;;) {
+        if (cancel && cancel->load()) return asrCancelledError();
+        if (!draining) {
+            auto packet = demuxer.readPacket(&error);
+            if (!packet) {
+                if (error.code() != 0) return error;
+                draining = true;
+                (void)decoder.send(nullptr);
+            } else {
+                if (packet->stream_index != index) continue;
+                const int sent = decoder.send(packet.get());
+                if (sent < 0) return makeFfmpegError(ErrorDomain::Decoder, sent, QStringLiteral("音频范围检查失败"));
+            }
+        }
+        for (;;) {
+            const int received = decoder.receive(frame.get());
+            if (received == AVERROR(EAGAIN)) break;
+            if (received == AVERROR_EOF) return end;
+            if (received < 0) return makeFfmpegError(ErrorDomain::Decoder, received, QStringLiteral("音频范围检查失败"));
+            if (frame->best_effort_timestamp == AV_NOPTS_VALUE || frame->sample_rate <= 0)
+                return AppError(ErrorDomain::Media, 1, QStringLiteral("无法确认音频时间映射"));
+            const qint64 at = av_rescale_q(frame->best_effort_timestamp, stream->time_base, AVRational{1, sampleRate});
+            end = std::max(end, at + av_rescale(frame->nb_samples, sampleRate, frame->sample_rate));
+            av_frame_unref(frame.get());
+        }
+        if (draining) return end;
+    }
+}
+
 QString asrProviderName(const QJsonObject &settings)
 {
     const QString provider = AsrProviderFactory::providerIdFromSettings(settings);
@@ -57,6 +107,15 @@ QString asrProviderName(const QJsonObject &settings)
         return AsrProviderCatalog::displayName(provider);
     }
     return settings.value(QStringLiteral("asrModel")).toString(QStringLiteral("云端 ASR"));
+}
+
+QString savedAsrApiKey(const ApplicationContext *context, const QJsonObject &settings)
+{
+    if (!context || AsrProviderFactory::providerIdFromSettings(settings)
+        != QLatin1String(kAsrProviderDashScope)) {
+        return {};
+    }
+    return context->credentials.load(QStringLiteral("SubCue/ASR/dashscope")).trimmed();
 }
 
 QString scriptDocumentText(const ScriptDocument &document)
@@ -102,6 +161,10 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
     connect(&playbackTimer_, &QTimer::timeout, this, [this] {
         const bool wasPriming = playback_.isPriming();
         playback_.pump();
+        if (previewItem_) {
+            const auto frame = playback_.displayedFrame();
+            if (!frame.image.isNull()) previewItem_->present(frame.image, frame.pts, frame.generation);
+        }
         if (wasPriming && !playback_.isPriming() && !playback_.isPaused()
             && context_ && context_->audioDevice) {
             context_->audioDevice->resume();
@@ -117,13 +180,19 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
             startTimelineClip(timelinePlaybackIndex_);
         }
         if (auditionEndSample_ >= 0 && sampleRate_ > 0
-            && playback_.position().microseconds() * sampleRate_ / 1'000'000 >= auditionEndSample_) {
+            && playback_.position().microseconds() * sampleRate_ / 1'000'000
+                >= auditionEndSample_ - sampleRate_ / 100) {
             if (timelinePlaybackIndex_ >= 0) {
                 playback_.pause();
                 if (context_->audioDevice) context_->audioDevice->pause();
                 const int finished = timelinePlaybackIndex_++;
                 auditionEndSample_ = -1;
                 if (timelinePlaybackIndex_ >= timeline_.size() || !continuousAudition_) {
+                    if (timelineItem_) {
+                        const RoughCutTimelineClip &clip = timeline_.at(finished);
+                        timelineItem_->setPlayheadUs((clip.timelineStartSample
+                            + clip.sourceEndSample - clip.sourceStartSample) * 1'000'000 / sampleRate_);
+                    }
                     stopTimeline();
                 } else {
                     const RoughCutTimelineClip &current = timeline_.at(finished);
@@ -134,9 +203,19 @@ RoughCutController::RoughCutController(ApplicationContext *context, QObject *par
                         + std::max<qint64>(0, next.timelineStartSample - currentEnd) * 1000 / sampleRate_;
                 }
             } else {
-                togglePlay();
+                playback_.pause();
+                if (context_->audioDevice) context_->audioDevice->pause();
+                playbackTimer_.stop();
+                emit playbackChanged();
                 auditionEndSample_ = -1;
             }
+        }
+        if (timelinePlaybackIndex_ < 0 && auditionEndSample_ < 0 && !playback_.isPaused()
+            && durationMs() > 0 && positionMs() >= durationMs() - 10) {
+            playback_.pause();
+            if (context_->audioDevice) context_->audioDevice->pause();
+            playbackTimer_.stop();
+            emit playbackChanged();
         }
         emit positionChanged();
         if (sourceWaveformItem_) sourceWaveformItem_->setPlayheadUs(positionMs() * 1000);
@@ -159,6 +238,7 @@ void RoughCutController::shutdown()
 {
     if (shuttingDown_) return;
     shuttingDown_ = true;
+    stopFrameRateCheck();
     cancel_ = true;
     stopWorker();
     stopWaveformWorker();
@@ -178,6 +258,7 @@ void RoughCutController::loadMedia(const QUrl &url)
     if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
     if (path.isEmpty()) return;
+    stopFrameRateCheck();
     stopWorker();
     cancel_ = false;
     beginTask(QStringLiteral("正在打开媒体"), true);
@@ -205,13 +286,21 @@ void RoughCutController::loadMedia(const QUrl &url)
             return;
         }
         const MediaInfo info = std::get<MediaInfo>(probed);
-        if (info.audioStreamIndex < 0 || info.audioStreamIndex >= info.streams.size()) {
+        if (info.audioStreamIndex < 0 || info.audioStreamIndex >= info.streams.size()
+            || info.streams.at(info.audioStreamIndex).sampleRate <= 0) {
             postUi([](RoughCutController *controller) {
                 controller->finishJobWithoutResults(QStringLiteral("所选文件没有音频轨。"));
             });
             return;
         }
-        postUi([path, info](RoughCutController *controller) {
+        const auto audioEnd = audioEndSample(path, info.streams.at(info.audioStreamIndex).sampleRate, &cancel_);
+        if (std::holds_alternative<AppError>(audioEnd) || std::get<qint64>(audioEnd) <= 0) {
+            const QString message = std::holds_alternative<AppError>(audioEnd)
+                ? std::get<AppError>(audioEnd).userMessage() : QStringLiteral("源文件没有有效音频");
+            postUi([message](RoughCutController *controller) { controller->finishJobWithoutResults(message); });
+            return;
+        }
+        postUi([path, info, sourceCount = std::get<qint64>(audioEnd)](RoughCutController *controller) {
             if (controller->cancel_) {
                 controller->finishJobWithoutResults(QStringLiteral("校验已取消。"));
                 return;
@@ -227,11 +316,17 @@ void RoughCutController::loadMedia(const QUrl &url)
             }
             if (controller->ownsSharedAudio_) controller->bindSharedAudioDevice();
             controller->mediaPath_ = QFileInfo(path).canonicalFilePath();
+            controller->mediaInfo_ = info;
+            controller->projectData_ = {};
+            controller->projectData_.state.insert(QStringLiteral("timelineOptions"), OmniReviewSettingsStore::toJsonPatch(OmniReviewSettingsStore::fromJson(controller->context_->settings)));
+            if (info.videoStreamIndex >= 0) {
+                const auto &video = info.streams.at(info.videoStreamIndex);
+                controller->projectData_.state.insert(QStringLiteral("sequenceFrameRate"), QStringLiteral("%1/%2").arg(video.frameRateNumerator).arg(video.frameRateDenominator));
+            }
             controller->analysisWords_.clear();
             controller->sampleRate_ = stream.sampleRate;
             controller->channels_ = stream.channels;
-            controller->sourceSampleCount_ = std::max<qint64>(
-                0, info.duration.microseconds() * controller->sampleRate_ / 1'000'000);
+            controller->sourceSampleCount_ = sourceCount;
             controller->model_.reset({}, {}, controller->sampleRate_);
             controller->timeline_.clear();
             controller->history_.clear();
@@ -248,23 +343,16 @@ void RoughCutController::loadMedia(const QUrl &url)
             emit controller->canSaveChanged();
             controller->refreshModified();
             controller->setStatus(QStringLiteral("已加载：%1").arg(QFileInfo(controller->mediaPath_).fileName()));
+            controller->syncSceneItems();
             controller->startWaveformWorker();
+            controller->startFrameRateCheck();
         });
     });
 }
 
-bool RoughCutController::saveProject(const QUrl &url)
+RoughCutProject RoughCutController::projectSnapshot() const
 {
-    const QString path = localPath(url);
-    if (busy_ || shuttingDown_ || path.isEmpty() || mediaPath_.isEmpty()) {
-        if (mediaPath_.isEmpty()) setStatus(QStringLiteral("请先选择完整 WAV，再保存粗剪工程。"));
-        return false;
-    }
-    stopWorker();
-    cancel_ = false;
-    beginTask(QStringLiteral("正在保存工程"), false);
-    setStatus(QStringLiteral("正在校验媒体并保存工程…"));
-    RoughCutProject project;
+    RoughCutProject project = projectData_;
     project.mediaPath = mediaPath_;
     project.scriptPath = scriptPath_;
     project.scriptText = scriptText_;
@@ -273,169 +361,332 @@ bool RoughCutController::saveProject(const QUrl &url)
     project.sourceSampleCount = sourceSampleCount_;
     project.analysisVersion = std::max(1, analysisVersion_);
     project.recording = model_.recording();
-    project.decisions = model_.decisions();
+    project.decisions = model_.baseDecisions();
     project.auxiliaryResults = auxiliaryResults_;
-    const QString mediaPath = mediaPath_;
-    const quint64 generation = ++workerGeneration_;
-    worker_ = std::thread([this, path, project, mediaPath, generation]() mutable {
-        auto postUi = [this, generation](auto fn) {
-            const QPointer<RoughCutController> self(this);
-            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
-                if (!self || generation != self->workerGeneration_) return;
-                fn(self.data());
-            }, Qt::QueuedConnection);
-        };
-        QString error;
-        project.mediaSha256 = RoughCutProjectSerializer::mediaSha256(mediaPath, &error, &cancel_,
-            [postUi](qint64 done, qint64 total) {
-                if (total <= 0) return;
-                postUi([done, total](RoughCutController *controller) {
-                    if (!controller->busy_) return;
-                    controller->progressPercent_ = std::clamp(int(done * 90 / total), 0, 90);
-                    emit controller->progressChanged();
-                });
-            });
-        if (project.mediaSha256.isEmpty()) {
-            postUi([error](RoughCutController *controller) {
-                controller->finishJobWithoutResults(error);
-            });
-            return;
+    project.state.insert(QStringLiteral("mediaInfo"), mediaInfoToJson(mediaInfo_));
+    QJsonArray words;
+    for (const auto &word : analysisWords_)
+        words.append(QJsonObject{{QStringLiteral("id"), word.id}, {QStringLiteral("text"), word.text},
+            {QStringLiteral("startMs"), word.startMs}, {QStringLiteral("endMs"), word.endMs},
+            {QStringLiteral("preciseTiming"), word.preciseTiming}});
+    project.state.insert(QStringLiteral("words"), words);
+    QJsonArray timeline;
+    for (const auto &clip : timeline_)
+        timeline.append(QJsonObject{{QStringLiteral("start"), clip.sourceStartSample},
+            {QStringLiteral("end"), clip.sourceEndSample}, {QStringLiteral("timelineStart"), clip.timelineStartSample},
+            {QStringLiteral("decision"), int(clip.decision)}, {QStringLiteral("scriptLine"), clip.scriptLineId},
+            {QStringLiteral("takeGroup"), clip.retakeGroupId}, {QStringLiteral("recording"), clip.recordingIndex},
+            {QStringLiteral("text"), clip.text}});
+    project.state.insert(QStringLiteral("timeline"), timeline);
+    project.state.insert(QStringLiteral("timelineVersion"), projectData_.state.value(QStringLiteral("timelineVersion")).toInt(1));
+    QJsonObject session = project.state.value(QStringLiteral("session")).toObject();
+    session.insert(QStringLiteral("positionMs"), positionMs());
+    session.insert(QStringLiteral("statusFilter"), statusFilter());
+    session.insert(QStringLiteral("playbackRate"), playbackRate_);
+    session.insert(QStringLiteral("continuousAudition"), continuousAudition_);
+    if (sourceWaveformItem_) {
+        session.insert(QStringLiteral("sourceZoom"), sourceWaveformItem_->pixelsPerMs());
+        session.insert(QStringLiteral("sourceScroll"), sourceWaveformItem_->scrollOffset());
+    }
+    if (timelineItem_) {
+        session.insert(QStringLiteral("timelineZoom"), timelineItem_->pixelsPerMs());
+        session.insert(QStringLiteral("timelineScroll"), timelineItem_->scrollOffset());
+    }
+    project.state.insert(QStringLiteral("session"), session);
+    return project;
+}
+
+bool RoughCutController::saveProject(const QUrl &url)
+{
+    if (!canSave()) return false;
+    const QString path = localPath(url);
+    QString error;
+    if (!safeOutputPath(path, {mediaPath_, scriptPath_}, &error)) {
+        setStatus(error);
+        emit projectSaveFinished(false, path, error);
+        return false;
+    }
+    stopWorker();
+    cancel_ = false;
+    RoughCutProject project = projectSnapshot();
+    const QByteArray fingerprint = RoughCutProjectSerializer::fingerprint(project);
+    const QPointer<RoughCutController> self(this);
+    auto *cancel = &cancel_;
+    beginTask(QStringLiteral("正在保存工程"), false);
+    worker_ = std::thread([self, cancel, path, project = std::move(project), fingerprint]() mutable {
+        QString message;
+        bool success = !cancel->load();
+        const QFileInfo media(project.mediaPath);
+        if (success && !project.mediaPath.isEmpty() && media.exists()
+            && (project.mediaSha256.size() != 32
+                || project.state.value(QStringLiteral("mediaSize")).toInteger(-1) != media.size()
+                || project.state.value(QStringLiteral("mediaMtime")).toInteger(-1) != media.lastModified().toMSecsSinceEpoch())) {
+            const auto hash = RoughCutProjectSerializer::mediaSha256(project.mediaPath, &message, cancel);
+            success = hash.size() == 32 && (project.mediaSha256.isEmpty() || hash == project.mediaSha256);
+            if (!success && message.isEmpty()) message = QStringLiteral("源素材内容已变化，请重新定位原素材或导入新素材。");
+            if (success) project.mediaSha256 = hash;
+            project.state.insert(QStringLiteral("mediaSize"), media.size());
+            project.state.insert(QStringLiteral("mediaMtime"), media.lastModified().toMSecsSinceEpoch());
         }
-        if (!RoughCutProjectSerializer::save(path, project, &error)) {
-            postUi([error](RoughCutController *controller) {
-                controller->finishJobWithoutResults(error);
-            });
-            return;
-        }
-        postUi([path](RoughCutController *controller) {
-            controller->projectPath_ = QFileInfo(path).absoluteFilePath();
-            emit controller->projectChanged();
-            controller->markSaved();
-            controller->setBusy(false);
-            controller->progressPercent_ = 100;
-            emit controller->progressChanged();
-            controller->setStatus(QStringLiteral("粗剪工程已保存：%1").arg(controller->projectPath_));
-        });
+        if (success) success = !cancel->load() && RoughCutProjectSerializer::save(path, project, &message, cancel);
+        if (!success && message.isEmpty()) message = QStringLiteral("保存已取消。");
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, project = std::move(project), fingerprint, success, message] {
+            if (!self || self->shuttingDown_) return;
+            if (success) {
+                self->projectData_.mediaSha256 = project.mediaSha256;
+                self->projectData_.state.insert(QStringLiteral("mediaSize"), project.state.value(QStringLiteral("mediaSize")));
+                self->projectData_.state.insert(QStringLiteral("mediaMtime"), project.state.value(QStringLiteral("mediaMtime")));
+                self->projectPath_ = QFileInfo(path).absoluteFilePath();
+                self->savedFingerprint_ = fingerprint;
+                self->refreshModified();
+                emit self->projectChanged();
+            }
+            self->setBusy(false);
+            self->setStatus(success ? QStringLiteral("粗剪工程已保存：%1").arg(path) : message);
+            emit self->projectSaveFinished(success, path, self->statusText_);
+        }, Qt::QueuedConnection);
     });
     return true;
 }
 
 bool RoughCutController::saveCurrentProject()
 {
-    if (projectPath_.isEmpty()) return false;
-    return saveProject(QUrl::fromLocalFile(projectPath_));
+    return !projectPath_.isEmpty() && saveProject(QUrl::fromLocalFile(projectPath_));
+}
+
+void RoughCutController::applyProject(const RoughCutProject &project, const QString &path,
+    const MediaInfo &info, bool available)
+{
+    stopFrameRateCheck();
+    stopWaveformWorker();
+    stopTimeline();
+    playback_.close();
+    if (sourceWaveformItem_) sourceWaveformItem_->setWaveform({});
+    if (previewItem_) previewItem_->clearFrame();
+    projectData_ = project;
+    mediaInfo_ = info;
+    mediaPath_ = project.mediaPath;
+    scriptPath_ = project.scriptPath;
+    scriptText_ = project.scriptText;
+    projectPath_ = path;
+    sampleRate_ = project.sampleRate;
+    channels_ = project.channels;
+    sourceSampleCount_ = project.sourceSampleCount;
+    analysisVersion_ = project.recording.isEmpty() ? 0 : project.analysisVersion;
+    analysisWords_.clear();
+    for (const auto &value : project.state.value(QStringLiteral("words")).toArray()) {
+        const auto word = value.toObject();
+        analysisWords_.append({word.value(QStringLiteral("id")).toInteger(), word.value(QStringLiteral("text")).toString(),
+            word.value(QStringLiteral("startMs")).toInteger(), word.value(QStringLiteral("endMs")).toInteger(),
+            word.value(QStringLiteral("preciseTiming")).toBool()});
+    }
+    auxiliaryResults_ = project.auxiliaryResults;
+    model_.reset(project.recording, project.decisions, sampleRate_,
+        project.state.value(QStringLiteral("analysisScriptText")).toString(scriptText_));
+    history_.clear();
+    historyIndex_ = 0;
+    timeline_.clear();
+    if (project.schemaVersion >= 6 && project.state.value(QStringLiteral("timeline")).isArray()) {
+        for (const auto &value : project.state.value(QStringLiteral("timeline")).toArray()) {
+            const auto clip = value.toObject();
+            timeline_.append({clip.value(QStringLiteral("start")).toInteger(), clip.value(QStringLiteral("end")).toInteger(),
+                clip.value(QStringLiteral("timelineStart")).toInteger(), RoughCutDecision(clip.value(QStringLiteral("decision")).toInt()),
+                clip.value(QStringLiteral("scriptLine")).toInt(-1), clip.value(QStringLiteral("takeGroup")).toInt(-1),
+                clip.value(QStringLiteral("recording")).toInt(-1), clip.value(QStringLiteral("text")).toString()});
+        }
+        syncSceneItems();
+    } else rebuildTimeline();
+    AppError error(ErrorDomain::Media, 0, QString());
+    if (available && playback_.open(mediaPath_, &error)) {
+        if (ownsSharedAudio_) bindSharedAudioDevice();
+        startWaveformWorker();
+        startFrameRateCheck();
+    }
+    const auto session = project.state.value(QStringLiteral("session")).toObject();
+    setStatusFilter(session.value(QStringLiteral("statusFilter")).toString(QStringLiteral("ALL")));
+    continuousAudition_ = session.value(QStringLiteral("continuousAudition")).toBool(true);
+    setPlaybackRate(session.value(QStringLiteral("playbackRate")).toDouble(1.0));
+    seek(std::clamp(session.value(QStringLiteral("positionMs")).toInteger(), qint64(0), durationMs()));
+    if (sourceWaveformItem_) sourceWaveformItem_->setView(
+        session.value(QStringLiteral("sourceZoom")).toDouble(sourceWaveformItem_->pixelsPerMs()),
+        session.value(QStringLiteral("sourceScroll")).toDouble());
+    if (timelineItem_) timelineItem_->setView(
+        session.value(QStringLiteral("timelineZoom")).toDouble(timelineItem_->pixelsPerMs()),
+        session.value(QStringLiteral("timelineScroll")).toDouble());
+    setBusy(false);
+    emit mediaChanged();
+    emit scriptChanged();
+    emit projectChanged();
+    emit resultsChanged();
+    emit historyChanged();
+    emit canSaveChanged();
+    markSaved();
+}
+
+void RoughCutController::newProject()
+{
+    if (busy_ || shuttingDown_) return;
+    stopWorker();
+    applyProject(RoughCutProject{}, {}, MediaInfo{}, false);
+    setStatus(QStringLiteral("新建粗剪工程。"));
 }
 
 void RoughCutController::openProject(const QUrl &url)
 {
     if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
-    if (path.isEmpty()) return;
     stopWorker();
     cancel_ = false;
+    const QPointer<RoughCutController> self(this);
+    auto *cancel = &cancel_;
     beginTask(QStringLiteral("正在打开工程"), false);
-    setStatus(QStringLiteral("正在校验工程与媒体…"));
-    const quint64 generation = ++workerGeneration_;
-    worker_ = std::thread([this, path, generation] {
-        auto postUi = [this, generation](auto fn) {
-            const QPointer<RoughCutController> self(this);
-            QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
-                if (!self || generation != self->workerGeneration_) return;
-                fn(self.data());
-            }, Qt::QueuedConnection);
-        };
-        QString error;
-        const std::optional<RoughCutProject> project = RoughCutProjectSerializer::load(path, &error);
-        if (!project) {
-            postUi([error](RoughCutController *controller) {
-                controller->finishJobWithoutResults(error);
-            });
-            return;
+    worker_ = std::thread([self, cancel, path] {
+        QString message;
+        auto project = RoughCutProjectSerializer::load(path, &message);
+        MediaInfo info;
+        bool available = false;
+        if (project) {
+            info = mediaInfoFromJson(project->state.value(QStringLiteral("mediaInfo")).toObject());
+            if (!project->mediaPath.isEmpty() && QFileInfo::exists(project->mediaPath)) {
+                const auto hash = RoughCutProjectSerializer::mediaSha256(project->mediaPath, &message, cancel);
+                if (hash.size() == 32 && hash == project->mediaSha256) {
+                    const auto probed = MediaProbe::probe(project->mediaPath);
+                    if (std::holds_alternative<MediaInfo>(probed)) {
+                        const bool verified = info.cfrVerified;
+                        info = std::get<MediaInfo>(probed);
+                        info.cfrVerified = verified;
+                        available = info.audioStreamIndex >= 0;
+                    }
+                }
+            }
+            if (cancel->load()) { project.reset(); message = QStringLiteral("打开已取消。"); }
         }
-        const QByteArray currentHash = RoughCutProjectSerializer::mediaSha256(
-            project->mediaPath, &error, &cancel_,
-            [postUi](qint64 done, qint64 total) {
-                if (total <= 0) return;
-                postUi([done, total](RoughCutController *controller) {
-                    if (!controller->busy_) return;
-                    controller->progressPercent_ = std::clamp(int(done * 80 / total), 0, 80);
-                    emit controller->progressChanged();
-                });
-            });
-        if (currentHash.isEmpty()) {
-            postUi([error](RoughCutController *controller) {
-                controller->finishJobWithoutResults(error == QStringLiteral("校验已取消。")
-                    ? error : QStringLiteral("工程源媒体不可用：%1").arg(error));
-            });
-            return;
-        }
-        if (currentHash != project->mediaSha256) {
-            postUi([](RoughCutController *controller) {
-                controller->finishJobWithoutResults(
-                    QStringLiteral("源媒体内容已变化，当前工程未改动，请重新选择媒体并分析。"));
-            });
-            return;
-        }
-        const ProbeResult probed = MediaProbe::probe(project->mediaPath);
-        if (std::holds_alternative<AppError>(probed)) {
-            postUi([message = std::get<AppError>(probed).userMessage()](RoughCutController *controller) {
-                controller->finishJobWithoutResults(message);
-            });
-            return;
-        }
-        const MediaInfo info = std::get<MediaInfo>(probed);
-        if (info.audioStreamIndex < 0 || info.audioStreamIndex >= info.streams.size()) {
-            postUi([](RoughCutController *controller) {
-                controller->finishJobWithoutResults(QStringLiteral("所选文件没有音频轨。"));
-            });
-            return;
-        }
-        postUi([path, project = *project, info](RoughCutController *controller) mutable {
-            if (controller->cancel_) {
-                controller->finishJobWithoutResults(QStringLiteral("校验已取消。"));
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, project = std::move(project), info, available, message] {
+            if (!self || self->shuttingDown_) return;
+            if (!project) {
+                self->finishJobWithoutResults(message);
+                emit self->projectOpenFinished(false, path, message);
                 return;
             }
-            AppError openError(ErrorDomain::Media, 0, QString());
-            controller->stopWaveformWorker();
-            if (controller->sourceWaveformItem_) controller->sourceWaveformItem_->setWaveform({});
-            controller->playback_.close();
-            if (!controller->playback_.open(project.mediaPath, &openError)) {
-                controller->finishJobWithoutResults(openError.userMessage());
-                return;
-            }
-            if (controller->ownsSharedAudio_) controller->bindSharedAudioDevice();
-            const MediaStreamInfo stream = info.streams.at(info.audioStreamIndex);
-            controller->mediaPath_ = QFileInfo(project.mediaPath).canonicalFilePath();
-            controller->analysisWords_.clear();
-            controller->sampleRate_ = stream.sampleRate;
-            controller->channels_ = stream.channels;
-            controller->sourceSampleCount_ = std::max<qint64>(
-                0, info.duration.microseconds() * controller->sampleRate_ / 1'000'000);
-            controller->scriptPath_ = project.scriptPath;
-            controller->scriptText_ = project.scriptText;
-            controller->projectPath_ = QFileInfo(path).absoluteFilePath();
-            controller->analysisVersion_ = project.analysisVersion;
-            controller->auxiliaryResults_ = project.auxiliaryResults;
-            controller->model_.reset(project.recording, project.decisions,
-                controller->sampleRate_, controller->scriptText_);
-            controller->history_.clear();
-            controller->historyIndex_ = 0;
-            controller->rebuildTimeline();
-            controller->setBusy(false);
-            controller->progressPercent_ = 100;
-            emit controller->progressChanged();
-            emit controller->mediaChanged();
-            emit controller->scriptChanged();
-            emit controller->projectChanged();
-            emit controller->resultsChanged();
-            emit controller->canAiReviewChanged();
-            emit controller->historyChanged();
-            emit controller->canSaveChanged();
-            controller->markSaved();
-            controller->setStatus(QStringLiteral("粗剪工程已打开：%1").arg(controller->projectPath_));
-            controller->startWaveformWorker();
-        });
+            self->applyProject(*project, QFileInfo(path).absoluteFilePath(), info, available);
+            self->setStatus(!project->mediaPath.isEmpty() && !self->mediaAvailable()
+                ? QStringLiteral("工程已打开，素材离线，请重新定位。")
+                : project->schemaVersion < 6 ? QStringLiteral("旧工程已迁移，请核对剪切边界后保存。")
+                : QStringLiteral("粗剪工程已打开：%1").arg(path));
+            emit self->projectOpenFinished(true, path, self->statusText_);
+        }, Qt::QueuedConnection);
     });
+}
+
+void RoughCutController::relinkMedia(const QUrl &url)
+{
+    if (busy_ || shuttingDown_ || projectData_.mediaSha256.size() != 32) {
+        setStatus(QStringLiteral("没有可验证的素材身份，请导入新素材。"));
+        return;
+    }
+    const QString path = localPath(url);
+    stopWorker();
+    cancel_ = false;
+    const QPointer<RoughCutController> self(this);
+    auto *cancel = &cancel_;
+    const RoughCutProject project = projectSnapshot();
+    const QString projectPath = projectPath_;
+    beginTask(QStringLiteral("正在重新定位素材"), false);
+    worker_ = std::thread([self, cancel, path, project, projectPath] {
+        QString message;
+        const auto hash = RoughCutProjectSerializer::mediaSha256(path, &message, cancel);
+        const auto probed = hash == project.mediaSha256 ? MediaProbe::probe(path)
+            : ProbeResult(AppError(ErrorDomain::Validation, 1, QStringLiteral("素材内容不同，不能作为重定位使用。")));
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, project = RoughCutProject(project), projectPath, probed, message]() mutable {
+            if (!self || self->shuttingDown_) return;
+            self->setBusy(false);
+            if (std::holds_alternative<AppError>(probed)) {
+                self->setStatus(message.isEmpty() ? std::get<AppError>(probed).userMessage() : message);
+                return;
+            }
+            const auto saved = self->savedFingerprint_;
+            project.mediaPath = QFileInfo(path).absoluteFilePath();
+            self->applyProject(project, projectPath, std::get<MediaInfo>(probed), true);
+            self->savedFingerprint_ = saved;
+            self->refreshModified();
+            self->setStatus(QStringLiteral("素材已重新定位，请保存工程。"));
+        }, Qt::QueuedConnection);
+    });
+}
+
+QString RoughCutController::sequenceFrameRate() const
+{
+    return projectData_.state.value(QStringLiteral("sequenceFrameRate")).toString(QStringLiteral("60/1"));
+}
+
+void RoughCutController::setSequenceFrameRate(const QString &rate)
+{
+    if (busy_ || sequenceFrameRate() == rate) return;
+    const QStringList allowed{QStringLiteral("24/1"), QStringLiteral("25/1"), QStringLiteral("30/1"),
+        QStringLiteral("50/1"), QStringLiteral("60/1"), QStringLiteral("24000/1001"),
+        QStringLiteral("30000/1001"), QStringLiteral("60000/1001")};
+    if (!allowed.contains(rate)) { setStatus(QStringLiteral("尚不支持此序列帧率。")); return; }
+    projectData_.state.insert(QStringLiteral("sequenceFrameRate"), rate);
+    refreshModified();
+    emit projectChanged();
+}
+
+QString RoughCutController::xmlExportReason() const
+{
+    if (!mediaAvailable()) return QStringLiteral("素材离线或尚未关联媒体。");
+    if (analysisStale()) return QStringLiteral("分析输入已改变，请重新分析后导出。");
+    if (!projectData_.state.value(QStringLiteral("timelineFrameError")).toString().isEmpty())
+        return projectData_.state.value(QStringLiteral("timelineFrameError")).toString();
+    if (channels_ > 2) return QStringLiteral("XML 首期仅支持单声道或立体声。");
+    if (hasVideo() && !mediaInfo_.cfrVerified)
+        return mediaInfo_.variableFrameRate ? QStringLiteral("源视频为可变帧率，不能导出 XML。")
+            : projectData_.state.value(QStringLiteral("frameRateError")).toString(QStringLiteral("正在检查或尚未确认固定帧率。"));
+    return {};
+}
+
+void RoughCutController::stopFrameRateCheck()
+{
+    frameRateCancel_ = true;
+    if (frameRateWorker_.joinable()) frameRateWorker_.join();
+}
+
+void RoughCutController::startFrameRateCheck()
+{
+    stopFrameRateCheck();
+    if (!hasVideo() || mediaInfo_.cfrVerified || !mediaAvailable()) return;
+    frameRateCancel_ = false;
+    const QString path = mediaPath_;
+    const quint64 generation = waveformGeneration_.load();
+    const QPointer<RoughCutController> self(this);
+    auto *cancel = &frameRateCancel_;
+    frameRateWorker_ = std::thread([self, cancel, path, generation] {
+        const auto result = MediaProbe::verifyFrameRate(path, cancel);
+        if (cancel->load() || !self) return;
+        QMetaObject::invokeMethod(self.data(), [self, path, result, generation] {
+            if (!self || self->shuttingDown_ || self->mediaPath_ != path || generation != self->waveformGeneration_.load()) return;
+            if (std::holds_alternative<MediaInfo>(result)) {
+                self->mediaInfo_ = std::get<MediaInfo>(result);
+                if (self->mediaInfo_.cfrVerified && self->projectPath_.isEmpty() && !self->timeline_.isEmpty()) {
+                    self->rebuildTimeline();
+                    self->refreshModified();
+                }
+                self->setStatus(self->mediaInfo_.cfrVerified ? QStringLiteral("源视频固定帧率已确认。") : QStringLiteral("源视频为可变帧率，XML 导出不可用。"));
+            } else {
+                self->projectData_.state.insert(QStringLiteral("frameRateError"), std::get<AppError>(result).userMessage());
+                self->setStatus(std::get<AppError>(result).userMessage());
+            }
+            emit self->mediaChanged();
+            emit self->canExportChanged();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void RoughCutController::setPreviewItem(QObject *item)
+{
+    previewItem_ = qobject_cast<VideoPreviewItem *>(item);
 }
 
 void RoughCutController::loadScript(const QUrl &url)
@@ -447,19 +698,28 @@ void RoughCutController::loadScript(const QUrl &url)
         return;
     }
     const QString canonicalPath = QFileInfo(path).canonicalFilePath();
-    const ScriptDocumentResult imported = QFileInfo(canonicalPath).suffix().compare(
-        QStringLiteral("docx"), Qt::CaseInsensitive) == 0
-        ? ScriptDocumentImporter::loadDocx(canonicalPath)
-        : ScriptDocumentImporter::loadTxt(canonicalPath);
-    if (std::holds_alternative<AppError>(imported)) {
-        setStatus(std::get<AppError>(imported).userMessage());
-        return;
-    }
-    scriptPath_ = canonicalPath;
-    scriptText_ = scriptDocumentText(std::get<ScriptDocument>(imported));
-    setStatus(QStringLiteral("已选择文案：%1").arg(QFileInfo(scriptPath_).fileName()));
-    emit scriptChanged();
-    refreshModified();
+    stopWorker();
+    cancel_ = false;
+    beginTask(QStringLiteral("正在导入文案"), true);
+    const quint64 generation = ++workerGeneration_;
+    worker_ = std::thread([this, canonicalPath, generation] {
+        const auto imported = QFileInfo(canonicalPath).suffix().compare(QStringLiteral("docx"), Qt::CaseInsensitive) == 0
+            ? ScriptDocumentImporter::loadDocx(canonicalPath, {}, &cancel_)
+            : ScriptDocumentImporter::loadTxt(canonicalPath);
+        const QPointer<RoughCutController> self(this);
+        QMetaObject::invokeMethod(this, [self, canonicalPath, generation, imported] {
+            if (!self || generation != self->workerGeneration_) return;
+            self->setBusy(false);
+            if (self->cancel_.load()) { self->setStatus(QStringLiteral("文案导入已取消。")); return; }
+            if (std::holds_alternative<AppError>(imported)) { self->setStatus(std::get<AppError>(imported).userMessage()); return; }
+            self->scriptPath_ = canonicalPath;
+            self->scriptText_ = scriptDocumentText(std::get<ScriptDocument>(imported));
+            self->setStatus(QStringLiteral("已选择文案：%1").arg(QFileInfo(canonicalPath).fileName()));
+            emit self->scriptChanged();
+            emit self->canExportChanged();
+            self->refreshModified();
+        }, Qt::QueuedConnection);
+    });
 }
 
 void RoughCutController::setScriptText(const QString &text)
@@ -468,6 +728,7 @@ void RoughCutController::setScriptText(const QString &text)
     scriptText_ = text;
     scriptPath_.clear();
     emit scriptChanged();
+    emit canExportChanged();
     refreshModified();
 }
 
@@ -491,6 +752,14 @@ void RoughCutController::setTimelineItem(QObject *item)
 void RoughCutController::startAnalysis()
 {
     if (busy_ || shuttingDown_ || mediaPath_.isEmpty()) return;
+    const QJsonObject settings = context_->settings;
+    const QString apiKey = savedAsrApiKey(context_, settings);
+    if (!asrOverride_
+        && AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
+        && apiKey.isEmpty()) {
+        setStatus(QStringLiteral("云端 ASR API Key 尚未配置，请在设置中保存凭据。"));
+        return;
+    }
     stopWorker();
     cancel_ = false;
     beginTask(QStringLiteral("正在分析"), false);
@@ -501,13 +770,12 @@ void RoughCutController::startAnalysis()
     const QString scriptText = scriptText_;
     const int sampleRate = sampleRate_;
     const qint64 sourceSampleCount = sourceSampleCount_;
-    const QJsonObject settings = context_->settings;
     const QString providerName = asrProviderName(settings);
     const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(settings);
     IAsrService *asrOverride = asrOverride_;
     const quint64 generation = ++workerGeneration_;
     worker_ = std::thread([this, mediaPath, scriptPath, scriptText, sampleRate, sourceSampleCount,
-                           settings, providerName, omniSettings, asrOverride, generation] {
+                           settings, apiKey, providerName, omniSettings, asrOverride, generation] {
         auto postUi = [this, generation](auto fn) {
             const QPointer<RoughCutController> self(this);
             QMetaObject::invokeMethod(this, [self, generation, fn = std::move(fn)]() mutable {
@@ -545,7 +813,7 @@ void RoughCutController::startAnalysis()
         std::unique_ptr<IAsrService> ownedAsr;
         IAsrService *asr = asrOverride;
         if (!asr) {
-            ownedAsr = factory.create(settings, QString());
+            ownedAsr = factory.create(settings, apiKey);
             asr = ownedAsr.get();
         }
         const AsrResult result = asr->transcribe({mediaPath, &cancel_,
@@ -621,19 +889,17 @@ void RoughCutController::startAnalysis()
         for (const RecognizedPassage &passage : recording)
             trusted.append(passage.boundaryTrustworthy && !passage.text.isEmpty());
         QVector<RoughCutSegmentDecision> decisions = RoughCutDecisionEngine::decide(
-            recording, matches, groups, trusted, scriptDocumentText(script));
-        RoughCutDecisionEngine::protectCuts(recording, &decisions, scriptDocumentText(script));
-        SafeCutBoundary::applyToPassages(
-            &recording, &decisions, transcript.words, sampleRate, sourceSampleCount, omniSettings);
+            recording, matches, groups, trusted, scriptDocumentText(script), false);
         postUi([recording = std::move(recording), decisions = std::move(decisions),
-                words = transcript.words](
+                words = transcript.words, analysisScript = scriptDocumentText(script)](
                    RoughCutController *controller) mutable {
             if (controller->cancel_) {
                 controller->finishJobWithoutResults(QStringLiteral("分析已取消。"));
                 return;
             }
             controller->model_.reset(std::move(recording), std::move(decisions),
-                controller->sampleRate_, controller->scriptText_);
+                controller->sampleRate_, analysisScript);
+            controller->projectData_.state.insert(QStringLiteral("analysisScriptText"), analysisScript);
             controller->analysisWords_ = std::move(words);
             ++controller->analysisVersion_;
             controller->auxiliaryResults_.clear();
@@ -763,10 +1029,6 @@ void RoughCutController::startAiReview()
                              QString::number(suggestion.confidence, 'f', 2)));
                 ++changed;
             }
-            QVector<RecognizedPassage> recording = controller->model_.recording();
-            RoughCutDecisionEngine::protectCuts(recording, &afterBase, controller->scriptText_);
-            SafeCutBoundary::applyToPassages(
-                &recording, &afterBase, words, sampleRate, sourceSampleCount, omniSettings);
             Edit edit;
             edit.beforeBase = beforeBase;
             edit.afterBase = afterBase;
@@ -794,11 +1056,6 @@ void RoughCutController::startAuxiliaryRecognition()
     const QVector<RoughCutSuspiciousRange> ranges = RoughCutAuxiliaryRecognition::plan(
         model_.recording(), model_.decisions(), sampleRate_, sourceSampleCount_);
     if (ranges.isEmpty()) { setStatus(QStringLiteral("没有需要辅助识别的 REVIEW 片段。")); return; }
-    stopWorker();
-    cancel_ = false;
-    beginTask(QStringLiteral("正在辅助识别"), false);
-    const QString mediaPath = mediaPath_;
-    const int sampleRate = sampleRate_;
     QJsonObject settings = context_->settings;
     if (!settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)) {
         settings.insert(QStringLiteral("asrProvider"),
@@ -806,12 +1063,23 @@ void RoughCutController::startAuxiliaryRecognition()
         settings.insert(QStringLiteral("asrModel"),
             settings.value(QStringLiteral("reviewAsrModel")).toString(QStringLiteral("Fun-ASR-Nano-2512")));
     }
+    const QString apiKey = savedAsrApiKey(context_, settings);
+    if (AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
+        && apiKey.isEmpty()) {
+        setStatus(QStringLiteral("云端 ASR API Key 尚未配置，请在设置中保存凭据。"));
+        return;
+    }
+    stopWorker();
+    cancel_ = false;
+    beginTask(QStringLiteral("正在辅助识别"), false);
+    const QString mediaPath = mediaPath_;
+    const int sampleRate = sampleRate_;
     const QString providerName = asrProviderName(settings);
     setStatus(QStringLiteral("正在使用 %1 执行辅助识别…").arg(providerName));
     const QVector<RecognizedPassage> recording = model_.recording();
     const QVector<RoughCutSegmentDecision> decisions = model_.decisions();
     const quint64 generation = ++workerGeneration_;
-    worker_ = std::thread([this, ranges, mediaPath, sampleRate, settings, providerName,
+    worker_ = std::thread([this, ranges, mediaPath, sampleRate, settings, apiKey, providerName,
                            recording, decisions, generation] {
         auto postUi = [this, generation](auto fn) {
             const QPointer<RoughCutController> self(this);
@@ -822,7 +1090,7 @@ void RoughCutController::startAuxiliaryRecognition()
         };
         QVector<RoughCutAuxiliaryResult> results;
         AsrProviderFactory factory;
-        std::unique_ptr<IAsrService> reviewAsr = factory.create(settings, QString());
+        std::unique_ptr<IAsrService> reviewAsr = factory.create(settings, apiKey);
         QTemporaryDir temporary;
         for (int rangeIndex = 0; rangeIndex < ranges.size() && !cancel_; ++rangeIndex) {
             const RoughCutSuspiciousRange &range = ranges.at(rangeIndex);
@@ -888,6 +1156,11 @@ void RoughCutController::startAuxiliaryRecognition()
 void RoughCutController::togglePlay()
 {
     if (!playback_.isOpen()) return;
+    if (durationMs() > 0 && positionMs() >= durationMs() - 20) {
+        playback_.pause();
+        if (context_->audioDevice) context_->audioDevice->pause();
+        playback_.seek(MediaTime::fromMilliseconds(0));
+    }
     if (playback_.isPaused()) {
         playback_.play();
         playbackTimer_.start();
@@ -917,6 +1190,11 @@ void RoughCutController::seek(qint64 value)
     auditionEndSample_ = -1;
     playback_.seek(MediaTime::fromMilliseconds(std::clamp<qint64>(value, 0, durationMs())));
     playback_.pump();
+    if (hasVideo() && !playbackTimer_.isActive()) playbackTimer_.start();
+    if (previewItem_) {
+        const auto frame = playback_.displayedFrame();
+        if (!frame.image.isNull()) previewItem_->present(frame.image, frame.pts, frame.generation);
+    }
     emit positionChanged();
 }
 
@@ -968,7 +1246,12 @@ void RoughCutController::audition(int row)
 void RoughCutController::playTimeline()
 {
     if (timeline_.isEmpty() || !playback_.isOpen()) return;
-    const qint64 startSample = timelineItem_ ? timelineItem_->playheadUs() * sampleRate_ / 1'000'000 : 0;
+    qint64 startSample = timelineItem_ ? timelineItem_->playheadUs() * sampleRate_ / 1'000'000 : 0;
+    const RoughCutTimelineClip &last = timeline_.constLast();
+    if (startSample >= last.timelineStartSample + last.sourceEndSample - last.sourceStartSample) {
+        startSample = 0;
+        if (timelineItem_) timelineItem_->setPlayheadUs(0);
+    }
     stopTimeline();
     timelinePlaybackIndex_ = 0;
     while (timelinePlaybackIndex_ + 1 < timeline_.size()
@@ -1075,27 +1358,66 @@ void RoughCutController::redo()
 
 void RoughCutController::exportXml(const QUrl &url)
 {
-    if (timeline_.isEmpty()) return;
+    const QString path = localPath(url);
+    QString error = xmlExportReason();
+    if (busy_ || timeline_.isEmpty()) error = QStringLiteral("当前没有可导出的粗剪结果或任务正在运行。");
+    if (!error.isEmpty() || !safeOutputPath(path, {mediaPath_, scriptPath_, projectPath_}, &error)) {
+        setStatus(error);
+        emit exportFinished(false, path, error);
+        return;
+    }
+    const auto request = exportRequest(&error);
+    if (!error.isEmpty()) { setStatus(error); emit exportFinished(false, path, error); return; }
+    const bool saved = XmemlExporter::save(path, request, &error);
+    setStatus(saved ? QStringLiteral("XML 已导出：%1").arg(path) : error);
+    emit exportFinished(saved, path, statusText_);
+}
+
+RoughCutExportRequest RoughCutController::exportRequest(QString *error) const
+{
     RoughCutExportRequest request;
     request.mediaPath = mediaPath_;
     request.sampleRate = sampleRate_;
     request.channels = channels_;
     request.sourceSampleCount = sourceSampleCount_;
+    request.mediaInfo = mediaInfo_;
+    request.sourceRangesAreFrameAligned = projectData_.state.value(QStringLiteral("timelineVersion")).toInt() >= 2;
+    request.frameRateNumerator = sequenceFrameRate().section(QLatin1Char('/'), 0, 0).toInt();
+    request.frameRateDenominator = sequenceFrameRate().section(QLatin1Char('/'), 1, 1).toInt();
     for (int index = 0; index < timeline_.size(); ++index) {
-        const RoughCutTimelineClip &clip = timeline_.at(index);
-        request.clips.append({clip.text.isEmpty() ? QStringLiteral("Clip %1").arg(index + 1) : clip.text,
-                              clip.sourceStartSample, clip.sourceEndSample,
-                              clip.timelineStartSample});
+        const auto &clip = timeline_.at(index);
+        RoughCutSourceClip source{clip.text.isEmpty() ? QStringLiteral("Clip %1").arg(index + 1) : clip.text,
+            clip.sourceStartSample, clip.sourceEndSample, clip.timelineStartSample};
+        source.allowedEndSample = sourceSampleCount_;
+        if (clip.recordingIndex >= 0 && clip.recordingIndex < model_.recording().size()) {
+            const auto &passage = model_.recording().at(clip.recordingIndex);
+            source.protectedStartSample = passage.startSample;
+            source.protectedEndSample = passage.endSample;
+        }
+        // 帧对齐只能借用合法静音，不能跨入已剪除的语音。
+        for (int row = 0; row < model_.recording().size(); ++row) {
+            if (model_.decisions().at(row).effectiveDecision() != RoughCutDecision::Cut) continue;
+            const auto &cut = model_.recording().at(row);
+            if (cut.endSample <= clip.sourceStartSample) source.allowedStartSample = std::max(source.allowedStartSample, cut.endSample);
+            else if (cut.startSample >= clip.sourceEndSample) source.allowedEndSample = std::min(source.allowedEndSample, cut.startSample);
+            else {
+                if (error) *error = QStringLiteral("片段 %1 与已剪除语音范围重叠。").arg(index + 1);
+                return {};
+            }
+        }
+        request.clips.append(source);
     }
-    QString error;
-    if (!XmemlExporter::save(localPath(url), request, &error)) setStatus(error);
-    else setStatus(QStringLiteral("XML 已导出：%1").arg(localPath(url)));
+    return request;
 }
 
 void RoughCutController::exportWav(const QUrl &url)
 {
     const QString path = localPath(url);
-    if (busy_ || path.isEmpty() || mediaPath_.isEmpty() || timeline_.isEmpty()) return;
+    if (busy_ || path.isEmpty() || !mediaAvailable() || analysisStale() || timeline_.isEmpty()) return;
+    QString outputError;
+    if (!safeOutputPath(path, {mediaPath_, scriptPath_, projectPath_}, &outputError)) {
+        setStatus(outputError); emit exportFinished(false, path, outputError); return;
+    }
     stopWorker();
     cancel_ = false;
     beginTask(QStringLiteral("正在导出 WAV"), true);
@@ -1122,6 +1444,7 @@ void RoughCutController::exportWav(const QUrl &url)
             emit controller->progressChanged();
             controller->setStatus(saved ? QStringLiteral("精简 WAV 已导出：%1").arg(path)
                             : error);
+            emit controller->exportFinished(saved, path, controller->statusText_);
         });
     });
 }
@@ -1158,6 +1481,7 @@ void RoughCutController::startWaveformWorker()
         QMetaObject::invokeMethod(this, [self, generation, waveform] {
             if (!self || generation != self->waveformGeneration_) return;
             if (self->sourceWaveformItem_) self->sourceWaveformItem_->setWaveform(waveform);
+            if (self->timelineItem_) self->timelineItem_->setWaveform(waveform);
         }, Qt::QueuedConnection);
     });
 }
@@ -1170,25 +1494,61 @@ void RoughCutController::syncSceneItems()
         sourceWaveformItem_->setView(sourceWaveformItem_->pixelsPerMs(), sourceWaveformItem_->scrollOffset());
     }
     if (!timelineItem_) return;
-    timelineItem_->clearCues();
+    QList<Subtitle> cues;
+    cues.reserve(timeline_.size());
     qint64 endSample = 0;
     for (int index = 0; index < timeline_.size(); ++index) {
         const RoughCutTimelineClip &clip = timeline_.at(index);
+        if (clip.decision == RoughCutDecision::Cut) continue;
         const qint64 duration = clip.sourceEndSample - clip.sourceStartSample;
-        timelineItem_->addCue(QString::number(clip.recordingIndex),
-            clip.timelineStartSample * 1'000'000 / sampleRate_,
-            (clip.timelineStartSample + duration) * 1'000'000 / sampleRate_, clip.text);
+        Subtitle cue;
+        cue.id = QString::number(clip.recordingIndex);
+        cue.start = MediaTime::fromMicroseconds(clip.timelineStartSample * 1'000'000 / sampleRate_);
+        cue.end = MediaTime::fromMicroseconds((clip.timelineStartSample + duration) * 1'000'000 / sampleRate_);
+        cue.text = clip.text;
+        cue.status = clip.decision == RoughCutDecision::Review ? QStringLiteral("REVIEW") : QStringLiteral("MANUAL");
+        cue.metadata.insert(QStringLiteral("sourceStartUs"), clip.sourceStartSample * 1'000'000 / sampleRate_);
+        cue.metadata.insert(QStringLiteral("sourceEndUs"), clip.sourceEndSample * 1'000'000 / sampleRate_);
+        cues.append(std::move(cue));
         endSample = std::max(endSample, clip.timelineStartSample + duration);
     }
+    timelineItem_->setSubtitles(std::move(cues));
+    timelineItem_->setEditable(false);
     timelineItem_->setDurationUs(sampleRate_ > 0 ? endSample * 1'000'000 / sampleRate_ : 0);
     timelineItem_->setView(timelineItem_->pixelsPerMs(), timelineItem_->scrollOffset());
 }
 
 void RoughCutController::rebuildTimeline()
 {
-    const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(context_->settings);
-    timeline_ = SafeCutBoundary::buildTimeline(
-        model_.recording(), model_.decisions(), sampleRate_, sourceSampleCount_, omniSettings);
+    const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(
+        projectData_.state.value(QStringLiteral("timelineOptions")).toObject());
+    auto recording = model_.recording();
+    auto decisions = model_.decisions();
+    SafeCutBoundary::applyToPassages(&recording, &decisions, analysisWords_, sampleRate_, sourceSampleCount_, omniSettings);
+    timeline_ = SafeCutBoundary::buildTimeline(recording, decisions, sampleRate_, sourceSampleCount_, omniSettings);
+    projectData_.state.insert(QStringLiteral("timelineVersion"), 1);
+    projectData_.state.remove(QStringLiteral("timelineFrameError"));
+    if (hasVideo() && mediaInfo_.cfrVerified && !timeline_.isEmpty()) {
+        QString error;
+        auto request = exportRequest(&error);
+        const auto &video = mediaInfo_.streams.at(mediaInfo_.videoStreamIndex);
+        request.frameRateNumerator = video.frameRateNumerator;
+        request.frameRateDenominator = video.frameRateDenominator;
+        const auto ranges = error.isEmpty() ? XmemlExporter::conformSourceRanges(request, &error) : QList<RoughCutSourceClip>{};
+        if (ranges.size() == timeline_.size()) {
+            const auto original = timeline_;
+            qint64 endSample = 0;
+            for (int i = 0; i < timeline_.size(); ++i) {
+                const qint64 gap = i == 0 ? 0 : std::max<qint64>(0, original[i].timelineStartSample
+                    - original[i - 1].timelineStartSample - original[i - 1].sourceEndSample + original[i - 1].sourceStartSample);
+                timeline_[i].sourceStartSample = ranges[i].sourceStartSample;
+                timeline_[i].sourceEndSample = ranges[i].sourceEndSample;
+                timeline_[i].timelineStartSample = endSample + gap;
+                endSample = timeline_[i].timelineStartSample + timeline_[i].sourceEndSample - timeline_[i].sourceStartSample;
+            }
+            projectData_.state.insert(QStringLiteral("timelineVersion"), 2);
+        } else projectData_.state.insert(QStringLiteral("timelineFrameError"), error);
+    }
     syncSceneItems();
     emit canExportChanged();
 }
@@ -1306,26 +1666,7 @@ void RoughCutController::markSaved()
 
 QByteArray RoughCutController::projectFingerprint() const
 {
-    QByteArray bytes;
-    QDataStream stream(&bytes, QIODevice::WriteOnly);
-    stream << mediaPath_ << scriptPath_ << scriptText_ << analysisVersion_;
-    const auto &recording = model_.recording();
-    const auto &decisions = model_.decisions();
-    stream << int(recording.size());
-    for (int index = 0; index < recording.size(); ++index) {
-        const RecognizedPassage &passage = recording.at(index);
-        stream << passage.id << passage.text << passage.startSample << passage.endSample;
-        if (index < decisions.size()) {
-            const RoughCutSegmentDecision &decision = decisions.at(index);
-            stream << int(decision.autoDecision)
-                   << (decision.userDecision ? int(*decision.userDecision) : -1)
-                   << decision.reason;
-        }
-    }
-    stream << int(auxiliaryResults_.size());
-    for (const RoughCutAuxiliaryResult &result : auxiliaryResults_)
-        stream << result.recordingIndex << result.funAsrText << result.conflict;
-    return bytes;
+    return RoughCutProjectSerializer::fingerprint(projectSnapshot());
 }
 
 void RoughCutController::finishJobWithoutResults(const QString &message)

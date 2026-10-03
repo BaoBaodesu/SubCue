@@ -9,8 +9,9 @@ ToolButton {
     padding: 7
     hoverEnabled: true
     Accessible.name: text
+    property string shortcutHint: action ? (action.keySequence || String(action.shortcut || "")) : ""
     ToolTip.visible: hovered
-    ToolTip.text: text
+    ToolTip.text: shortcutHint !== "" ? (text + "  " + shortcutHint) : text
     ToolTip.delay: 600
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fontSize
@@ -24,7 +25,8 @@ ToolButton {
 
     background: Rectangle {
         radius: Theme.radiusButton
-        border.width: 0
+        border.width: control.visualFocus ? 1 : 0
+        border.color: Theme.focusBorder
         color: control.down ? Theme.buttonPressed
              : control.hovered ? Theme.buttonHover
              : "transparent"

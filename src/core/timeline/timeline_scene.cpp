@@ -1,5 +1,7 @@
 #include "timeline/timeline_scene.h"
 
+#include <QtCore/QJsonValue>
+
 #include <algorithm>
 #include <cmath>
 
@@ -52,7 +54,7 @@ TimelineSceneLayout TimelineSceneBuilder::build(
         layout.ticks.push_back(tick);
     }
 
-    const double cueHeight = std::max(2.0, layout.subtitleTrack.height - metrics.cueVerticalPadding * 2.0);
+    const double cueHeight = std::max(2.0, std::min(metrics.cueLaneHeight, layout.subtitleTrack.height) - metrics.cueVerticalPadding * 2.0);
     const double cueY = layout.subtitleTrack.y + metrics.cueVerticalPadding;
     for (const Subtitle &cue : subtitles) {
         if (!cue.isTimed()) {
@@ -65,21 +67,47 @@ TimelineSceneLayout TimelineSceneBuilder::build(
         visual.id = cue.id;
         visual.text = cue.text;
         visual.selected = cue.id == selectedId;
-        visual.pending = cue.status == QStringLiteral("LOW_CONFIDENCE");
+        visual.pending = cue.status == QStringLiteral("REVIEW")
+            || cue.status == QStringLiteral("LOW_CONFIDENCE")
+            || cue.metadata.value(QStringLiteral("review")).toBool();
         visual.rect.x = viewport.xAtTime(cue.start);
-        visual.rect.y = cueY;
+        visual.overlapping = cue.metadata.value(QStringLiteral("displayOverlap")).toBool();
+        visual.rect.y = cueY + cue.metadata.value(QStringLiteral("displayLane")).toInt() * metrics.cueLaneHeight
+            - metrics.subtitleScrollOffset;
+        if (visual.rect.y + cueHeight <= layout.subtitleTrack.y || visual.rect.y >= layout.audioTrack.y) continue;
         visual.rect.width = std::max(2.0, viewport.xAtTime(cue.end) - visual.rect.x);
-        visual.rect.height = cueHeight;
+        visual.rect.height = std::min(visual.rect.y + cueHeight, layout.audioTrack.y) - std::max(visual.rect.y, layout.subtitleTrack.y);
+        visual.rect.y = std::max(visual.rect.y, layout.subtitleTrack.y);
         if (visual.selected) {
             layout.selectedCueRange.x = visual.rect.x;
             layout.selectedCueRange.y = layout.subtitleTrack.y;
             layout.selectedCueRange.width = visual.rect.width;
             layout.selectedCueRange.height = layout.subtitleTrack.height + layout.audioTrack.height;
         }
+        const QJsonValue sourceStart = cue.metadata.value(QStringLiteral("sourceStartUs"));
+        const QJsonValue sourceEnd = cue.metadata.value(QStringLiteral("sourceEndUs"));
+        if (sourceStart.isDouble() && sourceEnd.isDouble()
+            && sourceEnd.toInteger() > sourceStart.toInteger()) {
+            visual.audioBlock = true;
+            visual.waveformX = std::max(0.0, visual.rect.x);
+            visual.waveformWidth = std::max(0.0, std::min(width, visual.rect.x + visual.rect.width) - visual.waveformX);
+            if (waveform && visual.waveformWidth >= 1.0) {
+                const qint64 startUs = sourceStart.toInteger();
+                const qint64 durationUs = sourceEnd.toInteger() - startUs;
+                const double left = (visual.waveformX - visual.rect.x) / visual.rect.width;
+                const double right = (visual.waveformX + visual.waveformWidth - visual.rect.x) / visual.rect.width;
+                visual.waveform = waveform->peaksForRange(
+                    MediaTime::fromMicroseconds(startUs + static_cast<qint64>(durationUs * left)),
+                    MediaTime::fromMicroseconds(startUs + static_cast<qint64>(durationUs * right)),
+                    std::max(1, static_cast<int>(std::ceil(visual.waveformWidth))));
+            }
+        }
         layout.cues.push_back(std::move(visual));
     }
 
-    if (waveform && layout.audioTrack.height > 0.0 && width >= 1.0) {
+    const bool clipLocalWaveform = std::any_of(layout.cues.cbegin(), layout.cues.cend(),
+        [](const TimelineCueVisual &cue) { return cue.audioBlock; });
+    if (waveform && !clipLocalWaveform && layout.audioTrack.height > 0.0 && width >= 1.0) {
         const int columns = std::max(0, static_cast<int>(std::ceil(std::min(width,
             viewport.xAtTime(std::min(waveform->duration(), viewport.visibleEnd(width)))))));
         layout.waveform = waveform->peaksForRange(viewport.visibleStart(),
@@ -102,14 +130,18 @@ TimelineHit TimelineSceneBuilder::hitTest(
     const TimelineSceneLayout &layout, double x, double y, const TimelineSceneMetrics &metrics)
 {
     TimelineHit hit;
-    for (const TimelineCueVisual &cue : layout.cues) {
-        if (!contains(cue.rect, x, y)) {
+    for (auto it = layout.cues.crbegin(); it != layout.cues.crend(); ++it) {
+        const TimelineCueVisual &cue = *it;
+        const bool inAudioBlock = cue.audioBlock && containsX(cue.rect, x)
+            && y >= layout.audioTrack.y && y <= layout.audioTrack.y + layout.audioTrack.height;
+        if (!contains(cue.rect, x, y) && !inAudioBlock) {
             continue;
         }
         hit.cueId = cue.id;
-        if (x <= cue.rect.x + metrics.trimHandleWidth) {
+        const double handle = std::min(metrics.trimHandleWidth, cue.rect.width / 3.0);
+        if (metrics.editable && cue.rect.width >= 24.0 && x <= cue.rect.x + handle) {
             hit.kind = TimelineHitKind::CueTrimStart;
-        } else if (x >= cue.rect.x + cue.rect.width - metrics.trimHandleWidth) {
+        } else if (metrics.editable && cue.rect.width >= 24.0 && x >= cue.rect.x + cue.rect.width - handle) {
             hit.kind = TimelineHitKind::CueTrimEnd;
         } else {
             hit.kind = TimelineHitKind::CueBody;

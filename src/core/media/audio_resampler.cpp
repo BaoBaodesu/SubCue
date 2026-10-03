@@ -48,6 +48,11 @@ bool AudioResampler::configure(
     return true;
 }
 
+qint64 AudioResampler::delaySamples() const noexcept
+{
+    return context_ && sampleRate_ > 0 ? swr_get_delay(context_.get(), sampleRate_) : 0;
+}
+
 QVector<float> AudioResampler::convert(const AVFrame &frame, AppError *error)
 {
     if (!context_ || channels_ <= 0) {
@@ -69,7 +74,7 @@ QVector<float> AudioResampler::convert(const AVFrame &frame, AppError *error)
         context_.get(),
         output,
         maximumSamples,
-        const_cast<const uint8_t **>(frame.extended_data),
+        frame.nb_samples > 0 ? const_cast<const uint8_t **>(frame.extended_data) : nullptr,
         frame.nb_samples);
     if (converted < 0) {
         if (error) {

@@ -13,7 +13,8 @@ class RoughCutAudioTests final : public QObject {
 private slots:
     void detectsSpeechBeforeAsrInSourceCoordinates();
     void boundsContinuousSpeechSegments();
-    void exportsFloatWaveWithProtectedEdges();
+    void exportsOriginalPcmWithoutFades();
+    void exportsExactSampleRanges();
 };
 
 void RoughCutAudioTests::detectsSpeechBeforeAsrInSourceCoordinates()
@@ -43,7 +44,7 @@ void RoughCutAudioTests::boundsContinuousSpeechSegments()
         QVERIFY(segment.durationSamples() <= 49'000);
 }
 
-void RoughCutAudioTests::exportsFloatWaveWithProtectedEdges()
+void RoughCutAudioTests::exportsOriginalPcmWithoutFades()
 {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
@@ -58,7 +59,21 @@ void RoughCutAudioTests::exportsFloatWaveWithProtectedEdges()
     const QByteArray header = file.read(44);
     QCOMPARE(header.left(4), QByteArray("RIFF"));
     QCOMPARE(header.mid(8, 4), QByteArray("WAVE"));
+    QCOMPARE(header.mid(22, 2), QByteArray("\x01\x00", 2));
     QVERIFY(file.size() > 44);
+}
+
+void RoughCutAudioTests::exportsExactSampleRanges()
+{
+    QTemporaryDir directory;
+    const QString output = directory.filePath(QStringLiteral("exact.wav"));
+    QString error;
+    const QVector<RoughCutTimelineClip> clips{{1, 802, 0}, {2001, 2802, 1001}};
+    QVERIFY2(RoughCutWavExporter::save(output, QStringLiteral(SUBCUE_TEST_MEDIA_DIR "/audio.wav"),
+        clips, 48'000, 1, nullptr, &error, 0), qPrintable(error));
+    QFile file(output);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.size(), qint64(44 + 1802 * sizeof(float)));
 }
 
 QTEST_APPLESS_MAIN(RoughCutAudioTests)

@@ -4,11 +4,16 @@ import QtQuick.Controls
 // 顶部命令栏按钮：无大边框，仅 hover/pressed 底色变化。
 ToolButton {
     id: control
-    implicitHeight: 28
+    implicitHeight: 30
     leftPadding: 10
     rightPadding: 10
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fontSize
+    hoverEnabled: true
+    property string shortcutHint: action ? (action.keySequence || String(action.shortcut || "")) : ""
+    ToolTip.visible: hovered && shortcutHint !== ""
+    ToolTip.delay: 600
+    ToolTip.text: shortcutHint !== "" ? (text + "  " + shortcutHint) : text
 
     contentItem: Text {
         text: control.text
@@ -28,8 +33,8 @@ ToolButton {
              : control.highlighted ? Theme.selection
              : control.hovered ? Theme.menuButtonHover
              : "transparent"
-        border.width: control.highlighted ? 1 : 0
-        border.color: control.highlighted ? Theme.focusBorder : "transparent"
+        border.width: control.visualFocus || control.highlighted ? 1 : 0
+        border.color: control.visualFocus || control.highlighted ? Theme.focusBorder : "transparent"
 
         Rectangle {
             anchors.left: parent.left

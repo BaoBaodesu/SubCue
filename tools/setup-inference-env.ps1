@@ -20,7 +20,8 @@ if ((Get-FileHash -Algorithm SHA256 $torchWheel).Hash -ne
     throw "CUDA PyTorch wheel 校验失败"
 }
 uv pip install --python (Join-Path $environment "Scripts\python.exe") $torchWheel
-uv pip install --python (Join-Path $environment "Scripts\python.exe") "qwen-asr==0.0.6"
+uv pip install --python (Join-Path $environment "Scripts\python.exe") "torchaudio==2.6.0+cu124" --index-url "https://download.pytorch.org/whl/cu124"
+uv pip install --python (Join-Path $environment "Scripts\python.exe") "qwen-asr==0.0.6" "funasr==1.3.1"
 
 & (Join-Path $environment "Scripts\python.exe") -c @'
 import torch

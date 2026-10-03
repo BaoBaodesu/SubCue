@@ -109,12 +109,10 @@ ApplicationWindow {
             SubButton {
                 text: qsTr("取消")
                 DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
-                onClicked: exportNotice.reject()
             }
             PrimaryButton {
                 text: qsTr("导出")
                 DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
-                onClicked: exportNotice.accept()
             }
         }
         onAccepted: editor.exportSubtitles()
@@ -159,8 +157,13 @@ ApplicationWindow {
     function openMediaDialog() { mediaDialog.open() }
     function openScriptDialog() { scriptDialog.open() }
 
+    property string legacyDraftId: ""
+    property real legacyStartUs: -1
+    property real legacyEndUs: -1
+    function applyLegacyDraft() { return editor.applyCueEdit(legacyDraftId, cueTextEditor.text, legacyStartUs, legacyEndUs) }
     Connections {
         target: editor
+        function onCueDraftRequested(id, text, startUs, endUs) { window.legacyDraftId = id; window.legacyStartUs = startUs; window.legacyEndUs = endUs }
         function onScriptTextChanged() { sourceTabs.currentIndex = 1 }
         function onEditCueRequested(row, text) {
             cueEditorRow.text = String(row)
@@ -551,9 +554,9 @@ ApplicationWindow {
                             spacing: 2
                             Label { text: editor.formatTime(editor.positionMs); color: Theme.accent; font.family: "Consolas"; font.pixelSize: 11 }
                             Item { Layout.fillWidth: true }
-                            SubToolButton { objectName: "stepBack"; text: qsTr("上一帧"); icon.source: "icons/step-back.svg"; enabled: editor.hasMedia; onClicked: editor.stepFrames(-1) }
-                            SubToolButton { objectName: "playPause"; text: editor.playing ? qsTr("暂停") : qsTr("播放"); icon.source: editor.playing ? "icons/pause.svg" : "icons/play.svg"; enabled: editor.hasMedia; onClicked: editor.togglePlay() }
-                            SubToolButton { objectName: "stepForward"; text: qsTr("下一帧"); icon.source: "icons/step-forward.svg"; enabled: editor.hasMedia; onClicked: editor.stepFrames(1) }
+                            SubToolButton { objectName: "stepBack"; text: qsTr("上一帧"); shortcutHint: "Left"; icon.source: "icons/step-back.svg"; enabled: editor.hasMedia; onClicked: editor.stepFrames(-1) }
+                            SubToolButton { objectName: "playPause"; text: editor.playing ? qsTr("暂停") : qsTr("播放"); shortcutHint: "Space"; icon.source: editor.playing ? "icons/pause.svg" : "icons/play.svg"; enabled: editor.hasMedia; onClicked: editor.togglePlay() }
+                            SubToolButton { objectName: "stepForward"; text: qsTr("下一帧"); shortcutHint: "Right"; icon.source: "icons/step-forward.svg"; enabled: editor.hasMedia; onClicked: editor.stepFrames(1) }
                             SubComboBox {
                                 objectName: "playbackRateCombo"
                                 Layout.preferredWidth: 76
@@ -563,9 +566,9 @@ ApplicationWindow {
                                 onActivated: editor.setPlaybackRate(parseFloat(currentText))
                             }
                             Item { Layout.fillWidth: true }
-                            SubToolButton { text: qsTr("缩小时间轴"); icon.source: "icons/minus.svg"; enabled: editor.hasMedia; onClicked: editor.adjustZoomPercent(-10, timelineScene.width) }
+                            SubToolButton { text: qsTr("缩小时间轴"); shortcutHint: "-"; icon.source: "icons/minus.svg"; enabled: editor.hasMedia; onClicked: editor.adjustZoomPercent(-10, timelineScene.width) }
                             Label { objectName: "transportZoom"; text: editor.zoomPercent + "%"; color: Theme.secondaryText; font.pixelSize: 11; Layout.minimumWidth: 34; horizontalAlignment: Text.AlignHCenter }
-                            SubToolButton { text: qsTr("放大时间轴"); icon.source: "icons/plus.svg"; enabled: editor.hasMedia; onClicked: editor.adjustZoomPercent(10, timelineScene.width) }
+                            SubToolButton { text: qsTr("放大时间轴"); shortcutHint: "="; icon.source: "icons/plus.svg"; enabled: editor.hasMedia; onClicked: editor.adjustZoomPercent(10, timelineScene.width) }
                         }
                     }
                 }
@@ -826,9 +829,8 @@ ApplicationWindow {
                     if (event.key === Qt.Key_Escape) {
                         cueEditor.close()
                         event.accepted = true
-                    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                        editor.setCueText(Number(cueEditorRow.text), text)
-                        cueEditor.close()
+                    } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !inputMethodComposing && !(event.modifiers & Qt.ShiftModifier)) {
+                        if (window.applyLegacyDraft()) cueEditor.close()
                         event.accepted = true
                     }
                 }
@@ -839,8 +841,7 @@ ApplicationWindow {
                 PrimaryButton {
                     text: qsTr("保存")
                     onClicked: {
-                        editor.setCueText(Number(cueEditorRow.text), cueTextEditor.text)
-                        cueEditor.close()
+                        if (window.applyLegacyDraft()) cueEditor.close()
                     }
                 }
             }
@@ -1020,6 +1021,8 @@ ApplicationWindow {
     Shortcut { sequence: "Right"; enabled: !window.textEditing; onActivated: editor.stepFrames(1) }
     Shortcut { sequence: "Shift+Left"; enabled: !window.textEditing; onActivated: editor.stepFrames(-5) }
     Shortcut { sequence: "Shift+Right"; enabled: !window.textEditing; onActivated: editor.stepFrames(5) }
+    Shortcut { sequence: "Q"; enabled: !window.textEditing; onActivated: editor.setPreviousEnd() }
+    Shortcut { sequence: "W"; enabled: !window.textEditing; onActivated: editor.setFollowingStart() }
     Shortcut { sequence: "3"; enabled: !window.textEditing; onActivated: editor.setFollowingStart() }
     Shortcut { sequence: "4"; enabled: !window.textEditing; onActivated: editor.setPreviousEnd() }
     Shortcut { sequence: "T"; enabled: !window.textEditing; onActivated: editor.joinAroundPlayhead() }
@@ -1028,11 +1031,28 @@ ApplicationWindow {
     Shortcut { sequence: "C"; enabled: !window.textEditing; onActivated: editor.splitCurrentCue() }
     Shortcut { sequences: ["Return", "Enter"]; enabled: !window.textEditing; onActivated: editor.createOrEditCue() }
     Shortcut { sequences: ["Shift+Return", "Shift+Enter"]; enabled: !window.textEditing; onActivated: editor.createNextScriptCue() }
+    Shortcut { sequences: ["Ctrl+Return", "Ctrl+Enter"]; enabled: !window.textEditing; onActivated: editor.confirmCurrentCue() }
     Shortcut { sequence: "Up"; enabled: !window.textEditing; onActivated: editor.navigateCue(-1) }
     Shortcut { sequence: "Down"; enabled: !window.textEditing; onActivated: editor.navigateCue(1) }
     Shortcut { sequence: "Tab"; enabled: !window.textEditing; onActivated: editor.navigateCue(1) }
+    Shortcut { sequence: "Shift+Up"; enabled: !window.textEditing; onActivated: editor.navigatePendingCue(-1) }
+    Shortcut { sequence: "Shift+Down"; enabled: !window.textEditing; onActivated: editor.navigatePendingCue(1) }
+    Shortcut { sequence: "Ctrl+Up"; enabled: !window.textEditing; onActivated: editor.navigateMismatchCue(-1) }
+    Shortcut { sequence: "Ctrl+Down"; enabled: !window.textEditing; onActivated: editor.navigateMismatchCue(1) }
     Shortcut { sequence: "I"; enabled: !window.textEditing; onActivated: editor.setInPoint() }
     Shortcut { sequence: "O"; enabled: !window.textEditing; onActivated: editor.setOutPoint() }
+    Shortcut { sequence: "Shift+I"; enabled: !window.textEditing; onActivated: editor.seekToCurrentStart() }
+    Shortcut { sequence: "Shift+O"; enabled: !window.textEditing; onActivated: editor.seekToCurrentEnd() }
+    Shortcut { sequence: "Home"; enabled: !window.textEditing; onActivated: editor.seekToTimelineStart() }
+    Shortcut { sequence: "End"; enabled: !window.textEditing; onActivated: editor.seekToTimelineEnd() }
+    Shortcut { sequence: "Alt+Left"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentStart(-1) }
+    Shortcut { sequence: "Alt+Right"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentStart(1) }
+    Shortcut { sequence: "Alt+Shift+Left"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentEnd(-1) }
+    Shortcut { sequence: "Alt+Shift+Right"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentEnd(1) }
+    Shortcut { sequence: "Ctrl+Alt+Left"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentStart(-5) }
+    Shortcut { sequence: "Ctrl+Alt+Right"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentStart(5) }
+    Shortcut { sequence: "Ctrl+Alt+Shift+Left"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentEnd(-5) }
+    Shortcut { sequence: "Ctrl+Alt+Shift+Right"; enabled: !window.textEditing; onActivated: editor.nudgeCurrentEnd(5) }
     Shortcut { sequence: "Alt+I"; enabled: !window.textEditing; onActivated: editor.clearInPoint() }
     Shortcut { sequence: "Alt+O"; enabled: !window.textEditing; onActivated: editor.clearOutPoint() }
     Shortcut { sequence: "S"; enabled: !window.textEditing; onActivated: editor.toggleSnap() }

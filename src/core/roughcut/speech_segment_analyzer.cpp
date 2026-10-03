@@ -192,6 +192,9 @@ SpeechAnalysisResult SpeechSegmentAnalyzer::analyzeFile(
     FramePtr frame = makeFrame();
     if (!frame) return AppError(ErrorDomain::Decoder, AVERROR(ENOMEM), QStringLiteral("无法分配音频帧"));
     Detector detector(sourceSampleRate, sourceSampleCount, settings);
+    qint64 appended = 0;
+    qint64 nextSample = 0;
+    const QVector<float> silence(4096);
     bool draining = false;
     for (;;) {
         if (cancel && cancel->load()) return asrCancelledError();
@@ -199,6 +202,7 @@ SpeechAnalysisResult SpeechSegmentAnalyzer::analyzeFile(
         if (!draining) {
             packet = demuxer.readPacket(&error);
             if (!packet) {
+                if (error.code() != 0) return error;
                 draining = true;
                 const int sent = decoder.send(nullptr);
                 if (sent < 0 && sent != AVERROR_EOF) return makeFfmpegError(
@@ -214,13 +218,33 @@ SpeechAnalysisResult SpeechSegmentAnalyzer::analyzeFile(
         for (;;) {
             const int received = decoder.receive(frame.get());
             if (received == AVERROR(EAGAIN)) break;
-            if (received == AVERROR_EOF) return detector.finish();
-            if (received < 0) return makeFfmpegError(
+            if (received < 0 && received != AVERROR_EOF) return makeFfmpegError(
                 ErrorDomain::Decoder, received, QStringLiteral("音频解码失败"));
+            if (received != AVERROR_EOF && frame->best_effort_timestamp == AV_NOPTS_VALUE)
+                return AppError(ErrorDomain::Media, 1, QStringLiteral("音频缺少时间戳，无法建立源时间映射"));
+            const qint64 at = received == AVERROR_EOF ? nextSample
+                : av_rescale_q(frame->best_effort_timestamp, stream->time_base, AVRational{1, 16000}) - resampler.delaySamples();
+            if (received == AVERROR_EOF) av_frame_unref(frame.get());
             QVector<float> samples = resampler.convert(*frame, &error);
             av_frame_unref(frame.get());
-            if (samples.isEmpty()) return error;
-            detector.append(samples);
+            if (samples.isEmpty()) {
+                if (error.code() != 0) return error;
+                if (received == AVERROR_EOF) return detector.finish();
+                continue;
+            }
+            nextSample = at + samples.size();
+            // 固定缓冲补齐时间戳空洞，保证分析、播放及导出共用源坐标。
+            while (appended < at) {
+                if (cancel && cancel->load()) return asrCancelledError();
+                const qint64 count = std::min<qint64>(4096, at - appended);
+                detector.append(silence.first(count));
+                appended += count;
+            }
+            const qint64 skip = std::max<qint64>(0, appended - at);
+            if (skip < samples.size()) {
+                detector.append(samples.sliced(skip));
+                appended += samples.size() - skip;
+            }
         }
         if (draining) return detector.finish();
     }

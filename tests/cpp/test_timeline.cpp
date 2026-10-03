@@ -38,6 +38,7 @@ private slots:
     void viewportConvertsTimeAndPixel();
     void viewportZoomAnchorsPlayhead();
     void viewportZoomPercentIsClamped();
+    void viewportZoomStepsReturnTo100();
     void navigatorRangeKeepsPlayheadAndBounds();
     void viewportFitUsesMediaDuration();
     void viewportScrollIsClamped();
@@ -50,13 +51,15 @@ private slots:
     void dragPreviewDoesNotMutateDocument();
     void dragMoveSnapsAndCommitsViaCommand();
     void dragMoveCanCrossAnotherCue();
-    void dragTrimRespectsMinDurationAndNeighbors();
+    void dragMovePreservesNeighborsAndUndo();
+    void dragTrimRespectsMinDurationAndMediaBounds();
     void dragUndoRestoresOriginalTiming();
     void splitAtPlayheadAndUndo();
     void joinAroundPlayheadUsesSingleUndo();
     void sceneLayoutContainsOnlyVisibleCues();
     void sceneLayoutProjectsSelectedCueToAudioTrack();
     void sceneLayoutWaveformMatchesViewportWidth();
+    void sceneLayoutDrawsSourceRangeInsideAudioBlocks();
     void shortWaveformDoesNotStretchPastMedia();
     void sceneLayoutOmitsWaveformWithoutData();
     void rulerLabelFormatsMajorTicks();
@@ -120,6 +123,29 @@ void TimelineTests::viewportZoomPercentIsClamped()
     viewport.setZoomPercent(100, 200.0);
     QCOMPARE(viewport.pixelsPerMs(), 0.2);
     QCOMPARE(viewport.zoomPercent(), 200);
+}
+
+void TimelineTests::viewportZoomStepsReturnTo100()
+{
+    TimelineViewport viewport;
+    viewport.setDuration(MediaTime::fromMilliseconds(180'000));
+    viewport.setHasMedia(true);
+    viewport.setZoomPercent(100, 800.0);
+    QCOMPARE(viewport.zoomPercent(), 100);
+    for (int step = 0; step < 20; ++step) {
+        viewport.adjustZoomPercent(-10, 800.0);
+    }
+    QVERIFY(viewport.zoomPercent() < 100);
+    const int minimum = viewport.zoomPercent();
+    for (int step = 0; step < 40 && viewport.zoomPercent() < 100; ++step) {
+        viewport.adjustZoomPercent(10, 800.0);
+    }
+    QCOMPARE(viewport.zoomPercent(), 100);
+    viewport.adjustZoomPercent(-10, 800.0);
+    QCOMPARE(viewport.zoomPercent(), 90);
+    viewport.adjustZoomPercent(10, 800.0);
+    QCOMPARE(viewport.zoomPercent(), 100);
+    QVERIFY(minimum <= viewport.zoomPercent());
 }
 
 void TimelineTests::navigatorRangeKeepsPlayheadAndBounds()
@@ -399,11 +425,43 @@ void TimelineTests::dragMoveCanCrossAnotherCue()
 
     QVERIFY(editor.beginDrag(QStringLiteral("a"), CueDragMode::Move));
     QVERIFY(editor.updateDrag(MediaTime::fromMilliseconds(-500)));
-    QVERIFY(!editor.endDrag());
-    QCOMPARE(document.subtitle(QStringLiteral("a"))->start.milliseconds(), 1'400);
+    QVERIFY(editor.endDrag());
+    QCOMPARE(document.subtitle(QStringLiteral("a"))->start.milliseconds(), 900);
+    QCOMPARE(document.subtitle(QStringLiteral("b"))->start.milliseconds(), 700);
 }
 
-void TimelineTests::dragTrimRespectsMinDurationAndNeighbors()
+void TimelineTests::dragMovePreservesNeighborsAndUndo()
+{
+    SubtitleDocument document;
+    document.setSubtitles({
+        makeCue(QStringLiteral("1"), 0, 1'000),
+        makeCue(QStringLiteral("2"), 1'000, 2'000),
+        makeCue(QStringLiteral("3"), 2'000, 3'000),
+    });
+    SubtitleCommandManager commands(&document);
+    TimelineViewport viewport;
+    viewport.setDuration(MediaTime::fromMilliseconds(10'000));
+    SnapEngine snap;
+    snap.setEnabled(false);
+    TimelineEditor editor(&document, &commands, &viewport, &snap);
+
+    QVERIFY(editor.beginDrag(QStringLiteral("1"), CueDragMode::Move));
+    QVERIFY(editor.updateDrag(MediaTime::fromMilliseconds(1'600)));
+    QCOMPARE(editor.previewCue()->start.milliseconds(), 1'600);
+    QVERIFY(editor.endDrag());
+    QCOMPARE(document.subtitle(QStringLiteral("1"))->start.milliseconds(), 1'600);
+    QCOMPARE(document.subtitle(QStringLiteral("1"))->end.milliseconds(), 2'600);
+    QCOMPARE(document.subtitle(QStringLiteral("2"))->start.milliseconds(), 1'000);
+    QCOMPARE(document.subtitle(QStringLiteral("3"))->start.milliseconds(), 2'000);
+    commands.undo();
+    QCOMPARE(document.subtitle(QStringLiteral("1"))->start.milliseconds(), 0);
+    commands.redo();
+    QCOMPARE(document.subtitle(QStringLiteral("1"))->start.milliseconds(), 1'600);
+    QCOMPARE(document.subtitle(QStringLiteral("2"))->end.milliseconds(), 2'000);
+    QCOMPARE(document.subtitle(QStringLiteral("3"))->end.milliseconds(), 3'000);
+}
+
+void TimelineTests::dragTrimRespectsMinDurationAndMediaBounds()
 {
     SubtitleDocument document;
     document.setSubtitles({
@@ -436,6 +494,16 @@ void TimelineTests::dragTrimRespectsMinDurationAndNeighbors()
     QCOMPARE(document.subtitle(QStringLiteral("b"))->end.milliseconds()
                  - document.subtitle(QStringLiteral("b"))->start.milliseconds(),
              250);
+    document.setSubtitles({makeCue(QStringLiteral("a"), 0, 1'200),
+        makeCue(QStringLiteral("b"), 1'000, 2'000), makeCue(QStringLiteral("c"), 1'800, 3'000)});
+    QVERIFY(editor.beginDrag(QStringLiteral("b"), CueDragMode::TrimStart));
+    QVERIFY(editor.updateDrag(MediaTime::fromMilliseconds(-500)));
+    QCOMPARE(editor.previewCue()->start.milliseconds(), 1'000);
+    editor.cancelDrag();
+    QVERIFY(editor.beginDrag(QStringLiteral("b"), CueDragMode::TrimEnd));
+    QVERIFY(editor.updateDrag(MediaTime::fromMilliseconds(500)));
+    QCOMPARE(editor.previewCue()->end.milliseconds(), 2'000);
+    editor.cancelDrag();
 }
 
 void TimelineTests::dragUndoRestoresOriginalTiming()
@@ -569,6 +637,36 @@ void TimelineTests::sceneLayoutWaveformMatchesViewportWidth()
     QVERIFY(layout.waveform.front().min < 0.0f);
     QVERIFY(TimelineSceneBuilder::shouldDrawWaveform(layout));
     QVERIFY(TimelineSceneBuilder::shouldDrawAudioClip(layout));
+}
+
+void TimelineTests::sceneLayoutDrawsSourceRangeInsideAudioBlocks()
+{
+    std::vector<float> samples(8'000, 0.0f);
+    for (int index = 4'000; index < 8'000; ++index) samples[static_cast<size_t>(index)] = 0.9f;
+    const WaveformPyramid pyramid = WaveformPyramid::fromMonoFloat(samples.data(), 8'000, 8'000);
+    Subtitle cue = makeCue(QStringLiteral("kept"), 0, 100);
+    cue.metadata.insert(QStringLiteral("sourceStartUs"), qint64(500'000));
+    cue.metadata.insert(QStringLiteral("sourceEndUs"), qint64(1'000'000));
+    cue.metadata.insert(QStringLiteral("review"), true);
+    TimelineViewport viewport;
+    viewport.setDuration(MediaTime::fromMilliseconds(2'000));
+    viewport.setPixelsPerMs(1.0);
+    TimelineSceneMetrics metrics;
+    metrics.viewportWidth = 200.0;
+    metrics.viewportHeight = 160.0;
+    const TimelineSceneLayout layout = TimelineSceneBuilder::build(
+        viewport, {cue}, &pyramid, metrics, QStringLiteral("kept"));
+    QCOMPARE(layout.cues.size(), 1);
+    QVERIFY(layout.cues.front().audioBlock);
+    QVERIFY(layout.cues.front().pending);
+    QVERIFY(layout.waveform.isEmpty());
+    QVERIFY(!TimelineSceneBuilder::shouldDrawWaveform(layout));
+    QVERIFY(!layout.cues.front().waveform.isEmpty());
+    QVERIFY(layout.cues.front().waveform.front().max > 0.5f);
+    const TimelineHit audio = TimelineSceneBuilder::hitTest(
+        layout, layout.cues.front().rect.x + 20.0, layout.audioTrack.y + 8.0, metrics);
+    QCOMPARE(audio.kind, TimelineHitKind::CueBody);
+    QCOMPARE(audio.cueId, QStringLiteral("kept"));
 }
 
 void TimelineTests::shortWaveformDoesNotStretchPastMedia()

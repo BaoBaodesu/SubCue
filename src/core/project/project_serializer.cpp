@@ -1,4 +1,5 @@
 #include "project/project_serializer.h"
+#include "common/file_path_guard.h"
 
 #include <QtCore/QDir>
 #include <QtCore/QFile>
@@ -9,9 +10,40 @@
 #include <QtCore/QSet>
 
 #include <utility>
+#include <cmath>
 
 namespace subcue {
 namespace {
+
+bool validState(const QJsonObject &state, QString *errorMessage)
+{
+    for (const auto &key : {QStringLiteral("words"), QStringLiteral("assets")}) {
+        if (state.contains(key) && !state.value(key).isArray()) {
+            if (errorMessage) *errorMessage = QStringLiteral("工程状态字段无效：%1").arg(key);
+            return false;
+        }
+    }
+    QSet<qint64> ids;
+    for (const auto &value : state.value(QStringLiteral("words")).toArray()) {
+        const auto word = value.toObject();
+        const qint64 id = word.value(QStringLiteral("id")).toInteger(-1);
+        const qint64 start = word.value(QStringLiteral("startMs")).toInteger(-1);
+        const qint64 end = word.value(QStringLiteral("endMs")).toInteger(-1);
+        if (!value.isObject() || id < 0 || ids.contains(id) || start < 0 || end < start
+            || !word.value(QStringLiteral("text")).isString()) {
+            if (errorMessage) *errorMessage = QStringLiteral("工程词级证据范围或 ID 无效");
+            return false;
+        }
+        ids.insert(id);
+    }
+    for (const auto &value : state.value(QStringLiteral("assets")).toArray()) {
+        if (!value.isObject() || !value.toObject().value(QStringLiteral("path")).isString()) {
+            if (errorMessage) *errorMessage = QStringLiteral("工程素材引用无效");
+            return false;
+        }
+    }
+    return true;
+}
 
 QJsonObject subtitleToJson(const Subtitle &subtitle)
 {
@@ -27,6 +59,9 @@ QJsonObject subtitleToJson(const Subtitle &subtitle)
         {QStringLiteral("confidence"), subtitle.confidence},
         {QStringLiteral("source"), subtitle.source},
         {QStringLiteral("status"), subtitle.status},
+        {QStringLiteral("candidateText"), subtitle.candidateText},
+        {QStringLiteral("ambiguity"), subtitle.ambiguity},
+        {QStringLiteral("skipReason"), subtitle.skipReason},
         {QStringLiteral("wordIds"), wordIds},
         {QStringLiteral("metadata"), subtitle.metadata},
     };
@@ -49,7 +84,11 @@ std::optional<Subtitle> subtitleFromJson(const QJsonObject &object, QString *err
     if (wordIds.size() > 0 && wordIds.at(0).isDouble()) subtitle.startWordId = wordIds.at(0).toInteger();
     if (wordIds.size() > 1 && wordIds.at(1).isDouble()) subtitle.endWordId = wordIds.at(1).toInteger();
     subtitle.metadata = object.value(QStringLiteral("metadata")).toObject();
-    if (!subtitle.isValid()) {
+    subtitle.candidateText = object.value(QStringLiteral("candidateText")).toString();
+    subtitle.ambiguity = object.value(QStringLiteral("ambiguity")).toDouble(1.0);
+    subtitle.skipReason = object.value(QStringLiteral("skipReason")).toString();
+    if (!subtitle.isValid() || !std::isfinite(subtitle.confidence) || subtitle.confidence < 0 || subtitle.confidence > 1
+        || !std::isfinite(subtitle.ambiguity) || subtitle.ambiguity < 0 || subtitle.ambiguity > 1) {
         if (errorMessage) *errorMessage = QStringLiteral("工程中存在无效字幕：%1").arg(subtitle.id);
         return std::nullopt;
     }
@@ -65,8 +104,27 @@ QString relativeMediaPath(const QString &projectPath, const QString &mediaPath)
 
 } // namespace
 
-bool ProjectSerializer::save(const QString &path, const Project &project, QString *errorMessage)
+QByteArray ProjectSerializer::fingerprint(const Project &project)
 {
+    QJsonObject state = project.state;
+    state.remove(QStringLiteral("session"));
+    QJsonArray subtitles;
+    for (const SubtitleTrack &track : project.tracks) {
+        QJsonArray cues;
+        for (const Subtitle &cue : track.subtitles) cues.append(subtitleToJson(cue));
+        subtitles.append(QJsonObject{{QStringLiteral("id"), track.id},
+            {QStringLiteral("name"), track.name}, {QStringLiteral("metadata"), track.metadata},
+            {QStringLiteral("subtitles"), cues}});
+    }
+    return QJsonDocument(QJsonObject{{QStringLiteral("media"), project.mediaPath},
+        {QStringLiteral("state"), state}, {QStringLiteral("metadata"), project.metadata},
+        {QStringLiteral("tracks"), subtitles}}).toJson(QJsonDocument::Compact);
+}
+
+bool ProjectSerializer::save(const QString &path, const Project &project, QString *errorMessage, const std::atomic<bool> *cancel)
+{
+    if (!safeOutputPath(path, {project.mediaPath}, errorMessage)) return false;
+    if (!validState(project.state, errorMessage)) return false;
     QJsonArray tracks;
     QSet<QString> trackIds;
     QSet<QString> subtitleIds;
@@ -92,21 +150,45 @@ bool ProjectSerializer::save(const QString &path, const Project &project, QStrin
             {QStringLiteral("metadata"), track.metadata},
         });
     }
+    QJsonObject state = project.state;
+    if (state.contains(QStringLiteral("assets"))) {
+        QJsonArray assets;
+        for (const auto &value : state.value(QStringLiteral("assets")).toArray()) {
+            auto asset = value.toObject();
+            asset.insert(QStringLiteral("path"), relativeMediaPath(path, asset.value(QStringLiteral("path")).toString()));
+            assets.append(asset);
+        }
+        state.insert(QStringLiteral("assets"), assets);
+    }
     const QJsonObject root{
-        {QStringLiteral("schemaVersion"), 1},
+        {QStringLiteral("schemaVersion"), Project::CurrentSchemaVersion},
         {QStringLiteral("media"), QJsonObject{
             {QStringLiteral("path"), relativeMediaPath(path, project.mediaPath)},
             {QStringLiteral("fingerprint"), project.mediaFingerprint},
         }},
         {QStringLiteral("subtitleTracks"), tracks},
         {QStringLiteral("metadata"), project.metadata},
+        {QStringLiteral("state"), state},
     };
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly)) {
         if (errorMessage) *errorMessage = file.errorString();
         return false;
     }
-    if (file.write(QJsonDocument(root).toJson(QJsonDocument::Indented)) < 0 || !file.commit()) {
+    const QByteArray data = QJsonDocument(root).toJson(QJsonDocument::Indented);
+    if (cancel && cancel->load()) {
+        if (errorMessage) *errorMessage = QStringLiteral("工程保存已取消。");
+        return false;
+    }
+    if (file.write(data) != data.size()) {
+        if (errorMessage) *errorMessage = file.errorString();
+        return false;
+    }
+    if (cancel && cancel->load()) {
+        if (errorMessage) *errorMessage = QStringLiteral("工程保存已取消。");
+        return false;
+    }
+    if (!file.commit()) {
         if (errorMessage) *errorMessage = file.errorString();
         return false;
     }
@@ -127,11 +209,35 @@ std::optional<Project> ProjectSerializer::load(const QString &path, QString *err
         return std::nullopt;
     }
     const QJsonObject root = document.object();
-    if (root.value(QStringLiteral("schemaVersion")).toInt(-1) != 1) {
+    const int schema = root.value(QStringLiteral("schemaVersion")).toInt(-1);
+    if (schema < 1 || schema > Project::CurrentSchemaVersion
+        || !root.value(QStringLiteral("subtitleTracks")).isArray()) {
         if (errorMessage) *errorMessage = QStringLiteral("不支持的工程格式版本");
         return std::nullopt;
     }
+    if (schema >= 2 && !root.value(QStringLiteral("state")).isObject()) {
+        if (errorMessage) *errorMessage = QStringLiteral("工程状态缺失或无效");
+        return std::nullopt;
+    }
     Project project;
+    project.schemaVersion = schema;
+    project.state = root.value(QStringLiteral("state")).toObject();
+    if (!validState(project.state, errorMessage)) return std::nullopt;
+    if (project.state.contains(QStringLiteral("assets"))) {
+        QJsonArray assets;
+        for (const auto &value : project.state.value(QStringLiteral("assets")).toArray()) {
+            auto asset = value.toObject();
+            if (!value.isObject() || !asset.value(QStringLiteral("path")).isString()) {
+                if (errorMessage) *errorMessage = QStringLiteral("工程素材引用无效");
+                return std::nullopt;
+            }
+            const QString stored = asset.value(QStringLiteral("path")).toString();
+            asset.insert(QStringLiteral("path"), stored.isEmpty() ? QString()
+                : QDir::cleanPath(QFileInfo(path).absoluteDir().absoluteFilePath(stored)));
+            assets.append(asset);
+        }
+        project.state.insert(QStringLiteral("assets"), assets);
+    }
     const QJsonObject media = root.value(QStringLiteral("media")).toObject();
     const QString storedPath = media.value(QStringLiteral("path")).toString();
     if (!storedPath.isEmpty()) {
@@ -158,6 +264,10 @@ std::optional<Project> ProjectSerializer::load(const QString &path, QString *err
             return std::nullopt;
         }
         trackIds.insert(track.id);
+        if (!trackObject.value(QStringLiteral("subtitles")).isArray()) {
+            if (errorMessage) *errorMessage = QStringLiteral("字幕轨内容缺失或无效");
+            return std::nullopt;
+        }
         const QJsonArray subtitles = trackObject.value(QStringLiteral("subtitles")).toArray();
         for (const QJsonValue &value : subtitles) {
             if (!value.isObject()) {

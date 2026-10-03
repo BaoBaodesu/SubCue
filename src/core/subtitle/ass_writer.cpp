@@ -81,7 +81,7 @@ bool AssWriter::save(const QString &path, const QList<Subtitle> &subtitles, int 
     }
     const QByteArray data = QByteArray::fromHex("EFBBBF")
         + build(subtitles, width, height, settings).toUtf8();
-    if (file.write(data) < 0 || !file.commit()) {
+    if (file.write(data) != data.size() || !file.commit()) {
         if (errorMessage) *errorMessage = file.errorString();
         return false;
     }

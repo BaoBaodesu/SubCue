@@ -5,6 +5,7 @@
 
 #include <QtCore/QByteArray>
 #include <QtCore/QString>
+#include <QtCore/QJsonObject>
 
 #include <atomic>
 #include <functional>
@@ -13,7 +14,8 @@
 namespace subcue {
 
 struct RoughCutProject final {
-    int schemaVersion = 1;
+    static constexpr int CurrentSchemaVersion = 6;
+    int schemaVersion = CurrentSchemaVersion;
     int analysisVersion = 1;
     QString mediaPath;
     QByteArray mediaSha256;
@@ -25,16 +27,18 @@ struct RoughCutProject final {
     QVector<RecognizedPassage> recording;
     QVector<RoughCutSegmentDecision> decisions;
     QVector<RoughCutAuxiliaryResult> auxiliaryResults;
+    QJsonObject state;
 };
 
 class RoughCutProjectSerializer final {
 public:
+    [[nodiscard]] static QByteArray fingerprint(const RoughCutProject &project);
     [[nodiscard]] static QByteArray mediaSha256(const QString &path,
                                                 QString *errorMessage = nullptr,
                                                 const std::atomic<bool> *cancel = nullptr,
                                                 const std::function<void(qint64, qint64)> &progress = {});
     [[nodiscard]] static bool save(const QString &path, const RoughCutProject &project,
-                                   QString *errorMessage = nullptr);
+                                   QString *errorMessage = nullptr, const std::atomic<bool> *cancel = nullptr);
     [[nodiscard]] static std::optional<RoughCutProject> load(
         const QString &path, QString *errorMessage = nullptr);
 };

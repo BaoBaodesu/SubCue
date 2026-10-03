@@ -1,3 +1,6 @@
+#include "inference/inference_manager.h"
+#include <thread>
+#include <QtCore/QThread>
 #include "asr/asr_provider_factory.h"
 #include "asr/audio_chunk_extractor.h"
 #include "asr/audio_chunk_plan.h"
@@ -122,6 +125,7 @@ private slots:
     void factoryKeepsDashScopeDefault();
     void localModelRejectsIncompleteWeight();
     void modelLocatorPrefersSettingsThenEnv();
+    void inferenceQueueCanBeCancelled();
     void modelLocatorMigratesLegacyDirectories();
     void localModelsAtConfiguredRootAreReady();
     void inferenceManagerContainsWorkerFailure();
@@ -381,6 +385,19 @@ void AsrTests::localModelRejectsIncompleteWeight()
     QVERIFY(LocalPythonAsrService::modelReady(directory.path()));
 }
 
+void AsrTests::inferenceQueueCanBeCancelled()
+{
+    auto lease = InferenceManager::instance().acquire();
+    std::atomic<bool> cancel = false;
+    InferenceProcessResult result;
+    std::thread waiting([&] { result = InferenceManager::instance().run(QStringLiteral("unused"), {}, {}, &cancel, 1000); });
+    QThread::msleep(100);
+    cancel = true;
+    waiting.join();
+    QVERIFY(result.cancelled);
+    QVERIFY(!result.started);
+}
+
 void AsrTests::modelLocatorPrefersSettingsThenEnv()
 {
     QTemporaryDir settingsRoot;
@@ -397,6 +414,14 @@ void AsrTests::modelLocatorPrefersSettingsThenEnv()
     QCOMPARE(QDir::cleanPath(ModelLocator::root(settings)), QDir::cleanPath(settingsRoot.path()));
     QCOMPARE(ModelLocator::directoryFor(ModelKind::Qwen3Asr, settings),
         QDir(settingsRoot.path()).filePath(QStringLiteral("qwen3-asr-0.6b")));
+
+    qputenv("SUBCUE_MODELS_ROOT", QFile::encodeName(envRoot.path()));
+    QJsonObject missing{{QStringLiteral("modelsRoot"),
+        QDir(settingsRoot.path()).filePath(QStringLiteral("missing-models"))}};
+    QCOMPARE(QDir::cleanPath(ModelLocator::root(missing)), missing.value(QStringLiteral("modelsRoot")).toString());
+    QVERIFY(!QDir(ModelLocator::root(missing)).exists());
+    if (previous.isEmpty()) qunsetenv("SUBCUE_MODELS_ROOT");
+    else qputenv("SUBCUE_MODELS_ROOT", previous);
 }
 
 void AsrTests::modelLocatorMigratesLegacyDirectories()
@@ -469,6 +494,8 @@ void AsrTests::extractorWritesFlacAndPcm()
             ? std::get<AppError>(pcm).userMessage()
             : QString()));
     QVERIFY(!std::get<QVector<float>>(pcm).isEmpty());
+    // 1 秒 44.1 kHz 素材完整重采样后必须保留 16000 个样本，包括尾部滤波延迟。
+    QCOMPARE(std::get<QVector<float>>(pcm).size(), qsizetype(16'000));
 
     MediaResult<QByteArray> flac = AudioChunkExtractor::encodeFlac(std::get<QVector<float>>(pcm));
     QVERIFY2(std::holds_alternative<QByteArray>(flac),

@@ -14,7 +14,7 @@ public:
         const QString &path, const QString &sourcePath,
         const QVector<RoughCutTimelineClip> &clips, int sampleRate, int channels,
         const std::atomic<bool> *cancel = nullptr, QString *errorMessage = nullptr,
-        int fadeMs = 8);
+        int fadeMs = 0);
 };
 
 } // namespace subcue

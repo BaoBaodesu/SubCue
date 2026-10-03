@@ -10,8 +10,15 @@
 #include <QtCore/QElapsedTimer>
 #include <QtGui/QFont>
 #include <QtGui/QHoverEvent>
+#include <QtGui/QKeyEvent>
+#include <QtCore/QTimer>
+#include <QtCore/QHash>
+#include <QtCore/QSet>
+#include <QtCore/QVariantMap>
+#include <atomic>
 #include <QtGui/QTextLayout>
 #include <QtQml/qqmlregistration.h>
+#include <QtQml/QJSValue>
 #include <QtQuick/QQuickItem>
 
 #include <memory>
@@ -36,10 +43,29 @@ class TimelineSceneItem : public QQuickItem {
     Q_PROPERTY(QString selectedCueId READ selectedCueId WRITE setSelectedCueId NOTIFY selectedCueIdChanged)
     Q_PROPERTY(int followDirection READ followDirection WRITE setFollowDirection NOTIFY followDirectionChanged)
     Q_PROPERTY(bool viewportInteracting MEMBER viewportInteracting_)
+    Q_PROPERTY(bool editable READ editable WRITE setEditable NOTIFY editableChanged)
+    Q_PROPERTY(double subtitleScrollOffset READ subtitleScrollOffset WRITE setSubtitleScrollOffset NOTIFY viewChanged)
+    Q_PROPERTY(double subtitleContentHeight READ subtitleContentHeight NOTIFY viewChanged)
+    Q_PROPERTY(double subtitleViewportHeight READ subtitleViewportHeight NOTIFY viewChanged)
+    Q_PROPERTY(QVariantMap dragPreview READ dragPreview NOTIFY dragPreviewChanged)
+    Q_PROPERTY(QVariantMap hoveredCue READ hoveredCue NOTIFY hoveredCueChanged)
+    Q_PROPERTY(QJSValue interactionGuard READ interactionGuard WRITE setInteractionGuard)
 
 public:
     explicit TimelineSceneItem(QQuickItem *parent = nullptr);
 
+    QJSValue interactionGuard() const { return interactionGuard_; }
+    void setInteractionGuard(const QJSValue &guard) { interactionGuard_ = guard; }
+    bool editable() const { return editable_; }
+    void setEditable(bool value);
+    double subtitleScrollOffset() const { return subtitleScrollOffset_; }
+    void setSubtitleScrollOffset(double value);
+    double subtitleContentHeight() const { return laneCount_ * 54.0; }
+    double subtitleViewportHeight() const;
+    QVariantMap hoveredCue() const;
+    QVariantMap dragPreview() const;
+    Q_INVOKABLE QVariantMap renderStats() const;
+    Q_INVOKABLE void cancelCueDrag();
     [[nodiscard]] qint64 durationUs() const noexcept;
     void setDurationUs(qint64 value);
 
@@ -68,7 +94,8 @@ public:
     [[nodiscard]] QString selectedCueId() const;
     void setSelectedCueId(const QString &id);
 
-    Q_INVOKABLE void addCue(const QString &id, qint64 startUs, qint64 endUs, const QString &text);
+    Q_INVOKABLE void addCue(const QString &id, qint64 startUs, qint64 endUs, const QString &text,
+        qint64 sourceStartUs = -1, qint64 sourceEndUs = -1, bool review = false);
     Q_INVOKABLE void clearCues();
     Q_INVOKABLE void fit();
     Q_INVOKABLE int visibleCueCount() const;
@@ -76,7 +103,8 @@ public:
     enum PaintDirty : quint8 {
         PaintNone = 0,
         PaintPlayhead = 1,
-        PaintGeometry = 2
+        PaintGeometry = 2,
+        PaintAppearance = 4
     };
     [[nodiscard]] quint8 pendingPaintDirty() const noexcept { return dirty_; }
     void consumePaintDirtyForTest() noexcept { dirty_ = PaintNone; }
@@ -86,6 +114,9 @@ public:
     void setPreviewCue(std::optional<Subtitle> cue);
 
 signals:
+    void editableChanged();
+    void hoveredCueChanged();
+    void dragPreviewChanged();
     void durationUsChanged();
     void playheadUsChanged();
     void rangeChanged();
@@ -100,6 +131,8 @@ signals:
 
 protected:
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
@@ -129,7 +162,8 @@ private:
     };
 
     [[nodiscard]] TimelineSceneMetrics metrics() const;
-    [[nodiscard]] TimelineSceneLayout currentLayout() const;
+    [[nodiscard]] TimelineSceneLayout currentLayout(bool sampleWaveform = true) const;
+    void refreshAppearance();
     void refresh();
     void refreshPlayhead();
     void rebuildCueIndex();
@@ -141,6 +175,22 @@ private:
 
     TimelineViewport viewport_;
     bool draggingCue_ = false;
+    bool editable_ = true;
+    QJSValue interactionGuard_;
+    QString pressedCueId_;
+    int pressedMode_ = 0;
+    double lastDragX_ = 0.0;
+    double dragScrollStart_ = 0.0;
+    QTimer dragScrollTimer_;
+    QHash<QString, int> cueLanes_;
+    QHash<QString, int> cueRows_;
+    QVector<QVector<int>> laneCueOrder_;
+    QSet<QString> overlappingIds_;
+    int laneCount_ = 1;
+    double subtitleScrollOffset_ = 0.0;
+    std::atomic<quint64> geometryBuildCount_{0};
+    std::atomic<quint64> textBuildCount_{0};
+    std::atomic<quint64> waveformBuildCount_{0};
     int followDirection_ = 0;
     bool viewportInteracting_ = false;
     QElapsedTimer wheelInteraction_;

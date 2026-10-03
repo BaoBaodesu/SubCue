@@ -27,7 +27,8 @@ bool SrtWriter::save(const QString &path, const QList<Subtitle> &subtitles, QStr
         if (errorMessage) *errorMessage = file.errorString();
         return false;
     }
-    if (file.write(build(subtitles).toUtf8()) < 0 || !file.commit()) {
+    const QByteArray data = build(subtitles).toUtf8();
+    if (file.write(data) != data.size() || !file.commit()) {
         if (errorMessage) *errorMessage = file.errorString();
         return false;
     }

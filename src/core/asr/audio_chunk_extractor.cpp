@@ -169,45 +169,66 @@ MediaResult<QVector<float>> AudioChunkExtractor::decodePcm16kMono(
 
     QVector<float> samples;
     const qint64 windowEndUs = static_cast<qint64>(window.endSeconds * 1'000'000.0);
+    qint64 nextSample = 0;
+    bool draining = false;
     while (!asrCancelled(cancel)) {
-        PacketPtr packet = demuxer.readPacket(&error);
-        if (!packet) {
-            break;
+        int result = 0;
+        if (!draining) {
+            PacketPtr packet = demuxer.readPacket(&error);
+            if (!packet) {
+                if (error.code() != 0) return error;
+                draining = true;
+                result = decoder.send(nullptr);
+            } else {
+                if (packet->stream_index != streamIndex) continue;
+                result = decoder.send(packet.get());
+            }
         }
-        if (packet->stream_index != streamIndex) {
-            continue;
-        }
-        int result = decoder.send(packet.get());
-        if (result < 0 && result != AVERROR(EAGAIN)) {
+        if (result < 0 && result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
             return makeFfmpegError(ErrorDomain::Decoder, result, QStringLiteral("提交音频数据失败"));
         }
-        while (result >= 0) {
+        for (;;) {
             result = decoder.receive(frame.get());
-            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
+            if (result == AVERROR(EAGAIN)) {
                 break;
             }
-            if (result < 0) {
+            if (result < 0 && result != AVERROR_EOF) {
                 return makeFfmpegError(ErrorDomain::Decoder, result, QStringLiteral("音频解码失败"));
             }
-            const MediaTime frameStart = mediaTimeFromTimestamp(frame->best_effort_timestamp, stream->time_base);
+            if (result != AVERROR_EOF && frame->best_effort_timestamp == AV_NOPTS_VALUE)
+                return AppError(ErrorDomain::Media, 1, QStringLiteral("音频缺少时间戳，无法建立源时间映射"));
+            const qint64 frameStartSample = result == AVERROR_EOF ? nextSample
+                : av_rescale_q(frame->best_effort_timestamp, stream->time_base, AVRational{1, kAsrSampleRate}) - resampler.delaySamples();
+            const MediaTime frameStart = MediaTime::fromMicroseconds(
+                av_rescale_q(frameStartSample, AVRational{1, kAsrSampleRate}, kMicrosecondTimeBase));
             if (frameStart.microseconds() >= windowEndUs && window.endSeconds > window.startSeconds) {
                 av_frame_unref(frame.get());
                 return samples;
             }
+            if (result == AVERROR_EOF) av_frame_unref(frame.get());
             QVector<float> converted = resampler.convert(*frame, &error);
-            const qint64 frameStartUs = frameStart.microseconds() >= 0 ? frameStart.microseconds() : 0;
+            const qint64 frameStartUs = frameStart.microseconds();
             av_frame_unref(frame.get());
             if (converted.isEmpty()) {
-                return error;
+                if (error.code() != 0) return error;
+                if (result == AVERROR_EOF) return samples;
+                continue;
             }
+            nextSample = frameStartSample + converted.size();
             qsizetype skipSamples = 0;
             qsizetype keepSamples = 0;
             trimConvertedSamples(converted.size(), frameStartUs, window, skipSamples, keepSamples);
             if (keepSamples <= 0) {
                 continue;
             }
-            samples.append(converted.cbegin() + skipSamples, converted.cbegin() + skipSamples + keepSamples);
+            const qint64 at = std::max<qint64>(0, frameStartSample + skipSamples
+                - qRound64(window.startSeconds * 16000));
+            if (at > samples.size()) samples.resize(at);
+            const qint64 overlap = std::max<qint64>(0, samples.size() - at);
+            if (overlap < keepSamples)
+                samples.append(converted.cbegin() + skipSamples + overlap, converted.cbegin() + skipSamples + keepSamples);
         }
+        if (draining) break;
     }
     if (asrCancelled(cancel)) {
         return cancelError();

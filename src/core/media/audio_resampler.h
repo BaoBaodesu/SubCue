@@ -16,6 +16,7 @@ public:
         AppError *error = nullptr);
     [[nodiscard]] QVector<float> convert(const AVFrame &frame, AppError *error = nullptr);
 
+    [[nodiscard]] qint64 delaySamples() const noexcept;
     [[nodiscard]] int sampleRate() const noexcept { return sampleRate_; }
     [[nodiscard]] int channels() const noexcept { return channels_; }
 

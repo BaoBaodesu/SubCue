@@ -9,6 +9,7 @@ namespace subcue {
 struct WaveformPeak final {
     float min = 0.0f;
     float max = 0.0f;
+    bool operator==(const WaveformPeak &) const = default;
 };
 
 struct WaveformLevel final {
