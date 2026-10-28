@@ -24,7 +24,8 @@ void applyHeaders(QNetworkRequest &networkRequest, const HttpRequest &request, q
     }
     networkRequest.setAttribute(
         QNetworkRequest::RedirectPolicyAttribute,
-        QNetworkRequest::NoLessSafeRedirectPolicy);
+        request.followRedirects && !networkRequest.hasRawHeader(QByteArrayLiteral("Authorization"))
+            ? QNetworkRequest::NoLessSafeRedirectPolicy : QNetworkRequest::ManualRedirectPolicy);
     networkRequest.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
     if (request.transferTimeoutMs > 0) {
         networkRequest.setTransferTimeout(request.transferTimeoutMs);
@@ -92,6 +93,10 @@ std::variant<HttpResponse, AppError> QtNetworkHttpClient::send(
     }
     QNetworkAccessManager manager;
     QNetworkReply *reply = startReply(manager, request, 0);
+    if (request.maxResponseBytes > 0) {
+        reply->setReadBufferSize(request.maxResponseBytes + 1);
+        QObject::connect(reply, &QNetworkReply::readyRead, reply, [reply, limit = request.maxResponseBytes] { if (reply->bytesAvailable() > limit) reply->abort(); });
+    }
     if (!waitForReply(reply, cancel, request.connectTimeoutMs)) {
         reply->deleteLater();
         return asrCancelledError();
@@ -134,6 +139,8 @@ std::variant<qint64, AppError> QtNetworkHttpClient::download(
 
     QNetworkAccessManager manager;
     QNetworkReply *reply = startReply(manager, request, resumeFrom);
+    reply->setReadBufferSize(64 * 1024);
+    bool writeFailed = false;
     qint64 received = resumeFrom;
     qint64 total = -1;
     bool restarted = false;
@@ -154,7 +161,7 @@ std::variant<qint64, AppError> QtNetworkHttpClient::download(
                 progress(received, total);
             }
         });
-    QObject::connect(reply, &QNetworkReply::readyRead, reply, [reply, output, &restarted, resumeFrom]() {
+    QObject::connect(reply, &QNetworkReply::readyRead, reply, [reply, output, &restarted, resumeFrom, &writeFailed, limit = request.maxDownloadBytes]() {
         if (restarted && resumeFrom > 0 && output->pos() != 0) {
             output->seek(0);
             output->resize(0);
@@ -162,7 +169,7 @@ std::variant<qint64, AppError> QtNetworkHttpClient::download(
         }
         const QByteArray chunk = reply->readAll();
         if (!chunk.isEmpty()) {
-            output->write(chunk);
+            if ((limit > 0 && output->pos() + chunk.size() > limit) || output->write(chunk) != chunk.size()) { writeFailed = true; reply->abort(); }
         }
     });
 
@@ -170,6 +177,7 @@ std::variant<qint64, AppError> QtNetworkHttpClient::download(
         reply->deleteLater();
         return asrCancelledError();
     }
+    if (writeFailed) { reply->deleteLater(); return httpFailure(QStringLiteral("下载写入失败或超过文件大小限制"), output->errorString()); }
     if (reply->error() == QNetworkReply::OperationCanceledError) {
         const QByteArray trailing = reply->readAll();
         if (!trailing.isEmpty()) {
@@ -181,7 +189,7 @@ std::variant<qint64, AppError> QtNetworkHttpClient::download(
 
     const QByteArray trailing = reply->readAll();
     if (!trailing.isEmpty()) {
-        output->write(trailing);
+        if ((request.maxDownloadBytes > 0 && output->pos() + trailing.size() > request.maxDownloadBytes) || output->write(trailing) != trailing.size()) { reply->deleteLater(); return httpFailure(QStringLiteral("下载写入失败或超过文件大小限制"), output->errorString()); }
     }
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     const QNetworkReply::NetworkError error = reply->error();

@@ -220,18 +220,8 @@ OmniCompleteResult AiReviewService::completeWithRetry(
         const OmniChatResponse &response = std::get<OmniChatResponse>(first);
         if (!response.arguments.isEmpty()) return first;
     }
-    if (std::holds_alternative<AppError>(first)
-        && isFatalOmniError(std::get<AppError>(first))) {
-        return first;
-    }
-    qCWarning(subcueAiLog) << "omni_review retrying structured parse"
-        << "provider=" << provider_.providerId()
-        << "model=" << provider_.model();
-    OmniCompleteResult retry = provider_.complete(request, cancel);
-    if (std::holds_alternative<OmniChatResponse>(retry)) {
-        recordChatResponse(std::get<OmniChatResponse>(retry));
-    }
-    return retry;
+    // 付费请求结果未知时不自动重发，由用户明确重试。
+    return first;
 }
 
 SubtitleOmniResult AiReviewService::reviewSubtitles(

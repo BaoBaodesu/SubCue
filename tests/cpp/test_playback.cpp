@@ -9,6 +9,8 @@
 #include "playback/playback_engine.h"
 #include "playback/seek_controller.h"
 #include "playback/video_scheduler.h"
+#include "playback/audio_device.h"
+#include "tts/audio_quality.h"
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
@@ -17,10 +19,30 @@
 
 using namespace subcue;
 
+class CapturingAudioDevice final : public IAudioDevice {
+public:
+    AudioSampleProvider provider;
+    bool started = false;
+    QString backendId() const override { return QStringLiteral("capture-test"); }
+    int preferredSampleRate() const override { return 0; }
+    bool start(int, int, AppError *) override { started = true; return true; }
+    void stop() override { started = false; }
+    void pause() override {}
+    void resume() override {}
+    void setPlaybackRate(double) override {}
+    void setSampleProvider(AudioSampleProvider value) override { provider = std::move(value); }
+    void flushResampler() override {}
+    qint64 renderFrame() override { return 0; }
+    bool isStarted() const override { return started; }
+    bool isHardware() const override { return false; }
+};
+
 class PlaybackTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    void audioEndDrainsResamplerAndDeviceBuffer();
+    void previewGainChangesOutputSamplesOnly();
     void audioClockUsesFirstPtsConsumedSamplesAndBuffer();
     void audioClockPauseResumeDoesNotJump();
     void audioOutputRejectsStaleGeneration();
@@ -43,6 +65,53 @@ private:
 QString PlaybackTests::mediaPath(const QString &name) const
 {
     return QDir(QString::fromUtf8(SUBCUE_TEST_MEDIA_DIR)).filePath(name);
+}
+void PlaybackTests::previewGainChangesOutputSamplesOnly()
+{
+    const auto source = AudioQuality::inspect(mediaPath(QStringLiteral("audio.wav"))); QVERIFY(source);
+    QVector<QVector<float>> outputs;
+    for (const float gain : {1.0f, 0.25f, 0.0f}) {
+        CapturingAudioDevice device; PlaybackEngine engine; AppError error(ErrorDomain::Media, 0, {});
+        QVERIFY(engine.open(mediaPath(QStringLiteral("audio.wav")), &error));
+        QVERIFY(device.start(engine.outputSampleRate(), engine.outputChannels(), &error));
+        engine.setOutputGain(gain); engine.setAudioDevice(&device, 1); engine.play();
+        engine.primeAudio(); QVERIFY(device.provider);
+        QVector<float> output(1024 * engine.outputChannels());
+        const auto frames = device.provider(output.data(), 1024); QVERIFY(frames > 0);
+        output.resize(frames * engine.outputChannels()); outputs.append(output); engine.close();
+    }
+    QCOMPARE(outputs[0].size(), outputs[1].size()); QCOMPARE(outputs[0].size(), outputs[2].size());
+    bool audible = false;
+    for (qsizetype i = 0; i < outputs[0].size(); ++i) {
+        audible |= std::abs(outputs[0][i]) > 0.001f;
+        QVERIFY(std::abs(outputs[1][i] - outputs[0][i] * 0.25f) < 0.000001f);
+        QCOMPARE(outputs[2][i], 0.0f);
+    }
+    QVERIFY(audible);
+    const auto after = AudioQuality::inspect(mediaPath(QStringLiteral("audio.wav"))); QVERIFY(after); QCOMPARE(after->sha256, source->sha256);
+}
+
+void PlaybackTests::audioEndDrainsResamplerAndDeviceBuffer()
+{
+    const auto quality = AudioQuality::inspect(mediaPath(QStringLiteral("audio.wav"))); QVERIFY(quality);
+    VirtualAudioDevice device;
+    PlaybackEngine engine; AppError error(ErrorDomain::Media, 0, {});
+    QVERIFY(engine.open(mediaPath(QStringLiteral("audio.wav")), &error));
+    QVERIFY(device.start(engine.outputSampleRate(), engine.outputChannels(), &error));
+    engine.setAudioDevice(&device, 1); engine.play();
+    device.pause();
+    QElapsedTimer timer; timer.start();
+    while (!engine.audioFinished() && timer.elapsed() < 8000) {
+        const bool priming = engine.isPriming(); engine.pump();
+        if (priming && !engine.isPriming()) device.resume();
+        if (!engine.isPriming()) (void)device.renderFrame();
+        engine.pump(); QTest::qWait(2);
+    }
+    QVERIFY(engine.audioFinished());
+    QCOMPARE(engine.audioOutput().writtenSamples(), av_rescale(quality->sampleCount, engine.outputSampleRate(), quality->sampleRate));
+    QCOMPARE(engine.audioOutput().consumedSamples(), engine.audioOutput().writtenSamples());
+    engine.close(); engine.setAudioDevice(nullptr, 0); device.stop();
+    QVERIFY(!engine.isOpen()); QVERIFY(!engine.audioFinished());
 }
 
 void PlaybackTests::audioClockUsesFirstPtsConsumedSamplesAndBuffer()

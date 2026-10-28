@@ -39,6 +39,8 @@ public:
                                                 const std::function<void(qint64, qint64)> &progress = {});
     [[nodiscard]] static bool save(const QString &path, const RoughCutProject &project,
                                    QString *errorMessage = nullptr, const std::atomic<bool> *cancel = nullptr);
+    [[nodiscard]] static bool save(const QString &path, const RoughCutProject &project,
+        QString *errorMessage, const std::atomic<bool> *cancel, QByteArray *committedSha256);
     [[nodiscard]] static std::optional<RoughCutProject> load(
         const QString &path, QString *errorMessage = nullptr);
 };

@@ -215,6 +215,7 @@ ApplicationWindow {
             MenuButton { text: qsTr("自动打轴"); enabled: !editor.busy; onClicked: editor.startAlignment() }
             MenuButton { text: qsTr("取消"); enabled: editor.busy; onClicked: editor.cancelAlignment() }
             MenuButton { text: qsTr("ASR 复核"); enabled: editor.canReview && !editor.busy; onClicked: editor.startReview() }
+            CloudTaskMenu { cloud: editor.cloudSettings; tasks: [{id: "speechRecognition", name: "语音识别"}, {id: "subtitleWordMapping", name: "字幕时间映射复核"}, {id: "subtitleAudioReview", name: "字幕听音复核"}] }
             MenuButton {
                 id: aiReviewButton
                 objectName: "aiReviewMenuButton"

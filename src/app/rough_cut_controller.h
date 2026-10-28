@@ -14,6 +14,7 @@
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QPointer>
 #include <QtCore/QTimer>
+#include <QtCore/QFuture>
 #include <QtCore/QUrl>
 
 #include <atomic>
@@ -26,6 +27,7 @@ class ApplicationContext;
 class TimelineSceneItem;
 
 class RoughCutController final : public QObject {
+    friend class ProjectSession;
     Q_OBJECT
     Q_PROPERTY(QObject *resultModel READ resultModel CONSTANT)
     Q_PROPERTY(QObject *resultFilterModel READ resultFilterModel CONSTANT)
@@ -240,6 +242,7 @@ private:
     std::atomic<bool> cancel_{false};
     std::atomic<quint64> workerGeneration_{0};
     std::thread worker_;
+    QFuture<void> projectStorageTask_;
     std::atomic<bool> waveformCancel_{false};
     std::atomic<quint64> waveformGeneration_{0};
     std::thread waveformWorker_;

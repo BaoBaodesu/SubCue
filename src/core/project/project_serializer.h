@@ -14,6 +14,8 @@ public:
     [[nodiscard]] static QByteArray fingerprint(const Project &project);
     [[nodiscard]] static bool save(const QString &path, const Project &project,
                                    QString *errorMessage = nullptr, const std::atomic<bool> *cancel = nullptr);
+    [[nodiscard]] static bool save(const QString &path, const Project &project,
+        QString *errorMessage, const std::atomic<bool> *cancel, QByteArray *committedSha256);
     [[nodiscard]] static std::optional<Project> load(const QString &path,
                                                      QString *errorMessage = nullptr);
 };

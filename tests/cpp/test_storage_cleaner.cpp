@@ -21,6 +21,8 @@ private slots:
     void removesOnlySelectedTargets();
     void cancelStopsWithoutDeleting();
     void destroyedControllerDoesNotDeliverCallback();
+    void previewDoesNotRetargetAfterRescan();
+    void changedPreviewIsRejectedBeforeAnyDeletion();
 };
 
 namespace {
@@ -34,6 +36,44 @@ void writeFile(const QString &path, const QByteArray &bytes = QByteArrayLiteral(
 }
 
 } // namespace
+
+void StorageCleanerTests::previewDoesNotRetargetAfterRescan()
+{
+    QTemporaryDir dir;
+    const auto keep = dir.filePath(QStringLiteral("out/build/windows-release-cuda"));
+    QDir().mkpath(keep);
+    writeFile(dir.filePath(QStringLiteral("b.log")));
+    StorageCleaner cleaner(dir.path(), {}, keep);
+    const auto preview = cleaner.scan();
+    QString id;
+    for (const auto &target : preview) if (target.path.endsWith(QStringLiteral("/b.log"))) id = target.id;
+    QVERIFY(!id.isEmpty());
+    writeFile(dir.filePath(QStringLiteral("a.log")));
+    QVERIFY(cleaner.remove({id}, preview).ok);
+    QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("a.log"))));
+    QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("b.log"))));
+}
+
+void StorageCleanerTests::changedPreviewIsRejectedBeforeAnyDeletion()
+{
+    QTemporaryDir dir;
+    const auto keep = dir.filePath(QStringLiteral("out/build/windows-release-cuda"));
+    QDir().mkpath(keep);
+    writeFile(dir.filePath(QStringLiteral("a.log")));
+    writeFile(dir.filePath(QStringLiteral("out/tmp-probe/first.bin")));
+    StorageCleaner cleaner(dir.path(), {}, keep);
+    const auto preview = cleaner.scan();
+    QStringList ids;
+    for (const auto &target : preview) {
+        if (target.path.endsWith(QStringLiteral("/a.log"))) ids.prepend(target.id);
+        if (target.path.endsWith(QStringLiteral("/tmp-probe"))) ids.append(target.id);
+    }
+    QCOMPARE(ids.size(), 2);
+    writeFile(dir.filePath(QStringLiteral("out/tmp-probe/new.bin")));
+    QVERIFY(!cleaner.remove(ids, preview).ok);
+    QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("a.log"))));
+    QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("out/tmp-probe/new.bin"))));
+}
 
 void StorageCleanerTests::rejectsProtectedPaths()
 {
@@ -65,6 +105,8 @@ void StorageCleanerTests::rejectsProtectedPaths()
     QVERIFY(!cleaner.isPathAllowed(keep));
     QVERIFY(cleaner.isPathAllowed(QDir(keep).filePath(QStringLiteral("package"))));
     QVERIFY(!cleaner.isPathAllowed(QStringLiteral("C:/Windows/System32")));
+    StorageCleaner nestedModels(root, QDir(root).filePath(QStringLiteral("out/tmp-models/weights")), keep);
+    QVERIFY(!nestedModels.isPathAllowed(QDir(root).filePath(QStringLiteral("out/tmp-models"))));
 }
 
 void StorageCleanerTests::removesOnlySelectedTargets()

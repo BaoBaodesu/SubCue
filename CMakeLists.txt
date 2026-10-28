@@ -189,6 +189,29 @@ qt_add_library(SubCueCore STATIC
     src/core/project/project.h
     src/core/project/project_serializer.cpp
     src/core/project/project_serializer.h
+    src/core/project/project_store.cpp
+    src/core/project/project_store.h
+    src/core/project/asset_file.cpp
+    src/core/project/asset_file.h
+    src/core/tts/voice_library.cpp
+    src/core/tts/voice_library.h
+    src/core/tts/audio_quality.cpp
+    src/core/tts/audio_quality.h
+    src/core/tts/reference_samples.cpp
+    src/core/tts/reference_samples.h
+    src/core/tts/voice_document.cpp
+    src/core/tts/voice_document.h
+    src/core/tts/voice_audio.cpp
+    src/core/tts/voice_audio.h
+    src/core/project/project_storage_adapter.cpp
+    src/core/project/project_storage_adapter.h
+    src/core/project/project_manager.cpp
+    src/core/project/project_manager.h
+    src/core/tts/tts_types.h
+    src/core/tts/local_tts_provider.h
+    src/core/tts/local_tts_provider.cpp
+    src/core/tts/cloud_tts_provider.h
+    src/core/tts/cloud_tts_provider.cpp
     src/core/roughcut/rough_cut_types.h
     src/core/roughcut/alignment_evidence.cpp
     src/core/roughcut/alignment_evidence.h
@@ -221,6 +244,8 @@ qt_add_library(SubCueCore STATIC
     src/core/settings/model_locator.h
     src/core/settings/settings_manager.cpp
     src/core/settings/settings_manager.h
+    src/core/settings/cloud_config_store.cpp
+    src/core/settings/cloud_config_store.h
     src/core/settings/storage_cleaner.cpp
     src/core/settings/storage_cleaner.h
     src/core/subtitle/ass_writer.cpp
@@ -309,8 +334,22 @@ if(SUBCUE_BUILD_APP)
         src/app/main.cpp
         src/app/app_controller.cpp
         src/app/app_controller.h
+        src/app/cloud_settings_controller.cpp
+        src/app/cloud_settings_controller.h
         src/app/application_context.cpp
         src/app/application_context.h
+        src/app/project_session.cpp
+        src/app/project_session.h
+        src/app/tts_task_controller.h
+        src/app/tts_task_controller.cpp
+        src/app/voice_library_controller.h
+        src/app/voice_library_controller.cpp
+        src/app/voice_studio_controller.h
+        src/app/voice_studio_controller.cpp
+        src/app/voice_audio_controller.h
+        src/app/voice_audio_controller.cpp
+        src/app/audio_preview_controller.h
+        src/app/audio_preview_controller.cpp
         src/app/native_theme.cpp
         src/app/native_theme.h
         src/app/rough_cut_controller.cpp
@@ -329,10 +368,17 @@ if(SUBCUE_BUILD_APP)
         QML_FILES
             src/app/qml/Main.qml
             src/app/qml/AppRouter.qml
+            src/app/qml/TtsTasksDialog.qml
+            src/app/qml/VoicePreviewTransport.qml
+            src/app/qml/VoiceLibraryPage.qml
+            src/app/qml/VoiceLibraryDialog.qml
+            src/app/qml/VoiceWorkspace.qml
             src/app/qml/SubtitleWorkspace.qml
             src/app/qml/RoughCutWorkspace.qml
             src/app/qml/Theme.qml
             src/app/qml/SettingsWindow.qml
+            src/app/qml/CloudSettingsPanel.qml
+            src/app/qml/CloudTaskMenu.qml
             src/app/qml/AboutWindow.qml
             src/app/qml/MenuButton.qml
             src/app/qml/PrimaryButton.qml
@@ -365,6 +411,22 @@ if(SUBCUE_BUILD_APP)
     )
     target_link_libraries(SubCue PRIVATE
         SubCue::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
+    add_custom_command(TARGET SubCue POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SubCue>/inference"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/tts_python_worker.py"
+            "$<TARGET_FILE_DIR:SubCue>/inference/tts_python_worker.py")
+    add_custom_command(TARGET SubCue POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/tts_external_engines.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/audio_emotion_worker.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/tts_engine_preflight.py"
+            "$<TARGET_FILE_DIR:SubCue>/inference")
+    set_property(TARGET SubCue APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/tts_python_worker.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/audio_emotion_worker.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/tts_external_engines.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/tts_engine_preflight.py")
     if(TARGET SubCueInference)
         add_dependencies(SubCue SubCueInference)
         add_custom_command(TARGET SubCue POST_BUILD
@@ -390,6 +452,10 @@ if(SUBCUE_BUILD_APP)
         set(SUBCUE_PACKAGE_DEPENDS
             SubCue
             "${CMAKE_SOURCE_DIR}/cmake/PackageWindows.cmake"
+            "${CMAKE_SOURCE_DIR}/tools/tts_python_worker.py"
+            "${CMAKE_SOURCE_DIR}/tools/audio_emotion_worker.py"
+            "${CMAKE_SOURCE_DIR}/tools/tts_external_engines.py"
+            "${CMAKE_SOURCE_DIR}/tools/tts_engine_preflight.py"
             "${CMAKE_SOURCE_DIR}/licenses/NOTICE.txt"
             "${CMAKE_SOURCE_DIR}/src/app/qml/Main.qml"
             "${CMAKE_SOURCE_DIR}/src/app/qml/AboutWindow.qml"

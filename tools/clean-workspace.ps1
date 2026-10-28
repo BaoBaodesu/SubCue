@@ -1,10 +1,17 @@
 ﻿param(
     [switch]$Apply,
+    [switch]$LegacyCredentials,
+    [switch]$TestCredentials,
     [string[]]$Only = @(),
     [string]$KeepBuild = 'windows-release-cuda'
 )
 
 $ErrorActionPreference = 'Stop'
+if ($TestCredentials) {
+    if ($LegacyCredentials -or $Only.Count -gt 0) { throw '测试凭据清理不能与其它目标混用。' }
+    & (Join-Path $PSScriptRoot 'clear-cloud-credentials.ps1') -TestCredentials -Apply:$Apply
+    return
+}
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $protectedRoots = [System.Collections.Generic.List[string]]::new()
 foreach ($candidate in @(
@@ -42,7 +49,18 @@ function Add-CleanupTarget([string]$Path) {
     $targets.Add($resolved)
 }
 
-if ($Only.Count -gt 0) {
+if ($LegacyCredentials) {
+    if ($Only.Count -gt 0) { throw '凭据清理不能与普通目标混用。' }
+    foreach ($relative in @('SubCue\credentials.dat', 'AutoSubtitleAligner\credentials.dat')) {
+        $candidate = [System.IO.Path]::GetFullPath((Join-Path $env:APPDATA $relative))
+        if (Test-Path -LiteralPath $candidate) {
+            $info = Get-Item -LiteralPath $candidate -Force
+            $parent = Get-Item -LiteralPath $info.DirectoryName -Force
+            if ($info.PSIsContainer -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw '拒绝清理重定向的凭据路径。' }
+            $targets.Add($candidate)
+        }
+    }
+} elseif ($Only.Count -gt 0) {
     foreach ($item in $Only) {
         $candidate = if ([System.IO.Path]::IsPathRooted($item)) {
             $item
@@ -138,7 +156,8 @@ if (Get-Process -Name git, git-lfs -ErrorAction SilentlyContinue) {
 
 foreach ($target in $targets) {
     if (Test-Path -LiteralPath $target) {
-        Remove-Item -LiteralPath $target -Recurse -Force
+        if ($LegacyCredentials) { Remove-Item -LiteralPath $target -Force }
+        else { Remove-Item -LiteralPath $target -Recurse -Force }
     }
 }
 Write-Host '保守清理完成；模型目录未被操作。'

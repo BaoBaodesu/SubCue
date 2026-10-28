@@ -82,6 +82,7 @@ private slots:
     void parsesToolCallAndPlainJson();
     void resolveApiKeyPrefersUiThenSavedThenEnv();
     void wordMappingToolIsPresent();
+    void textRequestOmitsBailianParametersAndRejectsAudio();
 };
 
 void OmniProviderTests::payloadOmitsApiKeyAndUsesConfiguredModel()
@@ -227,11 +228,11 @@ void OmniProviderTests::resolveApiKeyPrefersUiThenSavedThenEnv()
     qputenv(kOmniReviewEnvKey, "env-key");
     QCOMPARE(OmniReviewSettingsStore::resolveApiKey({}, &store), QStringLiteral("saved-key"));
     QCOMPARE(OmniReviewSettingsStore::resolveApiKeySource({}, &store), AiKeySource::Saved);
-    QCOMPARE(OmniReviewSettingsStore::resolveApiKeySource({}, &store, true), AiKeySource::Environment);
+    QCOMPARE(OmniReviewSettingsStore::resolveApiKeySource({}, &store, true), AiKeySource::None);
     QCOMPARE(OmniReviewSettingsStore::resolveApiKeyLabel({}, &store, true),
-             QStringLiteral("当前来源：环境变量 DASHSCOPE_API_KEY"));
+             QStringLiteral("尚未配置"));
     store.secret.clear();
-    QCOMPARE(OmniReviewSettingsStore::resolveApiKey({}, &store), QStringLiteral("env-key"));
+    QVERIFY(OmniReviewSettingsStore::resolveApiKey({}, &store).isEmpty());
     if (previous.isNull()) qunsetenv(kOmniReviewEnvKey);
     else qputenv(kOmniReviewEnvKey, previous);
 }
@@ -243,6 +244,31 @@ void OmniProviderTests::wordMappingToolIsPresent()
     QCOMPARE(tools.at(0).toObject().value(QStringLiteral("function")).toObject()
                  .value(QStringLiteral("name")).toString(),
              QStringLiteral("submit_word_mapping"));
+}
+
+void OmniProviderTests::textRequestOmitsBailianParametersAndRejectsAudio()
+{
+    for (const auto &vendor : {QStringLiteral("deepseek"), QStringLiteral("moonshot"), QStringLiteral("bailian")}) {
+        OmniReviewSettings settings; settings.provider = vendor + QStringLiteral("-text");
+        settings.model = QStringLiteral("selected-model"); settings.baseUrl = QStringLiteral("https://api.deepseek.com/v1");
+        OmniChatRequest request; request.task = OmniTaskType::WordMappingReview;
+        request.userText = QStringLiteral("证据文本"); request.tools = QwenOmniProvider::wordMappingToolSchema();
+        request.toolChoiceName = QStringLiteral("submit_word_mapping");
+        FakeHttpClient http; http.response.status = 200;
+        http.response.body = toolCallBody(QJsonObject{{"results", QJsonArray{}}}, request.toolChoiceName);
+        QwenOmniProvider provider(QStringLiteral("sentinel-text-key"), settings, &http);
+        QVERIFY(std::holds_alternative<OmniChatResponse>(provider.complete(request)));
+        const auto body = QJsonDocument::fromJson(http.lastRequest.body).object();
+        QVERIFY(!body.contains(QStringLiteral("modalities"))); QVERIFY(!body.contains(QStringLiteral("enable_thinking")));
+        QVERIFY(!body.contains(QStringLiteral("reasoning_effort"))); QVERIFY(!http.lastRequest.followRedirects);
+        QVERIFY(!http.lastRequest.body.contains("sentinel-text-key"));
+        QVERIFY(!http.lastRequest.headers.empty());
+        QCOMPARE(http.lastRequest.headers.front().name, QByteArrayLiteral("Authorization"));
+        QCOMPARE(http.lastRequest.headers.front().value, QByteArrayLiteral("Bearer sentinel-text-key"));
+        QCOMPARE(body.value(QStringLiteral("messages")).toArray().last().toObject().value(QStringLiteral("content")).toString(), request.userText);
+        http.lastRequest = {}; request.audio = QwenOmniProvider::builtInProbeClip();
+        QVERIFY(std::holds_alternative<AppError>(provider.complete(request))); QVERIFY(http.lastRequest.url.isEmpty());
+    }
 }
 
 QTEST_MAIN(OmniProviderTests)

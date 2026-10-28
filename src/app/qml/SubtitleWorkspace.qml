@@ -9,6 +9,7 @@ Item {
     objectName: "subtitleWorkspace"
 
     property bool auxiliaryCollapsed: false
+    onWidthChanged: if (width > 0 && width < 1280) auxiliaryCollapsed = true
     property bool externalModalEditing: false
     readonly property bool textEditing: window.Window.window && window.Window.window.activeFocusItem
         && typeof window.Window.window.activeFocusItem.inputMethodComposing !== "undefined"
@@ -16,7 +17,7 @@ Item {
         || exportNotice.visible || exportFolderDialog.visible || exportResultDialog.visible
         || preflightDialog.visible || omniSuggestionDialog.visible || activeSubtitlesDialog.visible
         || (settingsWindow && settingsWindow.visible) || fileMenu.visible || aiReviewMenu.visible
-        || cueEditDialog.visible || relinkDialog.visible || timedSubtitleDialog.visible || subtitlePlaybackRate.popup.visible
+        || cueEditDialog.visible || srtImportMode.visible || relinkDialog.visible || timedSubtitleDialog.visible || subtitlePlaybackRate.popup.visible
     property bool draftActive: false
     property bool draftChanged: false
     property bool draftLoading: false
@@ -28,6 +29,13 @@ Item {
     property real originalEndUs: -1
     property bool switchingSelection: false
     property bool taskDetailsExpanded: false
+    property var styleDraft: ({})
+    property bool styleExpanded: false
+    function editStyle(key, value) { styleDraft = Object.assign({}, styleDraft, { [key]: value }) }
+    function applyStyle() {
+        if (!editor.applySubtitleStyle(styleDraft)) { draftError = editor.statusText; styleExpanded = true; return false }
+        styleDraft = ({}); return true
+    }
     Connections {
         target: window.Window.window
         function onActiveFocusItemChanged() {
@@ -46,42 +54,57 @@ Item {
         closePolicy: Popup.CloseOnEscape
         onRejected: window.discardDraft()
         Shortcut { sequence: "Ctrl+S"; enabled: cueEditDialog.visible && !window.externalModalEditing; onActivated: if (window.commitPendingCue()) { cueEditDialog.close(); window.Window.window.saveAction.trigger() } }
-        contentItem: ColumnLayout {
-            id: inspectorRegion
-            spacing: 8
-            Flickable {
-                id: inspectorScroll; objectName: "cueInspectorScroll"
-                Layout.fillWidth: true
-                Layout.fillHeight: true; Layout.minimumHeight: 40
-                boundsBehavior: Flickable.StopAtBounds; flickableDirection: Flickable.VerticalFlick
-                contentWidth: width; contentHeight: cueInspector.implicitHeight + 16
-                clip: true
-                ScrollBar.vertical: SubScrollBar { orientation: Qt.Vertical; parent: inspectorScroll; anchors.top: parent.top; anchors.right: parent.right; anchors.bottom: parent.bottom }
-                ColumnLayout {
-                    id: cueInspector; objectName: "cueInspector"
-                    width: inspectorScroll.width - 16 - Theme.scrollBarSize; x: 8; y: 8; spacing: 4
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label { text: window.draftId ? qsTr("字幕内容") : qsTr("新建字幕"); color: Theme.text; font.bold: true }
-                        Label { text: window.draftChanged ? qsTr("未应用") : ""; color: Theme.warning; font.pixelSize: 12 }
-                        Item { Layout.fillWidth: true }
-                        SubCheckBox { id: cueTimed; text: qsTr("已定位"); enabled: window.draftActive && !editor.busy && window.originalStartUs < 0; onCheckedChanged: if (!window.draftLoading) window.draftChanged = true }
-                    }
+        contentItem: Item { id: dialogInspectorHost }
+    }
+    ColumnLayout {
+        id: inspectorRegion
+        Keys.onEscapePressed: function(event) {
+            if (window.Window.window && window.Window.window.activeFocusItem && window.Window.window.activeFocusItem.inputMethodComposing === true) { event.accepted = false; return }
+            window.discardDraft(); event.accepted = true
+        }
+        parent: dialogInspectorHost
+        anchors.fill: parent
+        visible: cueEditDialog.visible
+        spacing: 8
+        Flickable {
+            id: inspectorScroll; objectName: "cueInspectorScroll"
+            Layout.fillWidth: true
+            Layout.fillHeight: true; Layout.minimumHeight: 40
+            boundsBehavior: Flickable.StopAtBounds; flickableDirection: Flickable.VerticalFlick
+            contentWidth: width; contentHeight: cueInspector.implicitHeight + 16
+            clip: true
+            ScrollBar.vertical: SubScrollBar { orientation: Qt.Vertical; parent: inspectorScroll; anchors.top: parent.top; anchors.right: parent.right; anchors.bottom: parent.bottom }
+            ColumnLayout {
+                id: cueInspector; objectName: "cueInspector"
+                width: inspectorScroll.width - 16 - Theme.scrollBarSize; x: 8; y: 8; spacing: 4
+                RowLayout {
+                    Layout.fillWidth: true
+                    Label { text: window.draftId ? qsTr("字幕内容") : qsTr("新建字幕"); color: Theme.text; font.bold: true }
+                    Label { text: window.draftChanged ? qsTr("未应用") : ""; color: Theme.warning; font.pixelSize: 12 }
+                    Item { Layout.fillWidth: true }
+                    SubCheckBox { id: cueTimed; text: qsTr("已定位"); enabled: window.draftActive && !editor.busy && window.originalStartUs < 0; onCheckedChanged: if (!window.draftLoading) window.draftChanged = true }
+                }
+                Item {
+                    id: dialogTextHost
+                    Layout.fillWidth: true; Layout.preferredHeight: 112
+                    // 编辑器固定在弹窗中，避免跟随字幕列表委托的创建和销毁。
                     ScrollView {
-                        id: cueTextScroll
-                        Layout.fillWidth: true; Layout.preferredHeight: 112; Layout.maximumHeight: 160
+                        id: cueTextScroll; objectName: "cueTextScroll"
+                        anchors.fill: parent
                         clip: true
                         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                         TextArea {
                             id: cueTextEditor; objectName: "cueTextEditor"
                             width: cueTextScroll.availableWidth
                             enabled: window.draftActive && !editor.busy
-                            placeholderText: qsTr("选择字幕，或按 Enter 新建")
-                            color: Theme.text; wrapMode: TextEdit.Wrap; selectByMouse: true
+                            placeholderText: qsTr("输入字幕内容，Shift+Enter 换行")
+                            color: Theme.text; placeholderTextColor: Theme.placeholder
+                            selectionColor: Theme.selection; selectedTextColor: Theme.text
+                            wrapMode: TextEdit.Wrap; selectByMouse: true
                             background: Rectangle { color: Theme.input; border.color: cueTextEditor.activeFocus ? Theme.focusBorder : Theme.border; radius: Theme.radiusInput }
                             onTextChanged: if (!window.draftLoading) window.draftChanged = true
                             Keys.onPressed: function(event) {
-                                if (event.key === Qt.Key_Escape) { window.discardDraft(); event.accepted = true }
+                                if (event.key === Qt.Key_Escape && !inputMethodComposing) { window.discardDraft(); event.accepted = true }
                                 else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !inputMethodComposing && !(event.modifiers & Qt.ShiftModifier)) {
                                     if (window.commitPendingCue() && (event.modifiers & Qt.ControlModifier)) editor.confirmCurrentCue()
                                     event.accepted = true
@@ -89,42 +112,66 @@ Item {
                             }
                         }
                     }
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 4
+                    SubTextField { id: cueStart; objectName: "cueStartTime"; Layout.fillWidth: true; enabled: window.draftActive && cueTimed.checked && !editor.busy; font.family: "Consolas"; font.pixelSize: 12; onTextChanged: if (!window.draftLoading) window.draftChanged = true; onAccepted: window.commitPendingCue() }
+                    Label { text: "→"; color: Theme.secondaryText }
+                    SubTextField { id: cueEnd; objectName: "cueEndTime"; Layout.fillWidth: true; enabled: window.draftActive && cueTimed.checked && !editor.busy; font.family: "Consolas"; font.pixelSize: 12; onTextChanged: if (!window.draftLoading) window.draftChanged = true; onAccepted: window.commitPendingCue() }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: window.draftActive
+                    text: cueTimed.checked ? qsTr("时长 %1 秒").arg(((window.parseTime(cueEnd.text) - window.parseTime(cueStart.text)) / 1000000).toFixed(3)) : qsTr("未定位 · 应用时保留为文稿字幕")
+                    color: Theme.secondaryText; font.pixelSize: 12
+                }
+                Label {
+                    Layout.fillWidth: true; visible: window.draftError !== "" || editor.cueOverlaps(window.draftId)
+                    text: window.draftError || qsTr("当前字幕存在重叠；工程可保存，字幕导出前须处理。")
+                    color: Theme.warning; wrapMode: Text.Wrap; font.pixelSize: 12
+                }
+                Label {
+                    Layout.fillWidth: true; font.pixelSize: 12; color: Theme.secondaryText
+                    visible: window.inspectorCue.status === "LOW_CONFIDENCE" || window.inspectorCue.status === "REVIEW" || !!window.inspectorCue.candidateText
+                    text: qsTr("复核：") + (window.inspectorCue.status === "LOW_CONFIDENCE" ? qsTr("低置信度") : qsTr("待复核"))
+                    + (window.inspectorCue.candidateText ? " · " + window.inspectorCue.candidateText : "")
+                    elide: Text.ElideRight
+                    ToolTip.visible: reviewInfoHover.hovered; ToolTip.text: text
+                    HoverHandler { id: reviewInfoHover }
+                }
+                SubButton { text: window.styleExpanded ? qsTr("工程字幕样式 ▴") : qsTr("工程字幕样式 ▾"); onClicked: window.styleExpanded = !window.styleExpanded }
+                GridLayout {
+                    visible: window.styleExpanded; Layout.fillWidth: true; columns: 2; columnSpacing: 6; rowSpacing: 4
+                    Label { text: qsTr("字体"); color: Theme.secondaryText }
+                    SubTextField { Layout.fillWidth: true; text: window.styleDraft.fontFamily !== undefined ? window.styleDraft.fontFamily : editor.subtitleFontFamily; onTextEdited: window.editStyle("fontFamily", text); onAccepted: window.applyStyle() }
+                    Label { text: qsTr("字号 / 底边距"); color: Theme.secondaryText }
                     RowLayout {
-                        Layout.fillWidth: true; spacing: 4
-                        SubTextField { id: cueStart; objectName: "cueStartTime"; Layout.fillWidth: true; enabled: window.draftActive && cueTimed.checked && !editor.busy; font.family: "Consolas"; font.pixelSize: 12; onTextChanged: if (!window.draftLoading) window.draftChanged = true; onAccepted: window.commitPendingCue() }
-                        Label { text: "→"; color: Theme.secondaryText }
-                        SubTextField { id: cueEnd; objectName: "cueEndTime"; Layout.fillWidth: true; enabled: window.draftActive && cueTimed.checked && !editor.busy; font.family: "Consolas"; font.pixelSize: 12; onTextChanged: if (!window.draftLoading) window.draftChanged = true; onAccepted: window.commitPendingCue() }
-                    }
-                    Label {
                         Layout.fillWidth: true
-                        visible: window.draftActive
-                        text: cueTimed.checked ? qsTr("时长 %1 秒").arg(((window.parseTime(cueEnd.text) - window.parseTime(cueStart.text)) / 1000000).toFixed(3)) : qsTr("未定位 · 应用时保留为文稿字幕")
-                        color: Theme.secondaryText; font.pixelSize: 12
+                        SubSpinBox { from: 12; to: 200; value: window.styleDraft.fontSize1080p !== undefined ? window.styleDraft.fontSize1080p : editor.subtitleFontSize; onValueModified: window.editStyle("fontSize1080p", value) }
+                        SubSpinBox { from: 0; to: 600; value: window.styleDraft.bottomMargin1080p !== undefined ? window.styleDraft.bottomMargin1080p : editor.subtitleBottomMargin; onValueModified: window.editStyle("bottomMargin1080p", value) }
                     }
-                    Label {
-                        Layout.fillWidth: true; visible: window.draftError !== "" || editor.cueOverlaps(window.draftId)
-                        text: window.draftError || qsTr("当前字幕存在重叠；工程可保存，字幕导出前须处理。")
-                        color: Theme.warning; wrapMode: Text.Wrap; font.pixelSize: 12
+                    Label { text: qsTr("底部对齐"); color: Theme.secondaryText }
+                    SubComboBox { Layout.fillWidth: true; model: [qsTr("左对齐"), qsTr("居中"), qsTr("右对齐")]; currentIndex: ["bottom-left", "bottom-center", "bottom-right"].indexOf(window.styleDraft.alignment || editor.subtitleAlignment); onActivated: window.editStyle("alignment", ["bottom-left", "bottom-center", "bottom-right"][currentIndex]) }
+                    Label { text: qsTr("文字 / 描边色"); color: Theme.secondaryText }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        SubTextField { Layout.fillWidth: true; text: window.styleDraft.fontColor !== undefined ? window.styleDraft.fontColor : editor.subtitleFontColor; onTextEdited: window.editStyle("fontColor", text); onAccepted: window.applyStyle() }
+                        SubTextField { Layout.fillWidth: true; text: window.styleDraft.outlineColor !== undefined ? window.styleDraft.outlineColor : editor.subtitleOutlineColor; onTextEdited: window.editStyle("outlineColor", text); onAccepted: window.applyStyle() }
                     }
-                    Label {
-                        Layout.fillWidth: true; font.pixelSize: 12; color: Theme.secondaryText
-                        visible: window.inspectorCue.status === "LOW_CONFIDENCE" || window.inspectorCue.status === "REVIEW" || !!window.inspectorCue.candidateText
-                        text: qsTr("复核：") + (window.inspectorCue.status === "LOW_CONFIDENCE" ? qsTr("低置信度") : qsTr("待复核"))
-                        + (window.inspectorCue.candidateText ? " · " + window.inspectorCue.candidateText : "")
-                        elide: Text.ElideRight
-                        ToolTip.visible: reviewInfoHover.hovered; ToolTip.text: text
-                        HoverHandler { id: reviewInfoHover }
+                    RowLayout {
+                        Layout.columnSpan: 2; Layout.fillWidth: true
+                        SubButton { text: qsTr("应用工程样式"); enabled: Object.keys(window.styleDraft).length > 0; onClicked: window.applyStyle() }
+                        SubButton { text: qsTr("设为新工程默认值"); onClicked: if (window.applyStyle()) editor.saveSettings({defaultsOnly: true, fontFamily: editor.subtitleFontFamily, fontSize1080p: editor.subtitleFontSize, alignment: editor.subtitleAlignment, bottomMargin1080p: editor.subtitleBottomMargin, fontColor: editor.subtitleFontColor, outlineColor: editor.subtitleOutlineColor}) }
                     }
-
                 }
             }
-            RowLayout {
-                Layout.fillWidth: true; spacing: 4
-                SubButton { text: qsTr("应用并关闭"); enabled: window.draftChanged && !editor.busy; onClicked: if (window.commitPendingCue()) cueEditDialog.close() }
-                SubButton { text: qsTr("取消"); enabled: !editor.busy; onClicked: window.discardDraft() }
-                Item { Layout.fillWidth: true }
-                SubButton { text: qsTr("确认并下一条"); shortcutHint: "Ctrl+Enter"; enabled: window.draftActive && !editor.busy; leftPadding: 6; rightPadding: 6; onClicked: window.runCommand(function() { editor.confirmCurrentCue() }) }
-            }
+        }
+        RowLayout {
+            Layout.fillWidth: true; spacing: 4
+            SubButton { text: qsTr("应用并关闭"); enabled: window.draftChanged && !editor.busy; onClicked: if (window.commitPendingCue()) cueEditDialog.close() }
+            SubButton { text: qsTr("取消"); enabled: !editor.busy; onClicked: window.discardDraft() }
+            Item { Layout.fillWidth: true }
+            SubButton { text: qsTr("确认并下一条"); shortcutHint: "Ctrl+Enter"; enabled: window.draftActive && !editor.busy; leftPadding: 6; rightPadding: 6; onClicked: window.runCommand(function() { editor.confirmCurrentCue() }) }
         }
     }
     Action { id: alignmentAction; text: qsTr("自动打轴"); enabled: !editor.busy; onTriggered: window.runCommand(function() { editor.startAlignment() }) }
@@ -153,6 +200,8 @@ Item {
         draftLoading = false
     }
     function commitPendingCue() {
+        if (window.Window.window && window.Window.window.activeFocusItem && window.Window.window.activeFocusItem.inputMethodComposing === true) return false
+        if (Object.keys(styleDraft).length && !applyStyle()) return false
         if (!draftActive || !draftChanged) return true
         if (cueTextEditor.inputMethodComposing || cueStart.inputMethodComposing || cueEnd.inputMethodComposing) {
             draftError = qsTr("请先完成输入法候选确认。")
@@ -175,6 +224,7 @@ Item {
         return true
     }
     function discardDraft() {
+        styleDraft = ({})
         cueEditDialog.close()
         loadInspector(editor.selectedCueId)
         timelineScene.forceActiveFocus(Qt.OtherFocusReason)
@@ -222,7 +272,8 @@ Item {
     }
     function captureSession() {
         editor.setSessionState(Object.assign({}, editor.sessionState, {
-            auxiliaryCollapsed: auxiliaryCollapsed, topRatio: workspaceSplit.height / Math.max(1, verticalSplit.height),
+            auxiliaryCollapsed: auxiliaryCollapsed,
+            topRatio: workspaceSplit.height / Math.max(1, verticalSplit.height),
             auxiliaryRatio: auxiliaryPanel.width / Math.max(1, workspaceSplit.width),
             subtitleRatio: subtitlePanel.width / Math.max(1, workspaceSplit.width), sourceTab: sourceTabs.currentIndex,
             subtitleFilter: editor.filteredSubtitleModel.statusFilter, subtitleSearch: cueSearch.text,
@@ -230,18 +281,18 @@ Item {
         }))
     }
     function restoreLayout() {
-        workspaceSplit.SplitView.preferredHeight = verticalSplit.height * Math.max(0.4, Math.min(0.7, editor.sessionState.topRatio || 0.55))
+        workspaceSplit.SplitView.preferredHeight = verticalSplit.height * Math.max(0.4, Math.min(0.7, editor.sessionState.topRatio || 0.62))
         auxiliaryPanel.SplitView.preferredWidth = workspaceSplit.width * Math.max(0.12, Math.min(0.3, editor.sessionState.auxiliaryRatio || 0.18))
         subtitlePanel.SplitView.preferredWidth = Math.max(320, workspaceSplit.width * Math.max(0.25, Math.min(0.45, editor.sessionState.subtitleRatio || 0.32)))
     }
     function resetLayout() {
         auxiliaryCollapsed = false
-        workspaceSplit.SplitView.preferredHeight = verticalSplit.height * 0.55
+        workspaceSplit.SplitView.preferredHeight = verticalSplit.height * 0.62
         auxiliaryPanel.SplitView.preferredWidth = workspaceSplit.width * 0.18
         subtitlePanel.SplitView.preferredWidth = workspaceSplit.width * 0.32
     }
     FileDialog { id: relinkDialog; title: qsTr("重新定位原素材"); parentWindow: window.Window.window; onAccepted: editor.relinkMedia(selectedFile) }
-    FileDialog { id: timedSubtitleDialog; title: qsTr("按时间码导入字幕"); nameFilters: [qsTr("SRT 字幕 (*.srt)")]; parentWindow: window.Window.window; onAccepted: { const url = selectedFile; window.requestSubtitleLeave(function() { editor.importTimedSubtitles(url) }) } }
+    FileDialog { id: timedSubtitleDialog; title: qsTr("按时间码导入字幕"); nameFilters: [qsTr("SRT 字幕 (*.srt)")]; parentWindow: window.Window.window; onAccepted: { const url = selectedFile; window.requestSubtitleLeave(function() { editor.importTimedSubtitles(url) }, [url], true) } }
     signal exportCancelled()
 
     Component.onCompleted: {
@@ -255,6 +306,7 @@ Item {
         loadInspector(editor.selectedCueId)
     }
     Connections { target: editor; function onProjectChanged() {
+        window.styleDraft = ({})
         window.restoreLayout()
         window.auxiliaryCollapsed = editor.sessionState.auxiliaryCollapsed || false
         sourceTabs.currentIndex = editor.sessionState.sourceTab || 0
@@ -264,16 +316,24 @@ Item {
         window.loadInspector(editor.selectedCueId)
     } }
 
-    Component {
-        id: settingsWindowComponent
-        SettingsWindow { controller: editor }
-    }
-    property var settingsWindow: null
+    readonly property var settingsWindow: window.Window.window ? window.Window.window.settingsWindow : null
     property var preflightIssues: []
+    function recoveryFields() {
+        if ((!draftChanged || !draftActive) && !Object.keys(styleDraft).length) return ({})
+        if (cueTextEditor.inputMethodComposing || (window.Window.window && window.Window.window.activeFocusItem && window.Window.window.activeFocusItem.inputMethodComposing === true)) return null
+        return { id: draftId, text: cueTextEditor.text, start: cueStart.text, end: cueEnd.text, timed: cueTimed.checked, style: styleDraft }
+    }
+    function restoreRecoveryFields(fields) {
+        if (!fields) return
+        styleDraft = fields.style || ({})
+        if (!fields.id) return
+        loadInspector(fields.id)
+        if (draftId !== fields.id) return
+        draftLoading = true; cueTextEditor.text = fields.text; cueStart.text = fields.start; cueEnd.text = fields.end; cueTimed.checked = fields.timed
+        draftLoading = false; draftChanged = true; cueEditDialog.open()
+    }
     function openSettings() {
-        if (!settingsWindow)
-            settingsWindow = settingsWindowComponent.createObject(window)
-        settingsWindow.show()
+        if (window.Window.window) window.Window.window.openSettings()
     }
 
     function requestExport() {
@@ -457,25 +517,52 @@ Item {
         parentWindow: window.Window.window
         fileMode: FileDialog.OpenFiles
         nameFilters: [qsTr("支持的素材 (*.wav *.mp3 *.m4a *.flac *.aac *.mp4 *.mov *.mkv *.webm *.avi *.m4v *.wmv *.mpg *.mpeg *.mts *.m2ts *.ts *.mxf *.ogg *.opus *.wma *.aif *.aiff *.txt *.srt *.docx)"), qsTr("所有文件 (*)")]
-        onAccepted: editor.importFiles(selectedFiles)
+        onAccepted: {
+            const files = Array.from(selectedFiles)
+            if (!editor.validateImportFiles(files)) return
+            if (files.length === 1 && String(files[0]).toLowerCase().endsWith(".srt")) { srtImportMode.file = files[0]; srtImportMode.open() }
+            else window.requestSubtitleLeave(function() { editor.importFiles(files) }, files)
+        }
     }
     FileDialog {
         id: scriptDialog
         title: qsTr("导入字幕文稿")
         parentWindow: window.Window.window
         nameFilters: [qsTr("字幕文稿 (*.txt *.srt *.docx)"), qsTr("所有文件 (*)")]
-        onAccepted: editor.importScript(selectedFile)
+        onAccepted: {
+            if (!editor.validateImportFiles([selectedFile])) return
+            if (String(selectedFile).toLowerCase().endsWith(".srt")) { srtImportMode.file = selectedFile; srtImportMode.open() }
+            else { const file = selectedFile; window.requestSubtitleLeave(function() { editor.importScript(file) }, [file]) }
+        }
     }
-    function requestSubtitleLeave(action) {
-        const win = window.Window.window
+    Dialog {
+        id: srtImportMode; property url file
+        anchors.centerIn: parent; modal: true; width: Math.min(500, window.width - 32); title: qsTr("导入 SRT")
+        contentItem: Label { text: qsTr("保留时间码可继续编辑原字幕；仅提取文字用于重新打轴。"); wrapMode: Text.Wrap; color: Theme.text }
+        footer: DialogButtonBox {
+            PrimaryButton { text: qsTr("保留时间码（默认）"); onClicked: { srtImportMode.close(); window.requestSubtitleLeave(function() { editor.importTimedSubtitles(srtImportMode.file) }, [srtImportMode.file], true) } }
+            SubButton { text: qsTr("仅提取文字"); onClicked: { srtImportMode.close(); window.requestSubtitleLeave(function() { editor.importScript(srtImportMode.file) }, [srtImportMode.file]) } }
+            SubButton { text: qsTr("取消"); onClicked: srtImportMode.close() }
+        }
+    }
+    function requestSubtitleLeave(action, files, timed = false) {
         if (!window.commitPendingCue()) return
-        if (win && typeof win.requestSubtitleDestructiveAction === "function")
-            win.requestSubtitleDestructiveAction(action)
-        else
-            action()
+        const media = files.find(function(file) { return !/\.(txt|srt|docx)$/i.test(String(file)) })
+        // 首次补充缺失素材不离开工程；只有实际覆盖已有内容时才检查未保存更改。
+        if ((timed && editor.subtitleModel.count > 0)
+            || (!timed && editor.scriptText.trim() !== "" && files.some(function(file) { return /\.(txt|srt|docx)$/i.test(String(file)) }))
+            || (media && editor.mediaPath !== "" && editor.subtitleModel.count > 0
+                && editor.localPath(media).replace(/\\/g, "/").toLowerCase() !== editor.mediaPath.replace(/\\/g, "/").toLowerCase())) {
+            const win = window.Window.window
+            if (win && typeof win.requestSubtitleDestructiveAction === "function") {
+                win.requestSubtitleDestructiveAction(action)
+                return
+            }
+        }
+        action()
     }
-    function openMediaDialog() { requestSubtitleLeave(function() { mediaDialog.open() }) }
-    function openScriptDialog() { requestSubtitleLeave(function() { scriptDialog.open() }) }
+    function openMediaDialog() { mediaDialog.open() }
+    function openScriptDialog() { scriptDialog.open() }
 
     Connections {
         target: editor
@@ -548,21 +635,23 @@ Item {
                     MenuItem { action: window.Window.window.importAction; text: action.text + "    " + action.keySequence }
                     MenuItem { action: window.Window.window.scriptAction; text: action.text + "    " + action.keySequence }
                     MenuSeparator { }
-                    MenuItem { action: window.Window.window.exportAction; text: action.text + "    " + action.keySequence }
+                    MenuItem { action: window.Window.window.exportAction; text: action.text + "    " + action.keySequence; enabled: editor.canExport && !editor.busy }
                     MenuItem { text: window.auxiliaryCollapsed ? qsTr("展开辅助栏") : qsTr("折叠辅助栏"); onTriggered: { window.auxiliaryCollapsed = !window.auxiliaryCollapsed; editor.setSessionState(Object.assign({}, editor.sessionState, { auxiliaryCollapsed: window.auxiliaryCollapsed })) } }
                     MenuSeparator { }
                     MenuItem { text: qsTr("ASR 复核"); enabled: editor.canReview && !editor.busy; onTriggered: window.runCommand(function() { editor.startReview() }) }
                     MenuItem { text: qsTr("AI 内容复核"); enabled: editor.canOmniReview && !editor.busy; onTriggered: window.runCommand(function() { editor.startOmniSubtitleReview() }) }
+                    MenuItem { text: qsTr("复核时间映射"); enabled: editor.canOmniReview && !editor.busy; onTriggered: window.runCommand(function() { editor.startWordMappingReview() }) }
+                    MenuItem { text: qsTr("设置…"); onTriggered: window.openSettings() }
                     MenuItem { text: qsTr("关于"); onTriggered: window.openAbout() }
                     MenuItem { text: qsTr("重置布局"); onTriggered: window.resetLayout() }
                     MenuItem { text: qsTr("退出"); onTriggered: window.Window.window.close() }
                 }
             }
+            CloudTaskMenu { cloud: editor.cloudSettings; tasks: [{id: "speechRecognition", name: "语音识别"}, {id: "subtitleWordMapping", name: "字幕时间映射复核"}, {id: "subtitleAudioReview", name: "字幕听音复核"}] }
             MenuButton { action: window.Window.window.importAction }
+            MenuButton { action: window.Window.window.scriptAction }
             MenuButton { action: window.Window.window.saveAction }
-            Rectangle { width: 1; height: 24; color: Theme.divider }
-            MenuButton { action: alignmentAction }
-            MenuButton { text: qsTr("取消"); visible: editor.busy; enabled: editor.busy; onClicked: editor.cancelAlignment() }
+            Rectangle { implicitWidth: 1; implicitHeight: 24; color: Theme.divider }
             MenuButton { text: qsTr("ASR 复核"); visible: window.width >= 1200; enabled: editor.canReview && !editor.busy; onClicked: editor.startReview() }
             MenuButton {
                 id: aiReviewButton
@@ -585,11 +674,9 @@ Item {
                     }
                 }
             }
-            MenuButton { action: window.Window.window.exportAction }
-            Rectangle { width: 1; height: 24; color: Theme.divider }
-            MenuButton { text: qsTr("设置"); onClicked: window.openSettings() }
-            MenuButton { text: qsTr("关于"); visible: window.width >= 1300; onClicked: window.openAbout() }
             Item { Layout.fillWidth: true }
+            PrimaryButton { action: alignmentAction }
+            SubButton { action: window.Window.window.exportAction; enabled: editor.canExport && !editor.busy }
             BusyIndicator {
                 running: editor.busy
                 visible: running
@@ -616,7 +703,7 @@ Item {
         SplitView {
             id: workspaceSplit
             orientation: Qt.Horizontal
-            SplitView.preferredHeight: verticalSplit.height * Math.max(0.4, Math.min(0.7, editor.sessionState.topRatio || 0.55))
+            SplitView.preferredHeight: verticalSplit.height * Math.max(0.4, Math.min(0.7, editor.sessionState.topRatio || 0.62))
             SplitView.minimumHeight: Math.min(270, verticalSplit.height * 0.55)
             handle: Rectangle {
                 implicitWidth: 5
@@ -713,7 +800,7 @@ Item {
                                         }
                                     }
                                     onClicked: { assetList.currentIndex = index; assetList.forceActiveFocus() }
-                                    onDoubleClicked: { const row = index; window.requestSubtitleLeave(function() { editor.openProjectFile(row) }) }
+                                    onDoubleClicked: { const row = index; window.requestSubtitleLeave(function() { editor.openProjectFile(row) }, [modelData.path]) }
                                     TapHandler {
                                         acceptedButtons: Qt.RightButton
                                         onTapped: { assetList.currentIndex = assetRow.index; assetMenu.popup() }
@@ -724,13 +811,13 @@ Item {
                                 Layout.fillWidth: true
                                 Layout.margins: 8
                                 SubButton { text: qsTr("导入…"); onClicked: window.openMediaDialog() }
-                                SubButton { text: qsTr("打开"); enabled: assetList.currentIndex >= 0; onClicked: { const row = assetList.currentIndex; window.requestSubtitleLeave(function() { editor.openProjectFile(row) }) } }
+                                SubButton { text: qsTr("打开"); enabled: assetList.currentIndex >= 0; onClicked: { const row = assetList.currentIndex; window.requestSubtitleLeave(function() { editor.openProjectFile(row) }, [editor.projectFiles[row].path]) } }
                                 Item { Layout.fillWidth: true }
                                 SubButton { text: qsTr("移除"); enabled: assetList.currentIndex >= 0; onClicked: { editor.removeProjectFile(assetList.currentIndex); assetList.currentIndex = -1 } }
                             }
                             SubMenu {
                                 id: assetMenu
-                                MenuItem { text: qsTr("打开素材"); onTriggered: { const row = assetList.currentIndex; window.requestSubtitleLeave(function() { editor.openProjectFile(row) }) } }
+                                MenuItem { text: qsTr("打开素材"); onTriggered: { const row = assetList.currentIndex; window.requestSubtitleLeave(function() { editor.openProjectFile(row) }, [editor.projectFiles[row].path]) } }
                                 MenuItem { text: qsTr("在资源管理器中打开文件夹"); onTriggered: editor.showProjectFileFolder(assetList.currentIndex) }
                                 MenuSeparator { }
                                 MenuItem { text: qsTr("从项目中移除"); onTriggered: { editor.removeProjectFile(assetList.currentIndex); assetList.currentIndex = -1 } }
@@ -780,7 +867,9 @@ Item {
                 id: previewPanel
                 color: Theme.previewBackground
                 border.color: window.Window.window && window.belongsTo(window.Window.window.activeFocusItem, previewPanel) ? Theme.focusBorder : Theme.border
+                objectName: "subtitleMonitorPanel"
                 SplitView.fillWidth: true
+                SplitView.preferredWidth: workspaceSplit.width * 0.5
                 SplitView.minimumWidth: Math.min(360, window.width * 0.35)
                 clip: true
 
@@ -837,7 +926,8 @@ Item {
                 }
                 Text {
                     id: previewSubtitle
-                    visible: editor.currentSubtitleText.length > 0
+                    objectName: "monitorSubtitleText"
+                    visible: editor.hasMedia && editor.currentSubtitleText.length > 0
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
@@ -849,7 +939,7 @@ Item {
                     style: Text.Outline
                     styleColor: editor.subtitleOutlineColor
                     font.family: editor.subtitleFontFamily
-                    font.pixelSize: Math.max(10, editor.subtitleFontSize * parent.height / 1080)
+                    font.pixelSize: Math.max(14, editor.subtitleFontSize * parent.height / 1080)
                     font.bold: true
                     horizontalAlignment: editor.subtitleAlignment === "bottom-left" ? Text.AlignLeft : (editor.subtitleAlignment === "bottom-right" ? Text.AlignRight : Text.AlignHCenter)
                     wrapMode: Text.Wrap
@@ -934,7 +1024,7 @@ Item {
                 border.color: window.Window.window && window.belongsTo(window.Window.window.activeFocusItem, subtitlePanel) ? Theme.focusBorder : Theme.border
                 SplitView.preferredWidth: Math.max(320, workspaceSplit.width * Math.max(0.25, Math.min(0.45, editor.sessionState.subtitleRatio || 0.32)))
                 SplitView.minimumWidth: Math.min(320, window.width * 0.35)
-                SplitView.maximumWidth: 540
+                SplitView.maximumWidth: 600
                 ColumnLayout {
                     anchors.fill: parent; spacing: 0
                     RowLayout {
@@ -962,7 +1052,16 @@ Item {
                     RowLayout {
                         Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8; spacing: 4
                         SubButton { text: qsTr("编辑字幕"); shortcutHint: "Enter"; enabled: !!editor.selectedCueId && !editor.busy; onClicked: editor.createOrEditCue() }
-                        SubButton { text: qsTr("确认并下一条"); shortcutHint: "Ctrl+Enter"; enabled: !!editor.selectedCueId && !editor.busy; onClicked: editor.confirmCurrentCue() }
+                        SubButton {
+                            objectName: "confirmCueButton"
+                            text: window.inspectorCue.timed ? qsTr("确认并下一条") : qsTr("定位字幕")
+                            shortcutHint: window.inspectorCue.timed ? "Ctrl+Enter" : ""
+                            enabled: !!editor.selectedCueId && !editor.busy
+                            onClicked: window.runCommand(function() {
+                                if (window.inspectorCue.timed) editor.confirmCurrentCue()
+                                else { window.loadInspector(editor.selectedCueId, window.inspectorCue.text, editor.positionUs, Math.min(editor.durationUs, editor.positionUs + 2000000)); cueEditDialog.open() }
+                            })
+                        }
                         Item { Layout.fillWidth: true }
                     }
                     ListView {
@@ -976,46 +1075,30 @@ Item {
                             id: rowItem
                             required property int index
                             required property var model
-                            readonly property string cueId: model.id
+                            readonly property string cueId: model.id || ""
                             readonly property bool selected: editor.selectedCueId === cueId
                             readonly property bool pending: model.status === "REVIEW" || model.status === "LOW_CONFIDENCE"
                             readonly property bool overlapping: { editor.overlappingCueCount; return editor.cueOverlaps(cueId) }
-                            width: ListView.view.width; height: Math.max(74, rowText.implicitHeight + 26)
+                            width: ListView.view.width; height: Math.max(64, rowContent.implicitHeight + 20)
                             objectName: "subtitleRow_" + (model.sourceIndex - 1)
                             color: selected ? Theme.selection : rowMouse.containsMouse ? Theme.listHover : index % 2 ? Theme.panel : Theme.panelSecondary
                             border.color: selected ? Theme.focusBorder : "transparent"
                             Rectangle { width: 3; height: parent.height - 12; y: 6; visible: rowItem.overlapping; color: Theme.warning }
-                            Label {
-                                x: 8; y: 12; width: 22
-                                text: rowItem.model.sourceIndex; color: Theme.muted; font.pixelSize: 12
-                            }
-                            Column {
-                                x: 36; y: 12; width: 100; spacing: 5
-                                Label { text: rowItem.model.timed ? editor.formatTime(rowItem.model.startMs) : qsTr("未定位"); color: Theme.secondaryText; font.family: "Consolas"; font.pixelSize: 12 }
-                                Label { text: rowItem.model.timed ? editor.formatTime(rowItem.model.endMs) : ""; color: Theme.secondaryText; font.family: "Consolas"; font.pixelSize: 12 }
-                            }
-                            Column {
+                            ColumnLayout {
+                                id: rowContent
                                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
-                                anchors.leftMargin: 144; anchors.rightMargin: 12 + Theme.scrollBarSize; anchors.topMargin: 10; spacing: 5
-                                Label { id: rowText; width: parent.width; text: rowItem.model.text || qsTr("（空字幕）"); color: Theme.text; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight }
-                                Label { width: parent.width; text: [rowItem.pending ? qsTr("待确认") : "", rowItem.overlapping ? qsTr("重叠") : ""].filter(function(value) { return value !== "" }).join(" · "); visible: text !== ""; color: Theme.warning; font.pixelSize: 12; elide: Text.ElideRight }
-                            }
-                            SubButton {
-                                id: rowAction; objectName: "confirmCueButton"
-                                anchors.right: parent.right; anchors.rightMargin: Theme.scrollBarSize + 4; anchors.bottom: parent.bottom; anchors.bottomMargin: 4
-                                width: visible ? 54 : 0; leftPadding: 4; rightPadding: 4
-                                visible: rowItem.selected && (!rowItem.model.timed || rowItem.pending)
-                                enabled: !editor.busy
-                                text: rowItem.model.timed ? qsTr("确认") : qsTr("定位")
-                                onClicked: window.runCommand(function() {
-                                    editor.selectCue(editor.cueRowForId(rowItem.cueId), false)
-                                    if (rowItem.model.timed) editor.confirmCue(editor.cueRowForId(rowItem.cueId))
-                                    else { window.loadInspector(rowItem.cueId, rowItem.model.text, editor.positionUs, Math.min(editor.durationUs, editor.positionUs + 2000000)); cueEditDialog.open() }
-                                })
+                                anchors.leftMargin: 10; anchors.rightMargin: 10 + Theme.scrollBarSize; anchors.topMargin: 10; spacing: 6
+                                RowLayout {
+                                    Layout.fillWidth: true; spacing: 6
+                                    Label { text: rowItem.model.sourceIndex === undefined ? "" : String(rowItem.model.sourceIndex); color: Theme.muted; font.pixelSize: Theme.fontSizeTiny; Layout.minimumWidth: 18 }
+                                    Label { text: rowItem.model.timed ? editor.formatTime(rowItem.model.startMs) + " → " + editor.formatTime(rowItem.model.endMs) : qsTr("未定位"); color: Theme.secondaryText; font.family: "Consolas"; font.pixelSize: Theme.fontSizeTiny; Layout.fillWidth: true; elide: Text.ElideMiddle }
+                                    Label { text: [rowItem.pending ? qsTr("待确认") : "", rowItem.overlapping ? qsTr("重叠") : ""].filter(function(value) { return value !== "" }).join(" · "); visible: text !== ""; color: Theme.warning; font.pixelSize: Theme.fontSizeTiny }
+                                }
+                                Label { id: rowText; Layout.fillWidth: true; text: rowItem.model.text || qsTr("（空字幕）"); color: Theme.text; wrapMode: Text.Wrap; maximumLineCount: 3; elide: Text.ElideRight }
                             }
                             MouseArea {
                                 id: rowMouse; objectName: "subtitleRowMouse"
-                                anchors.fill: parent; anchors.rightMargin: rowAction.visible ? 70 : Theme.scrollBarSize
+                                anchors.fill: parent; anchors.rightMargin: Theme.scrollBarSize
                                 hoverEnabled: true
                                 onClicked: if (window.selectById(rowItem.cueId, true)) cueList.forceActiveFocus(Qt.MouseFocusReason)
                                 onDoubleClicked: if (window.selectById(rowItem.cueId, false)) editor.createOrEditCue()
@@ -1026,14 +1109,14 @@ Item {
                                     + (rowItem.model.candidateText ? "\n" + qsTr("识别候选：") + rowItem.model.candidateText : "")
                             }
                         }
-                        Label { anchors.centerIn: parent; visible: cueList.count === 0; text: qsTr("没有符合条件的字幕"); color: Theme.muted }
+                        Label { anchors.centerIn: parent; width: parent.width - 32; visible: cueList.count === 0; text: editor.subtitleModel.count > 0 ? qsTr("没有符合条件的字幕\n请调整筛选或搜索文字") : qsTr("导入文稿后点击“自动打轴”\n也可按 Enter 新建字幕"); color: Theme.muted; wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter }
                     }
                 }
             }
         }
 
         Item {
-            SplitView.preferredHeight: verticalSplit.height * 0.45
+            SplitView.preferredHeight: verticalSplit.height * 0.38
             SplitView.minimumHeight: Math.min(230, verticalSplit.height * 0.4)
             Rectangle {
                 id: timelineTools
@@ -1153,7 +1236,8 @@ Item {
         objectName: "alignmentProgressDialog"
         property double startedAt: 0
         property int elapsedSeconds: 0
-        onVisibleChanged: if (visible) { startedAt = Date.now(); elapsedSeconds = 0 }
+        property bool cancelRequested: false
+        onVisibleChanged: { cancelRequested = false; if (visible) { startedAt = Date.now(); elapsedSeconds = 0 } }
         Timer {
             interval: 1000
             repeat: true
@@ -1218,7 +1302,7 @@ Item {
                 }
             }
             Label { text: editor.alignmentIndeterminate ? qsTr("处理中…") : editor.alignmentProgress + "%"; color: Theme.text }
-            SubButton { text: qsTr("取消"); onClicked: editor.cancelAlignment() }
+            SubButton { text: alignmentProgressDialog.cancelRequested ? qsTr("取消中…") : qsTr("取消"); enabled: !alignmentProgressDialog.cancelRequested; onClicked: { alignmentProgressDialog.cancelRequested = true; editor.cancelAlignment() } }
         }
     }
     Dialog {
@@ -1296,9 +1380,10 @@ Item {
             if (drop.hasUrls && editor.canImportFiles(drop.urls)) {
                 const urls = Array.from(drop.urls)
                 drop.acceptProposedAction()
+                if (!editor.validateImportFiles(urls)) return
                 window.requestSubtitleLeave(function() {
                     editor.importFiles(urls)
-                })
+                }, urls)
             }
         }
         Rectangle {
@@ -1317,7 +1402,7 @@ Item {
     Action { id: subtitleCommand1; text: qsTr("撤销"); property string keySequence: "Ctrl+Z"; enabled: !editor.busy; onTriggered: window.runCommand(function() { editor.undo() } ) }
     Shortcut { sequence: subtitleCommand1.keySequence; enabled: subtitleCommand1.enabled && (window.visible && !window.textEditing && !window.modalEditing && !editor.busy); onActivated: subtitleCommand1.trigger() }
     Action { id: subtitleCommand2; text: qsTr("重做"); property string keySequence: "Ctrl+Y"; enabled: !editor.busy; onTriggered: window.runCommand(function() { editor.redo() } ) }
-    Shortcut { sequence: subtitleCommand2.keySequence; enabled: subtitleCommand2.enabled && (window.visible && !window.textEditing && !window.modalEditing && !editor.busy); onActivated: subtitleCommand2.trigger() }
+    Shortcut { sequences: [subtitleCommand2.keySequence, "Ctrl+Shift+Z"]; enabled: subtitleCommand2.enabled && (window.visible && !window.textEditing && !window.modalEditing && !editor.busy); onActivated: subtitleCommand2.trigger() }
     Action { id: subtitleCommand3; text: qsTr("删除当前字幕"); property string keySequence: "Delete"; enabled: !editor.busy; onTriggered: window.runCommand(function() { editor.deleteCue() } ) }
     Shortcut { sequence: subtitleCommand3.keySequence; enabled: subtitleCommand3.enabled && (window.visible && !window.textEditing && !window.modalEditing && !editor.busy); onActivated: subtitleCommand3.trigger() }
     Action { id: subtitleCommand4; text: qsTr("反向播放"); property string keySequence: "J"; enabled: true; onTriggered: window.runCommand(function() { editor.playReverse() } ) }

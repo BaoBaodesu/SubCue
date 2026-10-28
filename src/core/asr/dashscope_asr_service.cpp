@@ -10,6 +10,7 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QMap>
+#include <QtCore/QRegularExpression>
 
 #include <algorithm>
 #include <cstdlib>
@@ -27,11 +28,9 @@ QJsonObject sentenceFromEvent(const QJsonObject &event)
 
 QString responseErrorDetail(const QByteArray &body)
 {
-    const QJsonObject error = QJsonDocument::fromJson(body).object();
-    const QString code = error.value(QStringLiteral("code")).toString();
-    const QString message = error.value(QStringLiteral("message")).toString();
-    if (!code.isEmpty() && !message.isEmpty()) return code + QStringLiteral(": ") + message;
-    return message.isEmpty() ? code : message;
+    Q_UNUSED(body);
+    // 不展示服务端正文，避免错误响应回显鉴权信息。
+    return {};
 }
 
 } // namespace
@@ -70,6 +69,7 @@ QString DashScopeAsrService::providerId() const
 
 ProviderTestResult DashScopeAsrService::testConnection(const std::atomic<bool> *cancel)
 {
+    if (endpoint_.isEmpty()) return AppError(ErrorDomain::Asr, 0, QStringLiteral("仅允许已支持地域的官方 ASR 地址"));
     if (asrCancelled(cancel)) {
         return asrCancelledError();
     }
@@ -88,8 +88,8 @@ ProviderTestResult DashScopeAsrService::testConnection(const std::atomic<bool> *
         return std::get<AppError>(std::move(sent));
     }
     const HttpResponse response = std::get<HttpResponse>(std::move(sent));
-    // 空音频通常返回 400；它仍证明端点可达且凭据已通过认证。
-    if (response.status != 200 && response.status != 400) {
+    // 空音频的 400 不能证明模型权限或任务能力已验证。
+    if (response.status != 200) {
         const QString detail = responseErrorDetail(response.body);
         return AppError(ErrorDomain::Asr, response.status,
             detail.isEmpty()
@@ -124,7 +124,14 @@ QString DashScopeAsrService::endpointForApiHost(QString apiHost, QStringView reg
         apiHost += QStringLiteral("/api/v1/services/aigc/multimodal-generation/generation");
     }
     const QUrl url(apiHost);
-    if (!url.isValid() || url.scheme() != QLatin1String("https") || url.host().isEmpty()) return {};
+    const QString host = QUrl(endpointForRegion(region)).host();
+    const QString suffix = region == QLatin1String("singapore")
+        ? QStringLiteral(".ap-southeast-1.maas.aliyuncs.com") : QStringLiteral(".cn-beijing.maas.aliyuncs.com");
+    const QString workspace = url.host().endsWith(suffix) ? url.host().chopped(suffix.size()) : QString();
+    static const QRegularExpression workspacePattern(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9-]{0,127}$"));
+    if (!url.isValid() || url.scheme() != QLatin1String("https") || !url.userInfo().isEmpty()
+        || url.port(443) != 443 || url.hasQuery() || url.hasFragment()
+        || (url.host() != host && !workspacePattern.match(workspace).hasMatch())) return {};
     return url.toString(QUrl::FullyEncoded);
 }
 
@@ -246,6 +253,7 @@ AsrResult DashScopeAsrService::transcribeFlac(
     const QByteArray &flac,
     const std::atomic<bool> *cancel)
 {
+    if (endpoint_.isEmpty()) return AppError(ErrorDomain::Asr, 0, QStringLiteral("仅允许已支持地域的官方 ASR 地址"));
     if (asrCancelled(cancel)) {
         return asrCancelledError();
     }

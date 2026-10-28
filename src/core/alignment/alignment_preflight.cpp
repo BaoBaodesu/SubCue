@@ -65,7 +65,7 @@ QVector<PreflightIssue> AlignmentPreflight::check(
             addIssue(issues, "asr_key_missing", QStringLiteral("云端 ASR API Key 尚未配置"),
                      {}, QStringLiteral("asr"));
         }
-        if (!state.asrVerified) {
+        if (!state.asrVerified && !settings.value(QStringLiteral("unifiedAsrConfigured")).toBool()) {
             addIssue(issues, "asr_not_verified", QStringLiteral("云端 ASR 尚未通过连接测试"),
                      {}, QStringLiteral("asr"));
         }

@@ -47,6 +47,7 @@ public:
     void close();
     void play();
     void pause();
+    void setOutputGain(float gain) { outputGain_.store(gain); }
     quint64 seek(MediaTime target);
     [[nodiscard]] bool stepForward(AppError *error = nullptr);
     [[nodiscard]] bool stepBackward(AppError *error = nullptr);
@@ -68,6 +69,7 @@ public:
     [[nodiscard]] bool isOpen() const noexcept { return open_.load(); }
     [[nodiscard]] bool hasVideo() const noexcept { return hasVideo_.load(); }
     [[nodiscard]] bool hasAudio() const noexcept { return hasAudio_.load(); }
+    [[nodiscard]] bool audioFinished() const { return hasAudio_.load() && endOfStream_.load() && audioFrames_.size() == 0 && audioOutput_.bufferedFrames() == 0; }
     [[nodiscard]] int outputSampleRate() const noexcept { return outputSampleRate_; }
     [[nodiscard]] int outputChannels() const noexcept { return outputChannels_; }
     [[nodiscard]] HwAccelType hwAccel() const noexcept;
@@ -104,6 +106,7 @@ private:
     void beginClock(MediaTime start);
     [[nodiscard]] bool receiveVideoFrame(quint64 generation, AVFrame *frame, AppError *error);
 
+    std::atomic<float> outputGain_{1.0f};
     SeekController seek_;
     AudioClock clock_;
     AudioOutput audioOutput_;

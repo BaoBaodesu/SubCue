@@ -163,6 +163,17 @@ def parse_docx(path):
 
 
 def run_request(request, progress=None):
+    if request.get("offlineOnly"):
+        # 声音样本整理禁止 SDK 在缺失依赖时隐式下载，只约束本 Worker。
+        import os
+        import socket
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        def reject_connection(*args, **kwargs):
+            raise RuntimeError("Offline sample transcription cannot access network; check local model dependencies")
+        socket.create_connection = reject_connection
+        socket.socket.connect = reject_connection
+        socket.socket.connect_ex = reject_connection
     if request.get("action") == "ping":
         return {"python": sys.version.split()[0]}
     if request.get("action") == "runtime-check":

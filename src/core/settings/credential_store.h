@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtCore/QString>
+#include <QtCore/QStringList>
 
 namespace subcue {
 
@@ -18,6 +19,12 @@ public:
         const QString &credentialId,
         QString *errorMessage = nullptr) const = 0;
     [[nodiscard]] virtual bool exists(const QString &credentialId) const = 0;
+    [[nodiscard]] virtual QStringList list(const QString &prefix, QString *errorMessage = nullptr) const
+    {
+        Q_UNUSED(prefix);
+        if (errorMessage) *errorMessage = QStringLiteral("凭据库不支持枚举");
+        return {};
+    }
 };
 
 } // namespace subcue

@@ -1,4 +1,6 @@
+#include "cloud_settings_controller.h"
 #include "app_controller.h"
+#include "project_session.h"
 #include "common/file_path_guard.h"
 #include "project/project_serializer.h"
 #include "roughcut/rough_cut_project.h"
@@ -43,6 +45,7 @@
 #include <QtCore/QUuid>
 #include <QtGui/QDesktopServices>
 #include <QtGui/QFont>
+#include <QtGui/QColor>
 #include <QtGui/QFontMetrics>
 #include <QtGui/QUndoStack>
 
@@ -134,6 +137,7 @@ AppController::AppController(ApplicationContext *context, QObject *parent)
       editor_(&document_, &commands_, &viewport_, &snap_)
 {
     Q_ASSERT(context_ != nullptr);
+    cloudSettings_ = new CloudSettingsController(context_, this);
     filteredModel_.setSourceModel(&model_);
     savedFingerprint_ = projectFingerprint();
     context_->registerAudioClient(&playback_);
@@ -265,6 +269,29 @@ QString AppController::currentSubtitleText() const { return currentSubtitle_; }
 QString AppController::subtitleFontFamily() const
 {
     return setting(QStringLiteral("fontFamily")).toString();
+}
+
+bool AppController::applySubtitleStyle(const QVariantMap &values)
+{
+    if ((values.contains(QStringLiteral("fontFamily")) && values.value(QStringLiteral("fontFamily")).toString().trimmed().isEmpty())
+        || (values.contains(QStringLiteral("fontSize1080p")) && (values.value(QStringLiteral("fontSize1080p")).toInt() < 12 || values.value(QStringLiteral("fontSize1080p")).toInt() > 200))
+        || (values.contains(QStringLiteral("bottomMargin1080p")) && (values.value(QStringLiteral("bottomMargin1080p")).toInt() < 0 || values.value(QStringLiteral("bottomMargin1080p")).toInt() > 600))
+        || (values.contains(QStringLiteral("alignment")) && !QStringList{QStringLiteral("bottom-left"), QStringLiteral("bottom-center"), QStringLiteral("bottom-right")}.contains(values.value(QStringLiteral("alignment")).toString()))
+        || (values.contains(QStringLiteral("fontColor")) && !QColor(values.value(QStringLiteral("fontColor")).toString()).isValid())
+        || (values.contains(QStringLiteral("outlineColor")) && !QColor(values.value(QStringLiteral("outlineColor")).toString()).isValid())) {
+        setStatus(QStringLiteral("字幕样式无效：请检查字体、字号（12～200）、底边距（0～600）、对齐和颜色。"));
+        return false;
+    }
+    auto style = projectSnapshot().state.value(QStringLiteral("exportStyle")).toObject();
+    for (const QString &key : {QStringLiteral("fontFamily"), QStringLiteral("fontSize1080p"), QStringLiteral("bottomMargin1080p"),
+            QStringLiteral("alignment"), QStringLiteral("fontColor"), QStringLiteral("outlineColor")}) {
+        if (values.contains(key)) style.insert(key, QJsonValue::fromVariant(values.value(key)));
+    }
+    if (style != projectSnapshot().state.value(QStringLiteral("exportStyle")).toObject()) {
+        projectData_.state.insert(QStringLiteral("exportStyle"), style);
+        setModified(true); emit settingsChanged(); refreshMultilineFlags();
+    }
+    return true;
 }
 
 int AppController::subtitleFontSize() const
@@ -418,17 +445,17 @@ void AppController::loadMediaPath(const QString &path)
         emit canReviewChanged();
         emit canOmniReviewChanged();
     }
+    if (!sameFilePath(mediaPath_, path)) {
+        // 首次补充音频保留已导入的字幕；切换媒体只清除依赖旧媒体的定位结果。
+        if (!mediaPath_.isEmpty()) {
+            commands_.clear();
+            document_.setSubtitles({});
+            selectedCue_ = -1;
+        }
+        projectData_.mediaFingerprint = {};
+    }
     setCanExport(std::any_of(document_.subtitles().cbegin(), document_.subtitles().cend(),
                             [](const Subtitle &subtitle) { return subtitle.isExportable(); }));
-
-    if (!sameFilePath(mediaPath_, path)) {
-        commands_.clear();
-        document_.setSubtitles({});
-        selectedCue_ = -1;
-        projectPath_.clear();
-        projectData_ = {};
-        emit projectChanged();
-    }
     mediaPath_ = QFileInfo(path).canonicalFilePath();
     mediaInfo_ = info;
     durationUs_ = std::max<qint64>(0, info.duration.microseconds());
@@ -519,6 +546,8 @@ QByteArray AppController::projectFingerprint() const
 
 bool AppController::saveProject(const QUrl &url)
 {
+    if (context_->projectSession && context_->projectSession->active())
+        return context_->projectSession->saveProject(url, QStringLiteral("subtitle"));
     if (!canSave()) return false;
     const QString path = localPath(url);
     QString error;
@@ -535,7 +564,7 @@ bool AppController::saveProject(const QUrl &url)
     auto *cancel = &backgroundCancel_;
     backgroundCancel_ = false;
     setBusy(true);
-    backgroundTasks_.start([self, cancel, path, project = std::move(project), fingerprint]() mutable {
+    auto save = [self, cancel, path, project = std::move(project), fingerprint]() mutable {
         QString message;
         bool success = !cancel->load();
         if (success && QFileInfo::exists(project.mediaPath)) {
@@ -574,12 +603,16 @@ bool AppController::saveProject(const QUrl &url)
             self->setStatus(success ? QStringLiteral("字幕工程已保存：%1").arg(path) : message);
             emit self->projectSaveFinished(success, path, self->statusText_);
         }, Qt::QueuedConnection);
-    });
+    };
+    projectStorageTask_ = context_->submitProjectStorage(std::move(save));
     return true;
 }
 
 bool AppController::saveCurrentProject()
 {
+    if (context_->projectSession && context_->projectSession->active())
+        return !context_->projectSession->path().isEmpty()
+            && saveProject(QUrl::fromLocalFile(context_->projectSession->path()));
     return !projectPath_.isEmpty() && saveProject(QUrl::fromLocalFile(projectPath_));
 }
 
@@ -654,6 +687,7 @@ void AppController::applyProject(const Project &project, const QString &path, bo
 
 void AppController::newProject()
 {
+    if (context_->projectSession && context_->projectSession->active()) { context_->projectSession->newProject(); return; }
     if (busy_ || shuttingDown_) return;
     applyProject(Project{}, {}, false);
     setStatus(QStringLiteral("新建字幕工程。"));
@@ -661,6 +695,11 @@ void AppController::newProject()
 
 void AppController::openProject(const QUrl &url)
 {
+    if (context_->projectSession) {
+        if (!context_->projectSession->openProject(url, QStringLiteral("subtitle")))
+            emit projectOpenFinished(false, localPath(url), QStringLiteral("工程任务正在处理，请稍后打开。"));
+        return;
+    }
     if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
     const QPointer<AppController> self(this);
@@ -826,6 +865,32 @@ bool AppController::canImportFiles(const QList<QUrl> &urls) const
     });
 }
 
+bool AppController::validateImportFiles(const QList<QUrl> &urls)
+{
+    if (urls.isEmpty() || busy_) return false;
+    for (const auto &url : urls) {
+        const QString path = localPath(url);
+        QFile file(path);
+        if (!canImportFiles({url}) || !file.open(QIODevice::ReadOnly)) {
+            setStatus(QStringLiteral("无法导入：%1。请选择可读取的本地素材或文稿。").arg(path));
+            return false;
+        }
+        if (isMediaPath(path)) {
+            const ProbeResult probed = MediaProbe::probe(path);
+            if (std::holds_alternative<AppError>(probed)) {
+                setStatus(QStringLiteral("无法导入 %1：%2").arg(QFileInfo(path).fileName(), std::get<AppError>(probed).userMessage()));
+                return false;
+            }
+            const auto &info = std::get<MediaInfo>(probed);
+            if (info.videoStreamIndex < 0 && info.audioStreamIndex < 0) {
+                setStatus(QStringLiteral("无法导入 %1：没有可用的音频或视频流。").arg(QFileInfo(path).fileName()));
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void AppController::importFiles(const QList<QUrl> &urls)
 {
     QString firstMedia;
@@ -937,12 +1002,16 @@ void AppController::startOmniSubtitleReview()
         setStatus(QStringLiteral("请先完成自动打轴后再进行 AI 复核。"));
         return;
     }
-    const OmniReviewSettings settings = OmniReviewSettingsStore::fromJson(context_->settings);
-    const QString apiKey = OmniReviewSettingsStore::resolveApiKey({}, &context_->credentials);
-    if (apiKey.isEmpty()) {
-        setStatus(QStringLiteral("未配置 AI API Key。字幕编辑仍可继续使用。"));
+    OmniReviewSettings settings;
+    QString apiKey, configError;
+    if (!OmniReviewSettingsStore::resolveTask(*context_->cloudConfig, QStringLiteral("subtitleAudioReview"),
+            context_->settings, &settings, &apiKey, &configError)) {
+        setStatus(configError);
         return;
     }
+    if (!context_->trackCloudTask(this, settings.cloudAccountId, [self = QPointer<AppController>(this)] {
+            if (self) { self->alignmentCancel_ = true; self->omniReviewCancel_ = true; self->stopAlignmentWorker(); self->stopOmniReviewWorker(); }
+        })) { setStatus(QStringLiteral("正在修改云端凭据，请稍后启动任务。")); return; }
     stopOmniReviewWorker();
     omniReviewCancel_ = false;
     resetProgress(QStringLiteral("正在复核字幕内容"), QStringLiteral("正在准备 AI 复核…"));
@@ -1005,12 +1074,16 @@ void AppController::startWordMappingReview()
         setStatus(QStringLiteral("缺少有效词级证据，请先完成打轴。"));
         return;
     }
-    const OmniReviewSettings settings = OmniReviewSettingsStore::fromJson(context_->settings);
-    const QString apiKey = OmniReviewSettingsStore::resolveApiKey({}, &context_->credentials);
-    if (apiKey.isEmpty()) {
-        setStatus(QStringLiteral("未配置 AI API Key。字幕编辑仍可继续使用。"));
+    OmniReviewSettings settings;
+    QString apiKey, configError;
+    if (!OmniReviewSettingsStore::resolveTask(*context_->cloudConfig, QStringLiteral("subtitleWordMapping"),
+            context_->settings, &settings, &apiKey, &configError)) {
+        setStatus(configError);
         return;
     }
+    if (!context_->trackCloudTask(this, settings.cloudAccountId, [self = QPointer<AppController>(this)] {
+            if (self) { self->alignmentCancel_ = true; self->omniReviewCancel_ = true; self->stopAlignmentWorker(); self->stopOmniReviewWorker(); }
+        })) { setStatus(QStringLiteral("正在修改云端凭据，请稍后启动任务。")); return; }
     stopOmniReviewWorker();
     omniReviewCancel_ = false;
     resetProgress(QStringLiteral("正在复核时间映射"), QStringLiteral("正在准备时间映射复核…"));
@@ -1104,12 +1177,24 @@ void AppController::startAlignmentRun(bool review)
     const QString mediaPath = mediaPath_;
     const MediaInfo mediaInfo = mediaInfo_;
     QJsonObject settings = context_->settings;
-    if (review && !settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)) {
+    QString asrApiKey, asrConfigError;
+    if (!asrOverride_ && (!review || settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)
+        || settings.value(QStringLiteral("reviewAsrProvider")).toString() == QLatin1String("dashscope"))
+        && !context_->cloudConfig->resolveAsr(&settings, &asrApiKey, &asrConfigError)) {
+        setStatus(asrConfigError);
+        return;
+    }
+    if (review && !settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)
+        && settings.value(QStringLiteral("reviewAsrProvider")).toString() != QLatin1String("dashscope")) {
         settings.insert(QStringLiteral("asrProvider"),
                         settings.value(QStringLiteral("reviewAsrProvider")).toString(QStringLiteral("funasr")));
         settings.insert(QStringLiteral("asrModel"),
                         settings.value(QStringLiteral("reviewAsrModel")).toString(QStringLiteral("Fun-ASR-Nano-2512")));
     }
+    if (!asrOverride_ && AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
+        && !context_->trackCloudTask(this, settings.value(QStringLiteral("cloudAccountId")).toString(), [self = QPointer<AppController>(this)] {
+            if (self) { self->alignmentCancel_ = true; self->omniReviewCancel_ = true; self->stopAlignmentWorker(); self->stopOmniReviewWorker(); }
+        })) { setStatus(QStringLiteral("正在修改云端凭据，请稍后启动任务。")); return; }
     reviewRun_ = review;
     IAsrService *asr = asrOverride_;
     Q_UNUSED(aiOverride_);
@@ -1122,7 +1207,7 @@ void AppController::startAlignmentRun(bool review)
     alignmentProgress_ = 0;
     emit alignmentProgressChanged();
 
-    alignmentThread_ = std::thread([this, generation, mediaPath, mediaInfo, lines, settings, asr] {
+    alignmentThread_ = std::thread([this, generation, mediaPath, mediaInfo, lines, settings, asr, asrApiKey] {
         QElapsedTimer preflightTimer;
         preflightTimer.start();
         const QString asrProvider = AsrProviderFactory::providerIdFromSettings(settings);
@@ -1138,7 +1223,7 @@ void AppController::startAlignmentRun(bool review)
                     == settings.value(QStringLiteral("asrCredentialRevision")).toInt()
                 && !asrVerification.value(QStringLiteral("verifiedAtUtc")).toString().isEmpty());
         const PreflightState preflightState{
-            asr != nullptr || context_->credentials.exists(QStringLiteral("SubCue/ASR/dashscope")),
+            asr != nullptr || !asrApiKey.isEmpty(),
             asrVerified,
         };
         const QVector<PreflightIssue> issues = AlignmentPreflight::check(
@@ -1164,7 +1249,7 @@ void AppController::startAlignmentRun(bool review)
 
         const AlignmentCredentials credentials{
             asrProvider == QLatin1String(kAsrProviderDashScope)
-                ? context_->credentials.load(QStringLiteral("SubCue/ASR/dashscope")) : QString(),
+                ? asrApiKey : QString(),
             {},
         };
         qCInfo(subcueAppLog) << "preflight elapsed_ms=" << preflightTimer.elapsed();
@@ -1202,6 +1287,7 @@ void AppController::startAlignmentRun(bool review)
 
 void AppController::cancelAlignment()
 {
+    if (context_->projectSession && context_->projectSession->changingProject()) { context_->projectSession->cancel(); return; }
     if (!busy_) {
         return;
     }
@@ -1802,6 +1888,10 @@ QVariant AppController::setting(const QString &key) const
     const QJsonObject style = projectData_.state.value(QStringLiteral("exportStyle")).toObject();
     return style.contains(key) ? style.value(key).toVariant() : context_->settings.value(key).toVariant();
 }
+QVariant AppController::defaultSetting(const QString &key) const
+{
+    return context_->settings.value(key).toVariant();
+}
 
 QVariantList AppController::asrProviders() const
 {
@@ -1844,68 +1934,53 @@ QVariantList AppController::asrModels(const QString &providerId) const
 
 void AppController::requestAsrModels(const QString &providerId, const QString &directory, int requestId)
 {
-    Q_UNUSED(directory);
-    emit asrModelsReady(requestId, asrModels(providerId));
-}
-
-void AppController::testAiConnection(const QString &apiKey)
-{
-    const OmniReviewSettings omni = OmniReviewSettingsStore::fromJson(context_->settings);
-    const QString key = OmniReviewSettingsStore::resolveApiKey(apiKey, &context_->credentials);
-    if (key.isEmpty()) {
-        emit aiConnectionTestFinished({
-            {QStringLiteral("success"), false},
-            {QStringLiteral("error"), QStringLiteral("请先输入 API Key，或设置 DASHSCOPE_API_KEY")}});
-        return;
+    auto models = asrModels(providerId);
+    const auto info = AsrProviderCatalog::byId(providerId);
+    if (info.local) {
+        auto settings = context_->settings;
+        settings.insert(QStringLiteral("modelsRoot"), directory);
+        const auto path = ModelLocator::directoryFor(info.modelKind, settings);
+        for (auto &model : models) {
+            auto row = model.toMap();
+            row.insert(QStringLiteral("directory"), path);
+            row.insert(QStringLiteral("ready"), ModelLocator::modelReady(path));
+            model = row;
+        }
     }
-    if (shuttingDown_) return;
-    QPointer<AppController> self(this);
-    IHttpClient *http = context_->aiHttp;
-    backgroundTasks_.start([self, key, omni, http, cancel = &backgroundCancel_] {
-        QwenOmniProvider service(key, omni, http);
-        OmniTestResult tested = service.testConnection(cancel);
-        QVariantMap result;
-        if (std::holds_alternative<AppError>(tested)) {
-            result.insert(QStringLiteral("success"), false);
-            result.insert(QStringLiteral("error"), std::get<AppError>(tested).userMessage());
-        } else {
-            const OmniConnectionTestResult connected = std::get<OmniConnectionTestResult>(tested);
-            result.insert(QStringLiteral("success"), true);
-            result.insert(QStringLiteral("model"), connected.model);
-            result.insert(QStringLiteral("latencyMs"), connected.latencyMs);
-            result.insert(QStringLiteral("promptTokens"), connected.usage.promptTokens);
-            result.insert(QStringLiteral("completionTokens"), connected.usage.completionTokens);
-            result.insert(QStringLiteral("totalTokens"), connected.usage.totalTokens);
-            result.insert(QStringLiteral("verifiedAtUtc"), connected.verifiedAtUtc.toString(Qt::ISODate));
-        }
-        if (self && !cancel->load()) {
-            QMetaObject::invokeMethod(self, [self, result] {
-                if (self) emit self->aiConnectionTestFinished(result);
-            }, Qt::QueuedConnection);
-        }
-    });
+    emit asrModelsReady(requestId, models);
 }
 
-void AppController::testAsrConnection(const QVariantMap &values, const QString &apiKey)
+int AppController::nextSettingsRequestId()
+{
+    return ++settingsRequestId_;
+}
+
+void AppController::testAiConnection(const QString &apiKey, int requestId, bool ignoreSaved)
+{
+    Q_UNUSED(apiKey); Q_UNUSED(ignoreSaved);
+    emit aiConnectionTestFinished({{QStringLiteral("requestId"), requestId}, {QStringLiteral("success"), false},
+        {QStringLiteral("error"), QStringLiteral("旧密钥测试入口已停用，请在 AI 服务中测试统一账号。")}});
+}
+
+void AppController::testAsrConnection(const QVariantMap &values, const QString &apiKey, int requestId)
 {
     QJsonObject settings = context_->settings;
     for (auto iterator = values.cbegin(); iterator != values.cend(); ++iterator) {
         settings.insert(iterator.key(), QJsonValue::fromVariant(iterator.value()));
     }
     const QString provider = AsrProviderFactory::providerIdFromSettings(settings);
-    const QString key = apiKey.trimmed().isEmpty()
-        ? context_->credentials.load(QStringLiteral("SubCue/ASR/dashscope")) : apiKey.trimmed();
-    if (provider == QLatin1String(kAsrProviderDashScope) && key.isEmpty()) {
-        emit asrConnectionTestFinished({
-            {QStringLiteral("success"), false},
-            {QStringLiteral("error"), QStringLiteral("请先输入云端 ASR API Key")}});
+    if (provider == QLatin1String(kAsrProviderDashScope) || !apiKey.trimmed().isEmpty()) {
+        emit asrConnectionTestFinished({{QStringLiteral("requestId"), requestId}, {QStringLiteral("success"), false},
+            {QStringLiteral("error"), QStringLiteral("旧云端测试入口已停用，请在 AI 服务中测试统一账号。")}});
         return;
     }
+    const QString key;
     if (shuttingDown_) return;
     QPointer<AppController> self(this);
-    backgroundTasks_.start([self, settings, key, cancel = &backgroundCancel_] {
+    backgroundTasks_.start([self, settings, key, requestId, cancel = &backgroundCancel_] {
         std::unique_ptr<IAsrService> service = AsrProviderFactory().create(settings, key);
-        const QVariantMap result = providerResult(service->testConnection(cancel));
+        QVariantMap result = providerResult(service->testConnection(cancel));
+        result.insert(QStringLiteral("requestId"), requestId);
         if (self && !cancel->load()) {
             QMetaObject::invokeMethod(self, [self, result] {
                 if (self) emit self->asrConnectionTestFinished(result);
@@ -1920,74 +1995,44 @@ bool AppController::saveSettings(
     const QString &aiApiKey)
 {
     const QJsonObject originalSettings = context_->settings;
+    const auto currentStyle = projectSnapshot().state.value(QStringLiteral("exportStyle")).toObject();
     const QStringList droppedKeys = {
         QStringLiteral("aiAssistEnabled"), QStringLiteral("aiProviderId"), QStringLiteral("aiProviders"),
         QStringLiteral("omniReviewEnabled"), QStringLiteral("omniReviewProvider"),
         QStringLiteral("omniReviewModel"), QStringLiteral("omniReviewBaseUrl"),
         QStringLiteral("omniReviewReasoningEffort"), QStringLiteral("clearAiApiKey"),
+        QStringLiteral("defaultsOnly"),
+        QStringLiteral("voiceApiKey"), QStringLiteral("clearVoiceApiKey"),
     };
-    const bool clearAiKey = values.value(QStringLiteral("clearAiApiKey")).toBool();
+    if (values.contains(QStringLiteral("ttsConnections")) || values.contains(QStringLiteral("ttsActiveConnection"))
+        || values.contains(QStringLiteral("ttsCloudCredential")) || values.contains(QStringLiteral("ttsCloudWorkspace"))
+        || !asrApiKey.trimmed().isEmpty() || !aiApiKey.trimmed().isEmpty()
+        || !values.value(QStringLiteral("voiceApiKey")).toString().isEmpty()
+        || values.value(QStringLiteral("clearAiApiKey")).toBool() || values.value(QStringLiteral("clearVoiceApiKey")).toBool()) {
+        setStatus(QStringLiteral("旧密钥入口已停用，请在 AI 云端与模型中管理账号密钥。")); return false;
+    }
     for (auto iterator = values.cbegin(); iterator != values.cend(); ++iterator) {
-        if (droppedKeys.contains(iterator.key())) continue;
+        if (droppedKeys.contains(iterator.key()) || iterator.key().startsWith(QLatin1String("ttsCloud"))
+            || iterator.key() == QLatin1String("ttsConnections") || iterator.key() == QLatin1String("ttsActiveConnection")) continue;
         context_->settings.insert(iterator.key(), QJsonValue::fromVariant(iterator.value()));
     }
     QString error;
-    const QString asrCredentialId = QStringLiteral("SubCue/ASR/dashscope");
-    const QString omniCredentialId = QString::fromLatin1(kOmniReviewCredentialId);
-    const QString previousAsrSecret = asrApiKey.trimmed().isEmpty()
-        ? QString() : context_->credentials.load(asrCredentialId);
-    const auto restoreCredential = [this](const QString &id, const QString &secret) {
-        if (id.isEmpty()) return;
-        if (secret.isEmpty()) (void)context_->credentials.remove(id);
-        else (void)context_->credentials.save(id, secret);
-    };
-    if (!asrApiKey.trimmed().isEmpty()) {
-        if (!context_->credentials.save(asrCredentialId, asrApiKey.trimmed(), &error)) {
-            context_->settings = originalSettings;
-            setStatus(QStringLiteral("设置保存失败：%1").arg(error));
-            return false;
-        }
-        context_->settings.insert(QStringLiteral("asrCredentialRevision"),
-            context_->settings.value(QStringLiteral("asrCredentialRevision")).toInt() + 1);
-    }
-    QString previousOmniSecret = context_->credentials.load(omniCredentialId);
-    bool omniSecretChanged = false;
-    if (clearAiKey) {
-        omniSecretChanged = true;
-        if (!context_->credentials.remove(omniCredentialId, &error)) {
-            if (!asrApiKey.trimmed().isEmpty()) restoreCredential(asrCredentialId, previousAsrSecret);
-            context_->settings = originalSettings;
-            setStatus(QStringLiteral("设置保存失败：%1").arg(error));
-            return false;
-        }
-    } else if (!aiApiKey.trimmed().isEmpty()) {
-        omniSecretChanged = true;
-        if (!context_->credentials.save(omniCredentialId, aiApiKey.trimmed(), &error)) {
-            if (!asrApiKey.trimmed().isEmpty()) restoreCredential(asrCredentialId, previousAsrSecret);
-            context_->settings = originalSettings;
-            setStatus(QStringLiteral("设置保存失败：%1").arg(error));
-            return false;
-        }
-    }
     if (!context_->settingsManager.save(context_->settings, &error)) {
-        if (!asrApiKey.trimmed().isEmpty()) restoreCredential(asrCredentialId, previousAsrSecret);
-        if (omniSecretChanged) restoreCredential(omniCredentialId, previousOmniSecret);
-        context_->settings = originalSettings;
-        setStatus(QStringLiteral("设置保存失败：%1").arg(error));
-        return false;
+        context_->settings = originalSettings; setStatus(QStringLiteral("设置保存失败：%1").arg(error)); return false;
     }
-    QJsonArray leftoverIds = context_->settings.value(QStringLiteral("legacyAiCredentialIds")).toArray();
-    for (const QJsonValue &id : leftoverIds) {
-        (void)context_->credentials.remove(aiCredentialId(id.toString()));
-    }
-    context_->settings.insert(QStringLiteral("legacyAiCredentialIds"), QJsonArray{});
-    (void)context_->settingsManager.save(context_->settings);
     context_->settings = context_->settingsManager.load();
-    QJsonObject style = projectData_.state.value(QStringLiteral("exportStyle")).toObject();
-    for (auto it = values.cbegin(); it != values.cend(); ++it)
-        if (style.contains(it.key())) style.insert(it.key(), QJsonValue::fromVariant(it.value()));
-    projectData_.state.insert(QStringLiteral("exportStyle"), style);
-    setModified(true);
+    QJsonObject style = values.value(QStringLiteral("defaultsOnly")).toBool() ? currentStyle : projectData_.state.value(QStringLiteral("exportStyle")).toObject();
+    for (const QString &key : {QStringLiteral("fontFamily"), QStringLiteral("fontSize1080p"),
+            QStringLiteral("fontColor"), QStringLiteral("outlineColor"), QStringLiteral("alignment"),
+            QStringLiteral("bottomMargin1080p"), QStringLiteral("outlineSize"), QStringLiteral("shadow")}) {
+        if (!values.value(QStringLiteral("defaultsOnly")).toBool() && values.contains(key) && QJsonValue::fromVariant(values.value(key))
+                != (style.contains(key) ? style.value(key) : originalSettings.value(key)))
+            style.insert(key, QJsonValue::fromVariant(values.value(key)));
+    }
+    if (style != projectData_.state.value(QStringLiteral("exportStyle")).toObject()) {
+        projectData_.state.insert(QStringLiteral("exportStyle"), style);
+        if (!values.value(QStringLiteral("defaultsOnly")).toBool()) setModified(true);
+    }
     emit settingsChanged();
     emit canOmniReviewChanged();
     refreshMultilineFlags();
@@ -1997,12 +2042,8 @@ bool AppController::saveSettings(
 
 QString AppController::aiKeySource(const QString &uiKey, bool ignoreSaved) const
 {
-    const AiKeySource source = OmniReviewSettingsStore::resolveApiKeySource(
-        uiKey, &context_->credentials, ignoreSaved);
-    if (ignoreSaved && source == AiKeySource::Environment) {
-        return QStringLiteral("已清除应用保存的密钥，仍可使用环境变量 DASHSCOPE_API_KEY");
-    }
-    return OmniReviewSettingsStore::resolveApiKeyLabel(uiKey, &context_->credentials, ignoreSaved);
+    Q_UNUSED(uiKey); Q_UNUSED(ignoreSaved);
+    return QStringLiteral("旧入口已停用，请使用统一账号");
 }
 
 QString AppController::credentialStatus(const QString &credentialId) const
@@ -2072,12 +2113,21 @@ void AppController::requestStorageTargets()
     if (shuttingDown_) return;
     QPointer<AppController> self(this);
     const QJsonObject settings = context_->settings;
-    backgroundTasks_.start([self, settings, cancel = &backgroundCancel_] {
+    auto protectedPaths = context_->projectSession ? context_->projectSession->inputPaths() : QStringList{};
+    protectedPaths.append(projectPath_);
+    protectedPaths.append(context_->settingsManager.path());
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("connections.sqlite")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("recovery")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-preview-cache")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-enrollment.json")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-enrollment-history")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-revisions")));
+    backgroundTasks_.start([self, settings, protectedPaths, cancel = &backgroundCancel_] {
         if (!self || cancel->load(std::memory_order_acquire)) return;
         StorageCleaner cleaner(
             QString::fromUtf8(SUBCUE_PROJECT_ROOT),
             ModelLocator::root(settings),
-            QCoreApplication::applicationDirPath());
+            QCoreApplication::applicationDirPath(), protectedPaths);
         const QVector<StorageTarget> scanned = cleaner.scan();
         QVariantList targets;
         targets.reserve(scanned.size());
@@ -2091,8 +2141,9 @@ void AppController::requestStorageTargets()
             });
         }
         if (!self) return;
-        QMetaObject::invokeMethod(self, [self, targets] {
+        QMetaObject::invokeMethod(self, [self, targets, scanned] {
             if (!self) return;
+            self->storagePreview_ = scanned;
             emit self->storageTargetsReady(targets);
         }, Qt::QueuedConnection);
     });
@@ -2101,9 +2152,24 @@ void AppController::requestStorageTargets()
 void AppController::cleanupStorage(const QStringList &ids)
 {
     if (shuttingDown_) return;
+    if (busy_ || (context_->projectSession && context_->projectSession->storageTasksRunning())) {
+        emit storageCleanupFinished(QVariantMap{{QStringLiteral("success"), false}, {QStringLiteral("bytesRemoved"), 0},
+            {QStringLiteral("error"), QStringLiteral("后台任务正在使用存储，请等待任务完成后重新预览清理。")}, {QStringLiteral("removed"), QStringList{}}});
+        return;
+    }
     QPointer<AppController> self(this);
     const QJsonObject settings = context_->settings;
-    backgroundTasks_.start([self, settings, ids, cancel = &backgroundCancel_] {
+    const auto preview = std::exchange(storagePreview_, {});
+    auto protectedPaths = context_->projectSession ? context_->projectSession->inputPaths() : QStringList{};
+    protectedPaths.append(projectPath_);
+    protectedPaths.append(context_->settingsManager.path());
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("connections.sqlite")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("recovery")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-preview-cache")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-enrollment.json")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-enrollment-history")));
+    protectedPaths.append(QFileInfo(context_->settingsManager.path()).absoluteDir().filePath(QStringLiteral("voice-revisions")));
+    backgroundTasks_.start([self, settings, ids, preview, protectedPaths, cancel = &backgroundCancel_] {
         StorageCleanupResult result;
         result.ok = false;
         result.error = QStringLiteral("任务已取消");
@@ -2111,8 +2177,8 @@ void AppController::cleanupStorage(const QStringList &ids)
             StorageCleaner cleaner(
                 QString::fromUtf8(SUBCUE_PROJECT_ROOT),
                 ModelLocator::root(settings),
-                QCoreApplication::applicationDirPath());
-            result = cleaner.remove(ids, cancel);
+                QCoreApplication::applicationDirPath(), protectedPaths);
+            result = cleaner.remove(ids, preview, cancel);
         }
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, result] {
@@ -2139,6 +2205,7 @@ void AppController::shutdown()
     stopOmniReviewWorker();
     stopWaveformWorker();
     backgroundTasks_.waitForDone();
+    projectStorageTask_.waitForFinished();
     stop();
     tickTimer_.stop();
     playback_.setAudioDevice(nullptr, 0);
@@ -2216,6 +2283,7 @@ void AppController::setStatus(const QString &text)
 
 void AppController::setBusy(bool value)
 {
+    if (!value) context_->clearCloudTask(this);
     if (value == busy_) {
         return;
     }

@@ -14,6 +14,7 @@ public:
                             QString *errorMessage = nullptr) const override;
     [[nodiscard]] bool remove(const QString &credentialId, QString *errorMessage = nullptr) const override;
     [[nodiscard]] bool exists(const QString &credentialId) const override;
+    [[nodiscard]] QStringList list(const QString &prefix, QString *errorMessage = nullptr) const override;
 
     [[nodiscard]] QString load(QString *errorMessage = nullptr) const;
     [[nodiscard]] bool save(const QString &apiKey, QString *errorMessage = nullptr) const;

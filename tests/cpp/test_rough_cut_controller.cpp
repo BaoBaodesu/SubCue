@@ -7,9 +7,11 @@
 
 #include <QtCore/QDataStream>
 #include <QtCore/QFile>
+#include <QtCore/QJsonArray>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QThread>
 #include <QtCore/QUrl>
+#include <QtTest/QSignalSpy>
 #include <QtTest/QTest>
 
 #include <cstdio>
@@ -62,6 +64,8 @@ private slots:
     void workspaceSwitchTransfersPlaybackWithoutAutoPlay();
     void sourceAndTimelinePreviewAdvance();
     void reviewFilterAndExportGuards();
+    void keepTailDoesNotBlockExport();
+    void decisionHistoryFrameRateAndStaleAnalysisGuards();
     void cloudAnalysisRequiresSavedCredential();
 
 private:
@@ -425,14 +429,26 @@ void RoughCutControllerTests::cloudAnalysisRequiresSavedCredential()
     const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
     QVERIFY(!wav.isEmpty());
     auto context = makeContext(dir);
-    context->settings.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope"));
+    auto cloud = context->cloudConfig->load();
+    auto accounts = cloud.value(QStringLiteral("accounts")).toArray();
+    accounts.append(QJsonObject{{"id", "cloud-asr"}, {"name", "测试云识别"}, {"vendor", "bailian"}, {"region", "beijing"}, {"enabled", true}});
+    cloud.insert(QStringLiteral("accounts"), accounts);
+    auto models = cloud.value(QStringLiteral("models")).toArray();
+    models.append(QJsonObject{{"id", "cloud-asr"}, {"accountId", "cloud-asr"}, {"remoteId", "fun-asr-flash"}, {"name", "识别"}, {"adapter", "dashscope-asr"}, {"enabled", true}});
+    cloud.insert(QStringLiteral("models"), models);
+    auto bindings = cloud.value(QStringLiteral("bindings")).toArray();
+    for (qsizetype index = 0; index < bindings.size(); ++index)
+        if (bindings.at(index).toObject().value(QStringLiteral("taskId")) == QLatin1String("speechRecognition"))
+            bindings[index] = QJsonObject{{"taskId", "speechRecognition"}, {"target", "cloud-asr"}};
+    cloud.insert(QStringLiteral("bindings"), bindings);
+    QVERIFY(context->cloudConfig->save(cloud, cloud.value(QStringLiteral("revision")).toInteger(), {}));
     RoughCutController controller(context.get());
     controller.loadMedia(QUrl::fromLocalFile(wav));
     QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
     controller.setScriptText(QStringLiteral("第一句。"));
     controller.startAnalysis();
     QVERIFY(!controller.busy());
-    QCOMPARE(controller.statusText(), QStringLiteral("云端 ASR API Key 尚未配置，请在设置中保存凭据。"));
+    QCOMPARE(controller.statusText(), QStringLiteral("任务未配置可用模型或需要添加密钥"));
     QCOMPARE(controller.resultCount(), 0);
 
     FakeAsrService asr;
@@ -444,6 +460,103 @@ void RoughCutControllerTests::cloudAnalysisRequiresSavedCredential()
     QVERIFY(controller.resultCount() > 0);
     QVERIFY(controller.canAiReview());
     QVERIFY(controller.canExport());
+}
+
+void RoughCutControllerTests::keepTailDoesNotBlockExport()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    RoughCutController controller(context.get());
+    const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
+    QVERIFY(!wav.isEmpty());
+
+    // 保留片段会按尾音保护向后延长，剪除范围随之向后收缩；导出守卫必须使用同一份范围，
+    // 否则被保留的尾音会被误报成“与已剪除语音范围重叠”而挡住导出。
+    RoughCutProject project;
+    project.mediaPath = wav;
+    project.mediaSha256 = RoughCutProjectSerializer::mediaSha256(wav, nullptr);
+    project.scriptText = QStringLiteral("第一句。");
+    project.sampleRate = 16'000;
+    project.channels = 1;
+    project.sourceSampleCount = 16'000;
+    project.analysisVersion = 1;
+    project.recording = {{QStringLiteral("p1"), QStringLiteral("第一句。"), 0, 5'000},
+        {QStringLiteral("p2"), QStringLiteral("第二句。"), 5'000, 16'000}};
+    RoughCutSegmentDecision keep;
+    keep.recordingIndex = 0;
+    keep.autoDecision = RoughCutDecision::Keep;
+    RoughCutSegmentDecision cut;
+    cut.recordingIndex = 1;
+    cut.autoDecision = RoughCutDecision::Cut;
+    cut.userDecision = RoughCutDecision::Cut;
+    project.decisions = {keep, cut};
+    const QString projectPath = dir.filePath(QStringLiteral("尾音保护.subcue-roughcut"));
+    QVERIFY(RoughCutProjectSerializer::save(projectPath, project));
+
+    controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY2(controller.canExport(), qPrintable(controller.statusText()));
+    const QString xml = dir.filePath(QStringLiteral("尾音保护.xml"));
+    QSignalSpy exported(&controller, &RoughCutController::exportFinished);
+    controller.exportXml(QUrl::fromLocalFile(xml));
+    QTRY_COMPARE(exported.count(), 1);
+    QVERIFY2(exported.first().first().toBool(), qPrintable(controller.statusText()));
+    QVERIFY(QFileInfo::exists(xml));
+}
+
+void RoughCutControllerTests::decisionHistoryFrameRateAndStaleAnalysisGuards()
+{
+    // 「恢复自动判断」、重做、序列帧率白名单与「分析输入已改变」的导出拦截此前都没有用例；
+    // 这些都会直接改变用户能否导出或丢不丢人工决定。
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    RoughCutController controller(context.get());
+    const QString wav = writeWav(dir.filePath(QStringLiteral("voice.wav")));
+    QVERIFY(!wav.isEmpty());
+    const QString projectPath = writeProject(dir, wav);
+    QVERIFY(!projectPath.isEmpty());
+    controller.openProject(QUrl::fromLocalFile(projectPath));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY2(controller.canExport(), qPrintable(controller.statusText()));
+
+    // 恢复自动判断：清掉人工决定，并记入撤销历史。
+    QVERIFY(controller.decisions().at(0).userDecision.has_value());
+    controller.restoreAutoDecision(0);
+    QVERIFY(!controller.decisions().at(0).userDecision.has_value());
+    QVERIFY(controller.modified());
+    QVERIFY(controller.canUndo());
+    controller.undo();
+    QCOMPARE(controller.decisions().at(0).userDecision, std::optional(RoughCutDecision::Keep));
+
+    // 重做：撤销后应能恢复人工剪除。
+    controller.setDecision(0, QStringLiteral("CUT"));
+    QVERIFY(controller.canUndo());
+    controller.undo();
+    QVERIFY(controller.canRedo());
+    controller.redo();
+    QCOMPARE(controller.decisions().at(0).userDecision, std::optional(RoughCutDecision::Cut));
+    QVERIFY(!controller.canRedo());
+
+    // 序列帧率只接受白名单值；非法值不改工程、不弄脏文档。
+    controller.saveCurrentProject();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.busy(), 8'000);
+    QVERIFY(!controller.modified());
+    const QString allowedRate = controller.sequenceFrameRate();
+    controller.setSequenceFrameRate(QStringLiteral("23/1"));
+    QVERIFY(controller.statusText().contains(QStringLiteral("尚不支持此序列帧率")));
+    QCOMPARE(controller.sequenceFrameRate(), allowedRate);
+    QVERIFY(!controller.modified());
+    controller.setSequenceFrameRate(QStringLiteral("30000/1001"));
+    QCOMPARE(controller.sequenceFrameRate(), QStringLiteral("30000/1001"));
+    QVERIFY(controller.modified());
+
+    // 分析后改文稿 → 结果过期，导出必须被拦住并说明原因。
+    controller.setScriptText(QStringLiteral("第一句。第二句。"));
+    QVERIFY(controller.analysisStale());
+    QVERIFY(!controller.canExport());
+    QVERIFY(controller.xmlExportReason().contains(QStringLiteral("重新分析")));
 }
 
 QTEST_MAIN(RoughCutControllerTests)

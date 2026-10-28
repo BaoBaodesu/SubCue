@@ -82,7 +82,7 @@ private slots:
     void windowsKeepGlobalOffsetAndOverlap();
     void correctSubtitleStaysKeep();
     void missingTextSuggestsReplace();
-    void invalidJsonBecomesReviewAfterRetry();
+    void invalidJsonBecomesReviewWithoutRetry();
     void authFailureAbortsReview();
     void cancelStopsReview();
     void gatedCutRequiresReplacementExceptNoise();
@@ -154,7 +154,7 @@ void AiReviewServiceTests::missingTextSuggestsReplace()
     QCOMPARE(cue.text, QStringLiteral("你好"));
 }
 
-void AiReviewServiceTests::invalidJsonBecomesReviewAfterRetry()
+void AiReviewServiceTests::invalidJsonBecomesReviewWithoutRetry()
 {
     FakeHttpClient http;
     http.responses.append({200, {}, QByteArrayLiteral("not-json")});
@@ -164,7 +164,7 @@ void AiReviewServiceTests::invalidJsonBecomesReviewAfterRetry()
     SubtitleOmniRequest request;
     request.segments.append(segment(QStringLiteral("a"), QStringLiteral("你好"), 0, 1000));
     const auto suggestions = std::get<QVector<SubtitleOmniSuggestion>>(service.reviewSubtitles(request));
-    QCOMPARE(http.sendCount, 2);
+    QCOMPARE(http.sendCount, 1);
     QCOMPARE(suggestions.at(0).decision, SubtitleOmniDecision::Review);
 }
 

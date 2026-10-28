@@ -189,6 +189,7 @@ private slots:
     void controllerDoesNotDetachBackgroundThreads();
     void applicationDoesNotImportPython();
     void applicationIconResourcesExist();
+    void qmlRuntimeFilesAreRegistered();
 
 private:
     [[nodiscard]] QString sourcePath(const QString &relative) const;
@@ -272,6 +273,7 @@ void SourceHygieneTests::qmlKeepsFrozenShortcutMatrix()
     editingKeys.remove(QStringLiteral("Ctrl+I"));
     editingKeys.insert(QStringLiteral("Shift+Tab"));
     editingKeys.insert(QStringLiteral("Ctrl+S"));
+    editingKeys.insert(QStringLiteral("Ctrl+Shift+Z"));
     QCOMPARE(shortcutTokens(workspace), editingKeys);
     const auto fileKeys = shortcutTokens(readText(QStringLiteral("src/app/qml/AppRouter.qml")));
     for (const auto &key : {QStringLiteral("Ctrl+O"), QStringLiteral("Ctrl+S"), QStringLiteral("Ctrl+Shift+S"),
@@ -331,7 +333,10 @@ void SourceHygieneTests::nativeSourcesDoNotLaunchPythonRuntime()
             }
             const QString text = QString::fromUtf8(file.readAll());
             for (const QString &token : forbidden) {
-                if (text.contains(token, Qt::CaseSensitive)) {
+                // Qt 的参数修饰接口仍由受管理的 QProcess 启动，不是直接调用系统 API。
+                if (token == QLatin1String("CreateProcess")
+                    ? QRegularExpression(QStringLiteral("\\bCreateProcess(?:A|W)?\\s*\\(")).match(text).hasMatch()
+                    : text.contains(token, Qt::CaseSensitive)) {
                     const QString relative = sourceRoot.relativeFilePath(path);
                     if (relative.startsWith(QLatin1String("src/inference/"))
                         && token == QLatin1String("python312.dll")) {
@@ -400,6 +405,16 @@ void SourceHygieneTests::applicationIconResourcesExist()
     QVERIFY(readText(QStringLiteral("CMakeLists.txt")).contains(QStringLiteral("src/app/resources/app.rc")));
     QVERIFY(readText(QStringLiteral("src/app/qml/AboutWindow.qml")).contains(QStringLiteral("icons/app-icon.png")));
     QVERIFY(readText(QStringLiteral("src/app/main.cpp")).contains(QStringLiteral("setWindowIcon")));
+}
+
+void SourceHygieneTests::qmlRuntimeFilesAreRegistered()
+{
+    const auto cmake = readText(QStringLiteral("CMakeLists.txt"));
+    const auto files = QDir(sourcePath(QStringLiteral("src/app/qml"))).entryList({QStringLiteral("*.qml")}, QDir::Files);
+    for (const auto &file : files) {
+        const auto path = QStringLiteral("src/app/qml/") + file;
+        QVERIFY2(cmake.contains(path), qPrintable(QStringLiteral("QML 文件未登记到构建资源：") + path));
+    }
 }
 
 QTEST_MAIN(SourceHygieneTests)

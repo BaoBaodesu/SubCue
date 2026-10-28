@@ -1,4 +1,5 @@
 #include "rough_cut_controller.h"
+#include "project_session.h"
 #include "common/file_path_guard.h"
 #include "video_preview_item.h"
 #include <QtCore/QJsonDocument>
@@ -107,15 +108,6 @@ QString asrProviderName(const QJsonObject &settings)
         return AsrProviderCatalog::displayName(provider);
     }
     return settings.value(QStringLiteral("asrModel")).toString(QStringLiteral("云端 ASR"));
-}
-
-QString savedAsrApiKey(const ApplicationContext *context, const QJsonObject &settings)
-{
-    if (!context || AsrProviderFactory::providerIdFromSettings(settings)
-        != QLatin1String(kAsrProviderDashScope)) {
-        return {};
-    }
-    return context->credentials.load(QStringLiteral("SubCue/ASR/dashscope")).trimmed();
 }
 
 QString scriptDocumentText(const ScriptDocument &document)
@@ -300,7 +292,16 @@ void RoughCutController::loadMedia(const QUrl &url)
             postUi([message](RoughCutController *controller) { controller->finishJobWithoutResults(message); });
             return;
         }
-        postUi([path, info, sourceCount = std::get<qint64>(audioEnd)](RoughCutController *controller) {
+        // 工程的素材身份必须随导入一起记录，否则保存会以“粗剪工程数据不完整”失败，
+        // 统一工程快照也会缺少指纹，重开后素材被判离线且无法重新定位。
+        QString hashError;
+        const QByteArray mediaHash = RoughCutProjectSerializer::mediaSha256(path, &hashError, &cancel_);
+        if (mediaHash.size() != 32) {
+            postUi([message = hashError.isEmpty() ? QStringLiteral("无法确认素材指纹。") : hashError]
+                (RoughCutController *controller) { controller->finishJobWithoutResults(message); });
+            return;
+        }
+        postUi([path, info, mediaHash, sourceCount = std::get<qint64>(audioEnd)](RoughCutController *controller) {
             if (controller->cancel_) {
                 controller->finishJobWithoutResults(QStringLiteral("校验已取消。"));
                 return;
@@ -318,6 +319,10 @@ void RoughCutController::loadMedia(const QUrl &url)
             controller->mediaPath_ = QFileInfo(path).canonicalFilePath();
             controller->mediaInfo_ = info;
             controller->projectData_ = {};
+            controller->projectData_.mediaSha256 = mediaHash;
+            const QFileInfo mediaFile(path);
+            controller->projectData_.state.insert(QStringLiteral("mediaSize"), mediaFile.size());
+            controller->projectData_.state.insert(QStringLiteral("mediaMtime"), mediaFile.lastModified().toMSecsSinceEpoch());
             controller->projectData_.state.insert(QStringLiteral("timelineOptions"), OmniReviewSettingsStore::toJsonPatch(OmniReviewSettingsStore::fromJson(controller->context_->settings)));
             if (info.videoStreamIndex >= 0) {
                 const auto &video = info.streams.at(info.videoStreamIndex);
@@ -398,6 +403,8 @@ RoughCutProject RoughCutController::projectSnapshot() const
 
 bool RoughCutController::saveProject(const QUrl &url)
 {
+    if (context_ && context_->projectSession && context_->projectSession->active())
+        return context_->projectSession->saveProject(url, QStringLiteral("roughcut"));
     if (!canSave()) return false;
     const QString path = localPath(url);
     QString error;
@@ -413,7 +420,7 @@ bool RoughCutController::saveProject(const QUrl &url)
     const QPointer<RoughCutController> self(this);
     auto *cancel = &cancel_;
     beginTask(QStringLiteral("正在保存工程"), false);
-    worker_ = std::thread([self, cancel, path, project = std::move(project), fingerprint]() mutable {
+    auto save = [self, cancel, path, project = std::move(project), fingerprint]() mutable {
         QString message;
         bool success = !cancel->load();
         const QFileInfo media(project.mediaPath);
@@ -446,12 +453,17 @@ bool RoughCutController::saveProject(const QUrl &url)
             self->setStatus(success ? QStringLiteral("粗剪工程已保存：%1").arg(path) : message);
             emit self->projectSaveFinished(success, path, self->statusText_);
         }, Qt::QueuedConnection);
-    });
+    };
+    if (context_) projectStorageTask_ = context_->submitProjectStorage(std::move(save));
+    else worker_ = std::thread(std::move(save));
     return true;
 }
 
 bool RoughCutController::saveCurrentProject()
 {
+    if (context_ && context_->projectSession && context_->projectSession->active())
+        return !context_->projectSession->path().isEmpty()
+            && saveProject(QUrl::fromLocalFile(context_->projectSession->path()));
     return !projectPath_.isEmpty() && saveProject(QUrl::fromLocalFile(projectPath_));
 }
 
@@ -469,6 +481,10 @@ void RoughCutController::applyProject(const RoughCutProject &project, const QStr
     mediaPath_ = project.mediaPath;
     scriptPath_ = project.scriptPath;
     scriptText_ = project.scriptText;
+    // 老工程或外部写入的工程可能没有记录分析时的文稿基线；用保存的文稿回填，
+    // 否则改文稿后“分析输入已改变”永远判不出来，导出会带着旧结果继续放行。
+    if (!project.recording.isEmpty() && !projectData_.state.contains(QStringLiteral("analysisScriptText")))
+        projectData_.state.insert(QStringLiteral("analysisScriptText"), project.scriptText);
     projectPath_ = path;
     sampleRate_ = project.sampleRate;
     channels_ = project.channels;
@@ -526,6 +542,7 @@ void RoughCutController::applyProject(const RoughCutProject &project, const QStr
 
 void RoughCutController::newProject()
 {
+    if (context_ && context_->projectSession && context_->projectSession->active()) { context_->projectSession->newProject(); return; }
     if (busy_ || shuttingDown_) return;
     stopWorker();
     applyProject(RoughCutProject{}, {}, MediaInfo{}, false);
@@ -534,6 +551,11 @@ void RoughCutController::newProject()
 
 void RoughCutController::openProject(const QUrl &url)
 {
+    if (context_ && context_->projectSession) {
+        if (!context_->projectSession->openProject(url, QStringLiteral("roughcut")))
+            emit projectOpenFinished(false, localPath(url), QStringLiteral("工程任务正在处理，请稍后打开。"));
+        return;
+    }
     if (busy_ || shuttingDown_) return;
     const QString path = localPath(url);
     stopWorker();
@@ -752,14 +774,21 @@ void RoughCutController::setTimelineItem(QObject *item)
 void RoughCutController::startAnalysis()
 {
     if (busy_ || shuttingDown_ || mediaPath_.isEmpty()) return;
-    const QJsonObject settings = context_->settings;
-    const QString apiKey = savedAsrApiKey(context_, settings);
+    QJsonObject settings = context_->settings;
+    QString apiKey, configError;
+    if (!asrOverride_ && !context_->cloudConfig->resolveAsr(&settings, &apiKey, &configError)) {
+        setStatus(configError); return;
+    }
     if (!asrOverride_
         && AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
         && apiKey.isEmpty()) {
         setStatus(QStringLiteral("云端 ASR API Key 尚未配置，请在设置中保存凭据。"));
         return;
     }
+    if (!asrOverride_ && AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
+        && !context_->trackCloudTask(this, settings.value(QStringLiteral("cloudAccountId")).toString(), [self = QPointer<RoughCutController>(this)] {
+            if (self) { self->cancelAnalysis(); self->stopWorker(); self->finishJobWithoutResults(QStringLiteral("账号凭据已移除，相关任务已取消。")); }
+        })) { setStatus(QStringLiteral("正在修改云端凭据，请稍后启动任务。")); return; }
     stopWorker();
     cancel_ = false;
     beginTask(QStringLiteral("正在分析"), false);
@@ -921,6 +950,7 @@ void RoughCutController::startAnalysis()
 
 void RoughCutController::cancelAnalysis()
 {
+    if (context_ && context_->projectSession && context_->projectSession->changingProject()) { context_->projectSession->cancel(); return; }
     if (!busy_ || cancelling_) return;
     cancelling_ = true;
     cancel_ = true;
@@ -933,12 +963,16 @@ void RoughCutController::cancelAnalysis()
 void RoughCutController::startAiReview()
 {
     if (busy_ || model_.rowCount() == 0) return;
-    const OmniReviewSettings omniSettings = OmniReviewSettingsStore::fromJson(context_->settings);
-    const QString omniKey = OmniReviewSettingsStore::resolveApiKey({}, &context_->credentials);
-    if (omniKey.isEmpty()) {
-        setStatus(QStringLiteral("未配置 AI API Key。"));
+    OmniReviewSettings omniSettings;
+    QString omniKey, configError;
+    if (!OmniReviewSettingsStore::resolveTask(*context_->cloudConfig, QStringLiteral("roughcutAudioReview"),
+            context_->settings, &omniSettings, &omniKey, &configError)) {
+        setStatus(configError);
         return;
     }
+    if (!context_->trackCloudTask(this, omniSettings.cloudAccountId, [self = QPointer<RoughCutController>(this)] {
+            if (self) { self->cancelAnalysis(); self->stopWorker(); self->finishJobWithoutResults(QStringLiteral("账号凭据已移除，相关任务已取消。")); }
+        })) { setStatus(QStringLiteral("正在修改云端凭据，请稍后启动任务。")); return; }
     RoughCutOmniRequest reviewRequest;
     reviewRequest.mediaPath = mediaPath_;
     reviewRequest.scriptText = scriptText_;
@@ -1057,18 +1091,28 @@ void RoughCutController::startAuxiliaryRecognition()
         model_.recording(), model_.decisions(), sampleRate_, sourceSampleCount_);
     if (ranges.isEmpty()) { setStatus(QStringLiteral("没有需要辅助识别的 REVIEW 片段。")); return; }
     QJsonObject settings = context_->settings;
-    if (!settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)) {
+    if (!settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)
+        && settings.value(QStringLiteral("reviewAsrProvider")).toString() != QLatin1String("dashscope")) {
         settings.insert(QStringLiteral("asrProvider"),
             settings.value(QStringLiteral("reviewAsrProvider")).toString(QStringLiteral("funasr")));
         settings.insert(QStringLiteral("asrModel"),
             settings.value(QStringLiteral("reviewAsrModel")).toString(QStringLiteral("Fun-ASR-Nano-2512")));
     }
-    const QString apiKey = savedAsrApiKey(context_, settings);
+    QString apiKey, configError;
+    if ((settings.value(QStringLiteral("reviewUseSameAsr")).toBool(true)
+        || AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope))
+        && !context_->cloudConfig->resolveAsr(&settings, &apiKey, &configError)) {
+        setStatus(configError); return;
+    }
     if (AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
         && apiKey.isEmpty()) {
         setStatus(QStringLiteral("云端 ASR API Key 尚未配置，请在设置中保存凭据。"));
         return;
     }
+    if (!asrOverride_ && AsrProviderFactory::providerIdFromSettings(settings) == QLatin1String(kAsrProviderDashScope)
+        && !context_->trackCloudTask(this, settings.value(QStringLiteral("cloudAccountId")).toString(), [self = QPointer<RoughCutController>(this)] {
+            if (self) { self->cancelAnalysis(); self->stopWorker(); self->finishJobWithoutResults(QStringLiteral("账号凭据已移除，相关任务已取消。")); }
+        })) { setStatus(QStringLiteral("正在修改云端凭据，请稍后启动任务。")); return; }
     stopWorker();
     cancel_ = false;
     beginTask(QStringLiteral("正在辅助识别"), false);
@@ -1384,6 +1428,13 @@ RoughCutExportRequest RoughCutController::exportRequest(QString *error) const
     request.sourceRangesAreFrameAligned = projectData_.state.value(QStringLiteral("timelineVersion")).toInt() >= 2;
     request.frameRateNumerator = sequenceFrameRate().section(QLatin1Char('/'), 0, 0).toInt();
     request.frameRateDenominator = sequenceFrameRate().section(QLatin1Char('/'), 1, 1).toInt();
+    // 时间线用的是经过尾音保护的剪切范围：保留片段的尾音可能落在原始剪切范围之内。
+    // 这里必须比对同一份调整后的范围，否则正常保留的尾音会被误报成“与已剪除语音重叠”。
+    QVector<RecognizedPassage> resolvedRecording = model_.recording();
+    QVector<RoughCutSegmentDecision> resolvedDecisions = model_.decisions();
+    SafeCutBoundary::applyToPassages(&resolvedRecording, &resolvedDecisions, analysisWords_, sampleRate_,
+        sourceSampleCount_, OmniReviewSettingsStore::fromJson(
+            projectData_.state.value(QStringLiteral("timelineOptions")).toObject()));
     for (int index = 0; index < timeline_.size(); ++index) {
         const auto &clip = timeline_.at(index);
         RoughCutSourceClip source{clip.text.isEmpty() ? QStringLiteral("Clip %1").arg(index + 1) : clip.text,
@@ -1395,9 +1446,9 @@ RoughCutExportRequest RoughCutController::exportRequest(QString *error) const
             source.protectedEndSample = passage.endSample;
         }
         // 帧对齐只能借用合法静音，不能跨入已剪除的语音。
-        for (int row = 0; row < model_.recording().size(); ++row) {
-            if (model_.decisions().at(row).effectiveDecision() != RoughCutDecision::Cut) continue;
-            const auto &cut = model_.recording().at(row);
+        for (int row = 0; row < resolvedRecording.size(); ++row) {
+            if (resolvedDecisions.at(row).effectiveDecision() != RoughCutDecision::Cut) continue;
+            const auto &cut = resolvedRecording.at(row);
             if (cut.endSample <= clip.sourceStartSample) source.allowedStartSample = std::max(source.allowedStartSample, cut.endSample);
             else if (cut.startSample >= clip.sourceEndSample) source.allowedEndSample = std::min(source.allowedEndSample, cut.startSample);
             else {
@@ -1454,6 +1505,7 @@ void RoughCutController::stopWorker()
     cancel_ = true;
     ++workerGeneration_;
     if (worker_.joinable()) worker_.join();
+    projectStorageTask_.waitForFinished();
     cancel_ = false;
 }
 
@@ -1578,6 +1630,7 @@ void RoughCutController::setStatus(QString value)
 
 void RoughCutController::setBusy(bool value)
 {
+    if (!value) context_->clearCloudTask(this);
     if (busy_ == value) return;
     busy_ = value;
     if (!value) {

@@ -6,6 +6,8 @@
 #include <QtCore/QFileInfo>
 #include <QtCore/QHash>
 #include <QtCore/QStandardPaths>
+#include <QtCore/QCryptographicHash>
+#include <QtCore/QDateTime>
 
 #include <utility>
 
@@ -19,10 +21,12 @@ QString joinRoot(const QString &root, const QString &relative)
 
 } // namespace
 
-StorageCleaner::StorageCleaner(QString projectRoot, QString modelsRoot, QString keepBuildDirectory)
+StorageCleaner::StorageCleaner(QString projectRoot, QString modelsRoot, QString keepBuildDirectory,
+                               QStringList protectedPaths)
     : projectRoot_(normalize(projectRoot))
     , modelsRoot_(normalize(modelsRoot))
     , keepBuildDirectory_(normalize(keepBuildDirectory))
+    , protectedPaths_(std::move(protectedPaths))
 {
 }
 
@@ -67,7 +71,13 @@ bool StorageCleaner::isPathAllowed(const QString &path) const
 {
     const QString canonical = normalize(path);
     if (canonical.isEmpty() || QFileInfo(canonical).isRelative()) return false;
-    if (!modelsRoot_.isEmpty() && under(canonical, modelsRoot_)) return false;
+    for (const auto &protectedPath : protectedPaths_) {
+        const auto protectedRoot = normalize(protectedPath);
+        if (under(canonical, protectedRoot) || under(protectedRoot, canonical)) return false;
+    }
+    if (!modelsRoot_.isEmpty() && (under(canonical, modelsRoot_) || under(modelsRoot_, canonical))) return false;
+    const auto modelCanonical = QFileInfo(modelsRoot_).canonicalFilePath();
+    if (!modelCanonical.isEmpty() && (under(canonical, modelCanonical) || under(modelCanonical, canonical))) return false;
     if (!projectRoot_.isEmpty()) {
         if (under(canonical, joinRoot(projectRoot_, QStringLiteral("src")))) return false;
         if (under(canonical, joinRoot(projectRoot_, QStringLiteral("tests/media")))) return false;
@@ -120,8 +130,36 @@ void StorageCleaner::appendIfExists(QVector<StorageTarget> *targets, StorageTarg
     target.path = normalize(target.path);
     if (target.path.isEmpty() || !QFileInfo::exists(target.path)) return;
     if (!isPathAllowed(target.path)) return;
+    target.canonicalPath = QFileInfo(target.path).canonicalFilePath();
+    target.fingerprint = fingerprint(target.path);
+    if (target.fingerprint.isEmpty()) return;
+    target.id = QString::fromLatin1(QCryptographicHash::hash(
+        target.path.toCaseFolded().toUtf8(), QCryptographicHash::Sha256).toHex());
     target.bytes = directoryBytes(target.path);
     targets->append(std::move(target));
+}
+
+QByteArray StorageCleaner::fingerprint(const QString &path) const
+{
+    if (QFileInfo(path).canonicalFilePath().compare(normalize(path), Qt::CaseInsensitive) != 0) return {};
+    // 确认后目录被替换、增删或重定向时，要求重新预览。
+    QStringList entries;
+    const auto append = [&entries](const QFileInfo &info) {
+        if (info.isSymLink() || info.isJunction() || info.canonicalFilePath().isEmpty()) return false;
+        entries.append(info.canonicalFilePath() + QLatin1Char('|') + QString::number(info.size())
+            + QLatin1Char('|') + QString::number(info.lastModified().toMSecsSinceEpoch())
+            + QLatin1Char('|') + QString::number(info.birthTime().toMSecsSinceEpoch()));
+        return true;
+    };
+    if (!append(QFileInfo(path))) return {};
+    QDirIterator iterator(path, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        iterator.next();
+        if (!append(iterator.fileInfo())) return {};
+    }
+    entries.sort();
+    return QCryptographicHash::hash(entries.join(QLatin1Char('\n')).toUtf8(), QCryptographicHash::Sha256);
 }
 
 QVector<StorageTarget> StorageCleaner::scan() const
@@ -135,14 +173,7 @@ QVector<StorageTarget> StorageCleaner::scan() const
     appendIfExists(&targets, {QStringLiteral("cache-logs"), QStringLiteral("cache"),
         QStringLiteral("应用日志"), QDir(appData).filePath(QStringLiteral("SubCue/logs"))});
 
-    QDir temp(QDir::tempPath());
-    const QFileInfoList tempEntries = temp.entryInfoList(
-        {QStringLiteral("SubCue-*")}, QDir::Dirs | QDir::Files | QDir::Hidden, QDir::Name);
-    int tempIndex = 0;
-    for (const QFileInfo &entry : tempEntries) {
-        appendIfExists(&targets, {QStringLiteral("cache-temp-%1").arg(tempIndex++), QStringLiteral("cache"),
-            QStringLiteral("临时目录 %1").arg(entry.fileName()), entry.absoluteFilePath()});
-    }
+    // Worker 临时文件由其所有者释放，通用清理不接管生命周期。
 
     if (!developmentTreeVisible()) return targets;
 
@@ -214,10 +245,27 @@ StorageCleanupResult StorageCleaner::remove(
     const QStringList &ids,
     const std::atomic<bool> *cancel) const
 {
+    return remove(ids, scan(), cancel);
+}
+
+StorageCleanupResult StorageCleaner::remove(
+    const QStringList &ids, const QVector<StorageTarget> &preview,
+    const std::atomic<bool> *cancel) const
+{
     StorageCleanupResult result;
-    const QVector<StorageTarget> targets = scan();
     QHash<QString, StorageTarget> byId;
-    for (const StorageTarget &target : targets) byId.insert(target.id, target);
+    for (const StorageTarget &target : preview) byId.insert(target.id, target);
+    // 先验证整个选择，避免发现过期项时已经删掉其他项。
+    for (const QString &id : ids) {
+        const auto target = byId.value(id);
+        if (!byId.contains(id) || !isPathAllowed(target.path)
+            || target.canonicalPath != QFileInfo(target.path).canonicalFilePath()
+            || target.fingerprint.isEmpty() || target.fingerprint != fingerprint(target.path)) {
+            result.ok = false;
+            result.error = QStringLiteral("清理预览已过期或路径不安全，请重新扫描：%1").arg(target.path);
+            return result;
+        }
+    }
     for (const QString &id : ids) {
         if (cancel && cancel->load(std::memory_order_acquire)) {
             result.ok = false;
@@ -230,7 +278,7 @@ StorageCleanupResult StorageCleaner::remove(
             return result;
         }
         const StorageTarget target = byId.value(id);
-        if (!isPathAllowed(target.path)) {
+        if (!isPathAllowed(target.path) || target.fingerprint != fingerprint(target.path)) {
             result.ok = false;
             result.error = QStringLiteral("拒绝清理受保护路径：%1").arg(target.path);
             return result;

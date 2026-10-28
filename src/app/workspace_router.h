@@ -1,11 +1,14 @@
 #pragma once
 
 #include <QtCore/QObject>
+#include <QtCore/QPointer>
 
 namespace subcue {
 
 class AppController;
 class RoughCutController;
+class AudioPreviewController;
+class ProjectSession;
 
 class WorkspaceRouter final : public QObject {
     Q_OBJECT
@@ -18,12 +21,18 @@ public:
     [[nodiscard]] QString workspace() const { return workspace_; }
     [[nodiscard]] bool canSwitch() const;
     Q_INVOKABLE bool switchTo(const QString &workspace);
+    void setAudioPreview(AudioPreviewController *preview);
+    void setProjectSession(ProjectSession *session);
 
 signals:
     void workspaceChanged();
     void canSwitchChanged();
 
 private:
+    void suspendPlayback();
+    void restorePlayback();
+    QPointer<AudioPreviewController> preview_;
+    QPointer<ProjectSession> session_;
     AppController *editor_ = nullptr;
     RoughCutController *roughCut_ = nullptr;
     QString workspace_ = QStringLiteral("subtitle");

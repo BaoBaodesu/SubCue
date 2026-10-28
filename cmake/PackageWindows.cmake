@@ -47,6 +47,10 @@ set(_qt_plugins "${_qt_prefix}/plugins")
 file(REMOVE_RECURSE "${SUBCUE_PACKAGE_DIR}")
 file(MAKE_DIRECTORY "${SUBCUE_PACKAGE_DIR}")
 file(COPY "${SUBCUE_EXE}" DESTINATION "${SUBCUE_PACKAGE_DIR}")
+file(MAKE_DIRECTORY "${SUBCUE_PACKAGE_DIR}/inference")
+file(COPY "${SUBCUE_SOURCE_DIR}/tools/tts_python_worker.py" DESTINATION "${SUBCUE_PACKAGE_DIR}/inference")
+file(COPY "${SUBCUE_SOURCE_DIR}/tools/audio_emotion_worker.py" DESTINATION "${SUBCUE_PACKAGE_DIR}/inference")
+file(COPY "${SUBCUE_SOURCE_DIR}/tools/tts_external_engines.py" "${SUBCUE_SOURCE_DIR}/tools/tts_engine_preflight.py" DESTINATION "${SUBCUE_PACKAGE_DIR}/inference")
 set(_development_bytes 0)
 if(SUBCUE_LOCAL_INFERENCE)
     set(_inference_dir "${SUBCUE_PACKAGE_DIR}/inference")
@@ -302,6 +306,10 @@ if(_forbidden_hits)
 endif()
 
 set(_required
+    "${SUBCUE_PACKAGE_DIR}/inference/tts_python_worker.py"
+    "${SUBCUE_PACKAGE_DIR}/inference/audio_emotion_worker.py"
+    "${SUBCUE_PACKAGE_DIR}/inference/tts_external_engines.py"
+    "${SUBCUE_PACKAGE_DIR}/inference/tts_engine_preflight.py"
     "${SUBCUE_PACKAGE_DIR}/SubCue.exe"
     "${SUBCUE_PACKAGE_DIR}/avcodec-63.dll"
     "${SUBCUE_PACKAGE_DIR}/avformat-63.dll"

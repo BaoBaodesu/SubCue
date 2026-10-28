@@ -46,6 +46,7 @@ struct AsrRequest final {
     QString mediaPath;
     const std::atomic<bool> *cancel = nullptr;
     std::function<void(int current, int total)> progress;
+    bool offlineOnly = false;
 };
 
 using AsrResult = std::variant<Transcript, AppError>;

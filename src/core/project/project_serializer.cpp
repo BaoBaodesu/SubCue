@@ -8,6 +8,7 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QSaveFile>
 #include <QtCore/QSet>
+#include <QtCore/QCryptographicHash>
 
 #include <utility>
 #include <cmath>
@@ -123,6 +124,12 @@ QByteArray ProjectSerializer::fingerprint(const Project &project)
 
 bool ProjectSerializer::save(const QString &path, const Project &project, QString *errorMessage, const std::atomic<bool> *cancel)
 {
+    return save(path, project, errorMessage, cancel, nullptr);
+}
+
+bool ProjectSerializer::save(const QString &path, const Project &project, QString *errorMessage,
+    const std::atomic<bool> *cancel, QByteArray *committedSha256)
+{
     if (!safeOutputPath(path, {project.mediaPath}, errorMessage)) return false;
     if (!validState(project.state, errorMessage)) return false;
     QJsonArray tracks;
@@ -192,6 +199,7 @@ bool ProjectSerializer::save(const QString &path, const Project &project, QStrin
         if (errorMessage) *errorMessage = file.errorString();
         return false;
     }
+    if (committedSha256) *committedSha256 = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
     return true;
 }
 

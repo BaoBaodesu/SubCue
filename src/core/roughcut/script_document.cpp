@@ -61,7 +61,7 @@ ScriptDocumentResult ScriptDocumentImporter::loadDocx(
         {QStringLiteral("path"), QFileInfo(path).absoluteFilePath()},
         {QStringLiteral("resultPath"), resultPath}}).toJson(QJsonDocument::Compact) + '\n';
     const InferenceProcessResult result = InferenceManager::instance().run(
-        program, {QStringLiteral("--stdio")}, request, cancel, 60'000);
+        program, {QStringLiteral("--stdio")}, request, cancel, 60'000, {}, QStringLiteral("导入文稿"), false);
     if (result.cancelled) {
         return AppError(ErrorDomain::Validation, 4, QStringLiteral("任务已取消"));
     }

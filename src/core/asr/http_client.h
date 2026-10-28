@@ -26,6 +26,9 @@ struct HttpRequest final {
     QByteArray body;
     int connectTimeoutMs = 15'000;
     int transferTimeoutMs = 360'000;
+    bool followRedirects = true;
+    qint64 maxResponseBytes = 0;
+    qint64 maxDownloadBytes = 0;
 };
 
 struct HttpResponse final {

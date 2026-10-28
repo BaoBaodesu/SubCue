@@ -7,10 +7,13 @@
 #include <QtCore/QString>
 
 namespace subcue {
+class CloudConfigStore;
 
 class OmniReviewSettingsStore final {
 public:
     [[nodiscard]] static OmniReviewSettings fromJson(const QJsonObject &settings);
+    [[nodiscard]] static bool resolveTask(const CloudConfigStore &store, const QString &taskId,
+        const QJsonObject &defaults, OmniReviewSettings *settings, QString *key, QString *error);
     [[nodiscard]] static QJsonObject toJsonPatch(const OmniReviewSettings &settings);
     [[nodiscard]] static QString resolveApiKey(
         const QString &uiKey = {},

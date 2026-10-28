@@ -281,7 +281,7 @@ void PlaybackEngine::installSampleProvider()
         if (available <= 0) {
             return 0;
         }
-        const qint64 guard = av_rescale(sampleRate, 2, 1'000);
+        const qint64 guard = endOfStream_.load() ? 0 : av_rescale(sampleRate, 2, 1'000);
         const qint64 requestedFrames = std::min(
             maximumFrames, std::max<qint64>(0, available - guard));
         if (requestedFrames <= 0) {
@@ -293,6 +293,8 @@ void PlaybackEngine::installSampleProvider()
         if (frames > 0) {
             std::memcpy(destination, samples.constData(),
                         static_cast<size_t>(samples.size()) * sizeof(float));
+            const float gain = outputGain_.load();
+            if (gain != 1.0f) for (qsizetype i = 0; i < samples.size(); ++i) destination[i] *= gain;
         }
         return frames;
     });
@@ -525,10 +527,12 @@ void PlaybackEngine::onSchedulerWake()
 
 void PlaybackEngine::demuxLoop()
 {
+    bool eofSent = false;
     while (!stop_.load()) {
         quint64 generation = 0;
         MediaTime target;
         if (seek_.takePending(&generation, &target)) {
+            eofSent = false;
             const int streamIndex = hasVideo_.load() ? videoStreamIndex_.load() : audioStreamIndex_.load();
             const AVRational timeBase = hasVideo_.load() ? videoTimeBase_ : audioTimeBase_;
             if (streamIndex >= 0) {
@@ -540,6 +544,7 @@ void PlaybackEngine::demuxLoop()
         AppError error(ErrorDomain::Media, 0, QString());
         PacketPtr packet = demuxer_.readPacket(&error);
         if (seek_.takePending(&generation, &target)) {
+            eofSent = false;
             const int streamIndex = hasVideo_.load() ? videoStreamIndex_.load() : audioStreamIndex_.load();
             const AVRational timeBase = hasVideo_.load() ? videoTimeBase_ : audioTimeBase_;
             if (streamIndex >= 0) {
@@ -548,6 +553,12 @@ void PlaybackEngine::demuxLoop()
             continue;
         }
         if (!packet) {
+            if (!eofSent && error.code() == 0) {
+                generation = seek_.generation();
+                if (hasAudio_.load()) (void)audioPackets_.push(PacketPtr{}, 0, generation);
+                if (hasVideo_.load()) (void)videoPackets_.push(PacketPtr{}, 0, generation);
+                eofSent = true;
+            }
             std::unique_lock lock(demuxMutex_);
             demuxWake_.wait_for(lock, std::chrono::milliseconds(20), [this] {
                 return stop_.load() || seek_.isPending();
@@ -672,6 +683,7 @@ void PlaybackEngine::audioLoop()
         return;
     }
     quint64 lastGeneration = 0;
+    MediaTime nextPts;
     while (!stop_.load()) {
         BoundedQueue<PacketPtr>::Item item;
         if (!audioPackets_.pop(item)) {
@@ -679,6 +691,8 @@ void PlaybackEngine::audioLoop()
         }
         if (item.generation != lastGeneration) {
             audioDecoder_.flush();
+            AppError error(ErrorDomain::Decoder, 0, QString());
+            if (!resampler_.configure(*audioDecoder_.context(), outputSampleRate_, outputChannels_, &error)) break;
             lastGeneration = item.generation;
         }
         if (!seek_.canCommit(item.generation)) {
@@ -689,7 +703,24 @@ void PlaybackEngine::audioLoop()
         auto receiveAll = [&] {
             for (;;) {
                 const int received = audioDecoder_.receive(frame.get());
-                if (received == AVERROR(EAGAIN) || received == AVERROR_EOF) {
+                if (received == AVERROR_EOF) {
+                    // 编码器尾帧与重采样延迟都要排出，不能把有效末尾样本留在缓冲中。
+                    AVFrame empty{};
+                    AppError error(ErrorDomain::Decoder, 0, QString());
+                    while (!stop_.load() && seek_.canCommit(item.generation)) {
+                        auto tail = resampler_.convert(empty, &error);
+                        if (tail.isEmpty()) break;
+                        const qsizetype bytes = tail.size() * static_cast<qsizetype>(sizeof(float));
+                        const MediaTime pts = nextPts;
+                        nextPts = MediaTime::fromMicroseconds(nextPts.microseconds()
+                            + av_rescale(tail.size() / outputChannels_, 1'000'000, outputSampleRate_));
+                        AudioItem audio{std::move(tail), pts, item.generation};
+                        if (!audioFrames_.push(std::move(audio), bytes, item.generation)) break;
+                    }
+                    if (seek_.canCommit(item.generation)) endOfStream_ = true;
+                    return;
+                }
+                if (received == AVERROR(EAGAIN)) {
                     return;
                 }
                 if (received < 0) {
@@ -711,6 +742,8 @@ void PlaybackEngine::audioLoop()
                 if (samples.isEmpty()) {
                     continue;
                 }
+                nextPts = MediaTime::fromMicroseconds(pts.microseconds()
+                    + av_rescale(samples.size() / outputChannels_, 1'000'000, outputSampleRate_));
                 AudioItem audio;
                 audio.samples = std::move(samples);
                 audio.pts = pts;
@@ -724,7 +757,7 @@ void PlaybackEngine::audioLoop()
             sent = audioDecoder_.send(item.value.get());
         }
         if (sent == AVERROR_EOF) {
-            endOfStream_ = true;
+            if (seek_.canCommit(item.generation)) endOfStream_ = true;
             continue;
         }
         if (sent < 0) {

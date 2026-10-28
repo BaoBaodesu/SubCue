@@ -13,11 +13,13 @@
 #include "timeline/timeline_viewport.h"
 #include "waveform/waveform_pyramid.h"
 #include "project/project.h"
+#include "settings/storage_cleaner.h"
 
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QJsonObject>
 #include <QtCore/QPointer>
 #include <QtCore/QThreadPool>
+#include <QtCore/QFuture>
 #include <QtCore/QTimer>
 #include <QtCore/QStringList>
 #include <QtCore/QUrl>
@@ -38,7 +40,9 @@ class TimelineSceneItem;
 class VideoPreviewItem;
 
 class AppController : public QObject {
+    friend class ProjectSession;
     Q_OBJECT
+    Q_PROPERTY(QObject *cloudSettings READ cloudSettings CONSTANT)
     Q_PROPERTY(QObject *subtitleModel READ subtitleModel CONSTANT)
     Q_PROPERTY(QObject *filteredSubtitleModel READ filteredSubtitleModel CONSTANT)
     Q_PROPERTY(QString selectedCueId READ selectedCueId NOTIFY selectedCueChanged)
@@ -101,6 +105,7 @@ public:
     ~AppController() override;
 
     [[nodiscard]] QObject *subtitleModel() const;
+    [[nodiscard]] QObject *cloudSettings() const { return cloudSettings_; }
     [[nodiscard]] QObject *filteredSubtitleModel() const { return const_cast<SubtitleFilterModel *>(&filteredModel_); }
     [[nodiscard]] QString selectedCueId() const { return selectedCueId_; }
     [[nodiscard]] int overlapCount() const { return static_cast<int>(subtitleIndex_.overlapRanges().size()); }
@@ -182,6 +187,8 @@ public:
     Q_INVOKABLE void handleDroppedUrl(const QString &value);
     Q_INVOKABLE void importFiles(const QList<QUrl> &urls);
     Q_INVOKABLE bool canImportFiles(const QList<QUrl> &urls) const;
+    Q_INVOKABLE bool validateImportFiles(const QList<QUrl> &urls);
+    Q_INVOKABLE bool applySubtitleStyle(const QVariantMap &values);
     Q_INVOKABLE void openProjectFile(int row);
     Q_INVOKABLE void removeProjectFile(int row);
     Q_INVOKABLE void showProjectFileFolder(int row);
@@ -241,10 +248,12 @@ public:
     Q_INVOKABLE void syncTimelineView(double pixelsPerMs, double scrollOffset);
     Q_INVOKABLE QString formatTime(qint64 ms) const;
     Q_INVOKABLE QVariant setting(const QString &key) const;
+    Q_INVOKABLE QVariant defaultSetting(const QString &key) const;
     Q_INVOKABLE QVariantList asrProviders() const;
     Q_INVOKABLE QVariantList asrModels(const QString &providerId) const;
-    Q_INVOKABLE void testAiConnection(const QString &apiKey = {});
-    Q_INVOKABLE void testAsrConnection(const QVariantMap &values, const QString &apiKey = {});
+    Q_INVOKABLE int nextSettingsRequestId();
+    Q_INVOKABLE void testAiConnection(const QString &apiKey = {}, int requestId = 0, bool ignoreSaved = false);
+    Q_INVOKABLE void testAsrConnection(const QVariantMap &values, const QString &apiKey = {}, int requestId = 0);
     Q_INVOKABLE bool saveSettings(const QVariantMap &values, const QString &asrApiKey = {},
                                   const QString &aiApiKey = {});
     Q_INVOKABLE QString aiKeySource(const QString &uiKey = {}, bool ignoreSaved = false) const;
@@ -339,6 +348,7 @@ private:
     void emitMediaChanged();
 
     ApplicationContext *context_ = nullptr;
+    QObject *cloudSettings_ = nullptr;
     SubtitleDocument document_;
     SubtitleTimeIndex subtitleIndex_;
     SubtitleModel model_;
@@ -363,7 +373,10 @@ private:
     std::atomic<bool> omniReviewCancel_{false};
     std::atomic<quint64> omniReviewGeneration_{0};
     QThreadPool backgroundTasks_;
+    QFuture<void> projectStorageTask_;
     std::atomic<bool> backgroundCancel_{false};
+    QVector<StorageTarget> storagePreview_;
+    int settingsRequestId_ = 0;
     IAsrService *asrOverride_ = nullptr;
     IAiProvider *aiOverride_ = nullptr;
     MediaInfo mediaInfo_;

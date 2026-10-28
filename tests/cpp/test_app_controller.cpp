@@ -1,3 +1,4 @@
+#include "cloud_settings_controller.h"
 #include "app_controller.h"
 #include "application_context.h" // 依赖 ApplicationContext 析构声明
 #include "asr/http_client.h"
@@ -5,6 +6,7 @@
 #include "playback/audio_device.h"
 #include "playback/audio_output.h"
 #include "preview/preview_renderer.h"
+#include "project/project_serializer.h"
 #include "subtitle/subtitle.h"
 #include "subtitle/subtitle_model.h"
 #include "timeline_scene_item.h"
@@ -23,6 +25,7 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonObject>
 #include <QtCore/QTemporaryDir>
+#include <QtCore/QScopeGuard>
 #include <QtGui/QColor>
 #include <QtGui/QImage>
 #include <QtTest/QTest>
@@ -60,6 +63,8 @@ class AppControllerTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    void cleanup();
+    void credentialCleanupPreservesOtherScope();
     void audioOutputTakeFramesAdvancesClockBuffer();
     void virtualAudioDeviceConsumesElapsedAudio();
     void createAudioDeviceVirtualKind();
@@ -69,6 +74,7 @@ private slots:
     void d3d11AdapterFallsBackWithoutWindow();
     void videoPreviewItemPresentsWithoutWindow();
     void appControllerLoadsMediaAndScript();
+    void importOrderPreservesProjectAndSavePath();
     void appControllerImportsDocxFixture();
     void realFixtureCompletesAutomaticAlignmentWhenRequested();
     void unicodeMediaOpensFromDialogAndDrop();
@@ -82,7 +88,14 @@ private slots:
     void appControllerSettingsRoundTrip();
     void settingsRoundTripIncludesModelsRoot();
     void unifiedAiKeySaveClearAndRollback();
+    void cloudDeletionWaitsForOwner();
     void saveSettingsDoesNotSendAiHttp();
+    void settingsOnlyStyleChangesDirtyProject();
+    void defaultsAndVoiceCredentialsStayScoped();
+    void cloudConnectionsPersistAndRollback();
+    void cloudSettingsDraftAndDiscovery();
+    void cloudSwitchConflictAndCapability();
+    void connectionTestsPreserveRequestIdentity();
     void appControllerPreflightReportsAllMissingItems();
     void appControllerExportsSrt();
     void draftProjectRoundTripAndFailedOpenPreservesEdits();
@@ -90,10 +103,13 @@ private slots:
     void wasapiProbeDoesNotCrash();
     void navigatePendingAndMismatchCues();
     void multilinePreviewFlagAndExportPreservesModified();
+    void subtitleTimecodeShortcutsKeepDocumentInSync();
+    void relinkMediaRejectsDifferentContent();
 
 private:
     [[nodiscard]] QString mediaPath(const QString &name) const;
-    [[nodiscard]] std::unique_ptr<ApplicationContext> makeContext(const QTemporaryDir &dir) const;
+    [[nodiscard]] std::unique_ptr<ApplicationContext> makeContext(const QTemporaryDir &dir);
+    QStringList credentialPaths_;
 };
 
 QString AppControllerTests::mediaPath(const QString &name) const
@@ -101,8 +117,41 @@ QString AppControllerTests::mediaPath(const QString &name) const
     return QDir(QString::fromUtf8(SUBCUE_TEST_MEDIA_DIR)).filePath(name);
 }
 
-std::unique_ptr<ApplicationContext> AppControllerTests::makeContext(const QTemporaryDir &dir) const
+void AppControllerTests::cleanup()
 {
+    // 只释放本用例临时路径下的隔离凭据，正式账号命名空间不受影响。
+    for (const auto &path : credentialPaths_) {
+        DpapiCredentialStore keys(path); QString error;
+        for (const auto &prefix : {"SubCue/Cloud/", "SubCue/ASR/", "SubCue/AIReview/", "SubCue/AI/", "SubCue/VoiceStudio/"}) {
+            const auto refs = keys.list(QString::fromLatin1(prefix), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            for (const auto &ref : refs) QVERIFY2(keys.remove(ref, &error), qPrintable(error));
+            QVERIFY2(keys.list(QString::fromLatin1(prefix), &error).isEmpty() && error.isEmpty(), qPrintable(error));
+        }
+    }
+    credentialPaths_.clear();
+}
+
+void AppControllerTests::credentialCleanupPreservesOtherScope()
+{
+    QTemporaryDir directory, otherDirectory; QString error;
+    const auto ref = QStringLiteral("SubCue/Cloud/cleanup-test/version");
+    DpapiCredentialStore other(otherDirectory.filePath(QStringLiteral("credentials.dat")));
+    QVERIFY2(other.save(ref, QStringLiteral("other-test-only"), &error), qPrintable(error));
+    const auto removeOther = qScopeGuard([&] { (void)other.remove(ref); });
+    {
+        auto context = makeContext(directory);
+        QVERIFY2(context->credentials.save(ref, QStringLiteral("owned-test-only"), &error), qPrintable(error));
+    }
+    cleanup();
+    QVERIFY(credentialPaths_.isEmpty());
+    QVERIFY(!DpapiCredentialStore(directory.filePath(QStringLiteral("credentials.dat"))).exists(ref));
+    QVERIFY(other.exists(ref));
+}
+
+std::unique_ptr<ApplicationContext> AppControllerTests::makeContext(const QTemporaryDir &dir)
+{
+    credentialPaths_.append(dir.filePath(QStringLiteral("credentials.dat")));
     return std::make_unique<ApplicationContext>(
         dir.filePath(QStringLiteral("settings.json")),
         dir.filePath(QStringLiteral("credentials.dat")),
@@ -285,6 +334,44 @@ void AppControllerTests::appControllerLoadsMediaAndScript()
     QVERIFY(controller.statusText().contains(QStringLiteral("前检查")));
 }
 
+void AppControllerTests::importOrderPreservesProjectAndSavePath()
+{
+    for (const bool mediaFirst : {false, true}) {
+        QTemporaryDir dir;
+        auto context = makeContext(dir);
+        AppController controller(context.get());
+        const auto path = dir.filePath(QStringLiteral("导入顺序.subcue"));
+        QSignalSpy saved(&controller, &AppController::projectSaveFinished);
+        QVERIFY(controller.saveProject(QUrl::fromLocalFile(path)));
+        QTRY_COMPARE(saved.count(), 1);
+        QVERIFY(saved.last().first().toBool());
+        if (mediaFirst) controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+        controller.setScriptText(QStringLiteral("第一行\n第二行"));
+        if (!mediaFirst) {
+            Subtitle cue; cue.id = QStringLiteral("before-media"); cue.text = QStringLiteral("已导入的字幕");
+            cue.start = MediaTime::fromMilliseconds(100); cue.end = MediaTime::fromMilliseconds(500);
+            controller.applySubtitles({cue});
+            controller.loadMediaPath(mediaPath(QStringLiteral("audio.wav")));
+            QCOMPARE(controller.subtitleModel()->property("count").toInt(), 1);
+        }
+        QCOMPARE(controller.projectPath(), path);
+        QCOMPARE(controller.scriptText(), QStringLiteral("第一行\n第二行"));
+        QVERIFY(controller.saveCurrentProject());
+        QTRY_COMPARE(saved.count(), 2);
+        QVERIFY(saved.last().first().toBool());
+        QVERIFY(!controller.modified());
+        const auto stored = ProjectSerializer::load(path);
+        QVERIFY(stored);
+        QCOMPARE(stored->state.value(QStringLiteral("scriptText")).toString(), controller.scriptText());
+        QCOMPARE(stored->mediaPath, controller.mediaPath());
+        controller.loadMediaPath(mediaPath(QStringLiteral("cfr_av.mp4")));
+        QCOMPARE(controller.projectPath(), path);
+        QVERIFY(controller.saveCurrentProject());
+        QTRY_COMPARE(saved.count(), 3);
+        QVERIFY(saved.last().first().toBool());
+    }
+}
+
 void AppControllerTests::appControllerImportsDocxFixture()
 {
     const QDir appDir(QCoreApplication::applicationDirPath());
@@ -359,6 +446,8 @@ void AppControllerTests::projectFilesImportReopenAndRemove()
     const QUrl video = QUrl::fromLocalFile(mediaPath(QStringLiteral("cfr_av.mp4")));
     const QUrl audio = QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav")));
     QVERIFY(controller.canImportFiles({video, audio}));
+    QVERIFY(controller.validateImportFiles({video, audio}));
+    QVERIFY(controller.projectFiles().isEmpty());
     controller.importFiles({video, audio, video});
     QCOMPARE(controller.projectFiles().size(), 2);
     QVERIFY(controller.hasVideo());
@@ -388,6 +477,8 @@ void AppControllerTests::invalidImportPreservesCurrentMedia()
     QVERIFY(corrupt.open(QIODevice::WriteOnly));
     corrupt.write("invalid media");
     corrupt.close();
+    QVERIFY(!controller.validateImportFiles({QUrl::fromLocalFile(corrupt.fileName())}));
+    QCOMPARE(controller.projectFiles().size(), 1);
     controller.importFiles({QUrl::fromLocalFile(corrupt.fileName())});
     QCOMPARE(controller.mediaPath(), mediaPath(QStringLiteral("cfr_av.mp4")));
     QVERIFY(controller.playback().isOpen());
@@ -541,28 +632,12 @@ void AppControllerTests::timelinePlayheadDoesNotDirtyStaticGeometry()
 
 void AppControllerTests::appControllerSettingsRoundTrip()
 {
-    QTemporaryDir dir;
-    QVERIFY(dir.isValid());
-    auto context = makeContext(dir);
-    AppController controller(context.get());
-    QCOMPARE(controller.credentialStatus(), QStringLiteral("尚未配置"));
-    QSignalSpy credentialSpy(&controller, &AppController::credentialStatusReady);
-    QElapsedTimer responseTimer;
-    responseTimer.start();
-    QCOMPARE(controller.requestCredentialStatus(), QStringLiteral("正在查询…"));
-    QVERIFY(responseTimer.elapsed() < 200);
-    QTRY_COMPARE(credentialSpy.size(), 1);
-    QCOMPARE(credentialSpy.first().at(1).toString(), QStringLiteral("尚未配置"));
-    controller.saveSettings(
-        {{QStringLiteral("fontFamily"), QStringLiteral("SimHei")},
-         {QStringLiteral("fontSize1080p"), 64},
-         {QStringLiteral("region"), QStringLiteral("singapore")}},
-        QStringLiteral("test-key-not-for-log"));
-    QCOMPARE(controller.subtitleFontFamily(), QStringLiteral("SimHei"));
-    QCOMPARE(controller.subtitleFontSize(), 64);
-    QCOMPARE(controller.setting(QStringLiteral("region")).toString(), QStringLiteral("singapore"));
-    QCOMPARE(controller.credentialStatus(), QStringLiteral("已安全保存"));
+    QTemporaryDir dir; auto context = makeContext(dir); AppController controller(context.get());
+    QVERIFY(!controller.saveSettings({}, QStringLiteral("test-key-not-for-log")));
+    QVERIFY(!context->credentials.exists(QStringLiteral("SubCue/ASR/dashscope")));
     QVERIFY(!controller.statusText().contains(QStringLiteral("test-key-not-for-log")));
+    QVERIFY(controller.saveSettings({{QStringLiteral("fontFamily"), QStringLiteral("SimHei")}, {QStringLiteral("fontSize1080p"), 64}}));
+    QCOMPARE(controller.subtitleFontFamily(), QStringLiteral("SimHei")); QCOMPARE(controller.subtitleFontSize(), 64);
 }
 
 void AppControllerTests::settingsRoundTripIncludesModelsRoot()
@@ -580,41 +655,34 @@ void AppControllerTests::settingsRoundTripIncludesModelsRoot()
 
 void AppControllerTests::unifiedAiKeySaveClearAndRollback()
 {
-    QTemporaryDir dir;
-    QVERIFY(dir.isValid());
-    auto context = makeContext(dir);
-    AppController controller(context.get());
-    QCOMPARE(controller.aiKeySource(), QStringLiteral("尚未配置"));
-    QVERIFY(context->credentials.save(QStringLiteral("SubCue/AI/custom"), QStringLiteral("legacy-key")));
-    context->settings.insert(QStringLiteral("legacyAiCredentialIds"),
-        QJsonArray{QStringLiteral("custom")});
-    QVERIFY(controller.saveSettings({}, {}, QStringLiteral("omni-secret-not-for-log")));
-    QVERIFY(!context->credentials.exists(QStringLiteral("SubCue/AI/custom")));
-    QCOMPARE(controller.credentialStatus(QStringLiteral("SubCue/AIReview/qwen_omni")),
-             QStringLiteral("已安全保存"));
-    QCOMPARE(controller.aiKeySource(), QStringLiteral("当前来源：已保存密钥"));
-    QVERIFY(!controller.statusText().contains(QStringLiteral("omni-secret-not-for-log")));
-    QVERIFY(!controller.setting(QStringLiteral("omniReviewEnabled")).isValid()
-            || !controller.setting(QStringLiteral("omniReviewEnabled")).toBool());
-    QVERIFY(!controller.setting(QStringLiteral("aiAssistEnabled")).isValid()
-            || !controller.setting(QStringLiteral("aiAssistEnabled")).toBool());
-
-    const QString settingsPath = dir.filePath(QStringLiteral("settings.json"));
-    QVERIFY(QFile::remove(settingsPath));
-    QVERIFY(QDir().mkdir(settingsPath));
-    QVERIFY(!controller.saveSettings({}, {}, QStringLiteral("replacement-key")));
-    QCOMPARE(context->credentials.load(QStringLiteral("SubCue/AIReview/qwen_omni")),
-             QStringLiteral("omni-secret-not-for-log"));
-    QVERIFY(QDir(settingsPath).removeRecursively());
-
-    QVERIFY(controller.saveSettings({{QStringLiteral("clearAiApiKey"), true}}, {}, {}));
+    QTemporaryDir dir; auto context = makeContext(dir); AppController controller(context.get());
+    CloudSettingsController cloud(context.get()); cloud.begin();
+    const auto account = cloud.addAccount(QStringLiteral("bailian"));
+    QVERIFY(cloud.stageKey(account, QStringLiteral("unified-secret"))); QVERIFY(cloud.save());
+    QCOMPARE(context->cloudConfig->resolveKey(account), QStringLiteral("unified-secret"));
+    QVERIFY(!controller.saveSettings({}, {}, QStringLiteral("legacy-must-not-save")));
     QVERIFY(!context->credentials.exists(QStringLiteral("SubCue/AIReview/qwen_omni")));
-    const QByteArray previous = qgetenv("DASHSCOPE_API_KEY");
-    qputenv("DASHSCOPE_API_KEY", "env-after-clear");
-    QCOMPARE(controller.aiKeySource({}, true),
-             QStringLiteral("已清除应用保存的密钥，仍可使用环境变量 DASHSCOPE_API_KEY"));
-    if (previous.isNull()) qunsetenv("DASHSCOPE_API_KEY");
-    else qputenv("DASHSCOPE_API_KEY", previous);
+    QCOMPARE(context->cloudConfig->resolveKey(account), QStringLiteral("unified-secret"));
+    QVERIFY(!controller.saveSettings({{QStringLiteral("clearAiApiKey"), true}}));
+    QCOMPARE(context->cloudConfig->resolveKey(account), QStringLiteral("unified-secret"));
+    cloud.begin(); cloud.removeKey(account); QVERIFY(cloud.save());
+    QVERIFY(context->cloudConfig->resolveKey(account).isEmpty());
+}
+
+void AppControllerTests::cloudDeletionWaitsForOwner()
+{
+    QTemporaryDir directory; auto context = makeContext(directory); CloudSettingsController cloud(context.get()); cloud.begin();
+    const auto account = cloud.addAccount(QStringLiteral("bailian")); QVERIFY(cloud.stageKey(account, QStringLiteral("old-key"))); QVERIFY(cloud.save());
+    QObject owner, unrelated, intruder; bool stopped = false, unrelatedStopped = false, blocked = false, existedBeforeStop = false;
+    QVERIFY(context->trackCloudTask(&owner, account, [&] {
+        existedBeforeStop = !context->cloudConfig->resolveKey(account).isEmpty();
+        blocked = !context->trackCloudTask(&intruder, account, [] {});
+        stopped = true; context->clearCloudTask(&owner);
+    }));
+    QVERIFY(context->trackCloudTask(&unrelated, QStringLiteral("unrelated"), [&] { unrelatedStopped = true; }));
+    QVERIFY(cloud.stageKey(account, QStringLiteral("rotated-key"))); QVERIFY(cloud.save()); QVERIFY(!stopped);
+    cloud.removeKey(account); QVERIFY(cloud.save()); QVERIFY(stopped); QVERIFY(blocked); QVERIFY(existedBeforeStop); QVERIFY(!unrelatedStopped);
+    QVERIFY(context->cloudConfig->resolveKey(account).isEmpty());
 }
 
 void AppControllerTests::saveSettingsDoesNotSendAiHttp()
@@ -629,8 +697,104 @@ void AppControllerTests::saveSettingsDoesNotSendAiHttp()
     QVERIFY(controller.saveSettings({
         {QStringLiteral("fontFamily"), QStringLiteral("SimHei")},
         {QStringLiteral("clearAiApiKey"), false},
-    }, {}, QStringLiteral("saved-ai-key")));
+    }, {}, {}));
     QCOMPARE(http.sendCount, 0);
+}
+
+void AppControllerTests::cloudConnectionsPersistAndRollback()
+{
+    QTemporaryDir dir; auto context = makeContext(dir); AppController controller(context.get());
+    const auto before = context->cloudConfig->load();
+    QVERIFY(!controller.saveSettings({{QStringLiteral("ttsConnections"), QVariantList{QVariantMap{{QStringLiteral("workspace"), QStringLiteral("old-workspace")}}}}}));
+    QVERIFY(!controller.saveSettings({{QStringLiteral("ttsCloudWorkspace"), QStringLiteral("old-workspace")}}));
+    QCOMPARE(context->cloudConfig->load(), before);
+    QVERIFY(controller.saveSettings({{QStringLiteral("fontFamily"), QStringLiteral("SimHei")}}));
+    QVERIFY(context->settingsManager.load().value(QStringLiteral("ttsConnections")).toArray().isEmpty());
+}
+
+void AppControllerTests::defaultsAndVoiceCredentialsStayScoped()
+{
+    QTemporaryDir dir; auto context = makeContext(dir); AppController controller(context.get());
+    const auto original = controller.setting(QStringLiteral("fontFamily"));
+    const auto reference = QStringLiteral("SubCue/VoiceStudio/SettingsTest");
+    QVERIFY(!controller.saveSettings({{QStringLiteral("voiceApiKey"), QStringLiteral("private-voice-settings-key")}}));
+    QVERIFY(controller.saveSettings({{QStringLiteral("defaultsOnly"), true}, {QStringLiteral("fontFamily"), QStringLiteral("SimHei")}}));
+    QVERIFY(!controller.modified()); QCOMPARE(controller.setting(QStringLiteral("fontFamily")), original);
+    QCOMPARE(controller.defaultSetting(QStringLiteral("fontFamily")).toString(), QStringLiteral("SimHei"));
+    QVERIFY(!context->credentials.exists(reference));
+    QFile settings(context->settingsManager.path()); QVERIFY(settings.open(QIODevice::ReadOnly));
+    QVERIFY(!settings.readAll().contains("private-voice-settings-key")); settings.close();
+    QVERIFY(!context->settings.contains(QStringLiteral("voiceApiKey")));
+    QVERIFY(!controller.saveSettings({{QStringLiteral("clearVoiceApiKey"), true}}));
+    QVERIFY(context->credentials.load(reference).isEmpty()); QVERIFY(!controller.modified());
+    QVERIFY(!controller.applySubtitleStyle({{QStringLiteral("fontSize1080p"), 0}}));
+    QVERIFY(!controller.modified());
+    QVERIFY(controller.applySubtitleStyle({{QStringLiteral("fontFamily"), QStringLiteral("KaiTi")}, {QStringLiteral("fontSize1080p"), 64}}));
+    QVERIFY(controller.modified()); QCOMPARE(controller.subtitleFontFamily(), QStringLiteral("KaiTi"));
+    QCOMPARE(controller.defaultSetting(QStringLiteral("fontFamily")).toString(), QStringLiteral("SimHei"));
+}
+
+void AppControllerTests::settingsOnlyStyleChangesDirtyProject()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    QVERIFY(!controller.modified());
+    QVERIFY(controller.saveSettings({{QStringLiteral("region"), QStringLiteral("singapore")}},
+        {}, {}));
+    QVERIFY(!controller.modified());
+    QVERIFY(controller.saveSettings({{QStringLiteral("fontFamily"), controller.setting(QStringLiteral("fontFamily"))}}));
+    QVERIFY(!controller.modified());
+    QVERIFY(controller.saveSettings({{QStringLiteral("fontFamily"), QStringLiteral("SimHei")}}));
+    QVERIFY(controller.modified());
+
+    QSignalSpy saved(&controller, &AppController::projectSaveFinished);
+    QVERIFY(controller.saveProject(QUrl::fromLocalFile(dir.filePath(QStringLiteral("style.subcue")))));
+    QTRY_COMPARE(saved.count(), 1);
+    QVERIFY(saved.first().first().toBool());
+    QVERIFY(!controller.modified());
+    QVERIFY(controller.saveSettings({{QStringLiteral("fontFamily"), QStringLiteral("SimHei")},
+        {QStringLiteral("outputSrt"), false}}));
+    QVERIFY(!controller.modified());
+    QVERIFY(controller.saveSettings({{QStringLiteral("fontSize1080p"), 64}}));
+    QVERIFY(controller.modified());
+}
+
+void AppControllerTests::connectionTestsPreserveRequestIdentity()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    auto context = makeContext(dir);
+    RecordingHttpClient http;
+    context->aiHttp = &http;
+    AppController controller(context.get());
+    QSignalSpy ai(&controller, &AppController::aiConnectionTestFinished);
+    QSignalSpy asr(&controller, &AppController::asrConnectionTestFinished);
+    const int first = controller.nextSettingsRequestId();
+    const int second = controller.nextSettingsRequestId();
+    QVERIFY(second > first);
+    controller.testAiConnection(QStringLiteral("test-key"), first);
+    controller.testAsrConnection({{QStringLiteral("asrProvider"), QStringLiteral("dashscope")}}, {}, second);
+    QTRY_COMPARE(ai.count(), 1);
+    QCOMPARE(asr.count(), 1);
+    QCOMPARE(ai.first().first().toMap().value(QStringLiteral("requestId")).toInt(), first);
+    QCOMPARE(asr.first().first().toMap().value(QStringLiteral("requestId")).toInt(), second);
+    QVERIFY(!ai.first().first().toMap().value(QStringLiteral("success")).toBool());
+    QVERIFY(!asr.first().first().toMap().value(QStringLiteral("success")).toBool());
+
+    QVERIFY(!controller.saveSettings({}, {}, QStringLiteral("saved-key")));
+    const QByteArray environmentKey = qgetenv("DASHSCOPE_API_KEY");
+    qunsetenv("DASHSCOPE_API_KEY");
+    controller.testAiConnection({}, second, true);
+    if (environmentKey.isNull()) qunsetenv("DASHSCOPE_API_KEY");
+    else qputenv("DASHSCOPE_API_KEY", environmentKey);
+    QCOMPARE(ai.count(), 2);
+    QCOMPARE(ai.last().first().toMap().value(QStringLiteral("requestId")).toInt(), second);
+    QCOMPARE(http.sendCount, 0);
+    controller.testAiConnection(QStringLiteral("test-key"));
+    QTRY_COMPARE(ai.count(), 3);
+    QCOMPARE(ai.last().first().toMap().value(QStringLiteral("requestId")).toInt(), 0);
 }
 
 void AppControllerTests::appControllerPreflightReportsAllMissingItems()
@@ -803,6 +967,209 @@ void AppControllerTests::multilinePreviewFlagAndExportPreservesModified()
     controller.exportSubtitles();
     QVERIFY(controller.statusText().contains(QStringLiteral("导出完成")));
     QVERIFY(controller.modified());
+}
+
+void AppControllerTests::cloudSettingsDraftAndDiscovery()
+{
+    class DiscoveryHttp final : public IHttpClient {
+    public:
+        std::atomic<bool> hold{false}, entered{false}, canceled{false};
+        HttpRequest request;
+        std::variant<HttpResponse, AppError> send(const HttpRequest &value, const std::atomic<bool> *cancel) override {
+            request = value; entered = true;
+            while (hold && !cancel->load()) QThread::msleep(5);
+            if (cancel->load()) { canceled = true; return AppError(ErrorDomain::Network, 1, QStringLiteral("已取消")); }
+            return HttpResponse{200, {}, QByteArrayLiteral("{\"data\":[{\"id\":\"test-model\"},{\"id\":\"cloud-ui-sentinel\"}]}")};
+        }
+        std::variant<qint64, AppError> download(const HttpRequest &, QFile *, qint64,
+            const std::atomic<bool> *, const std::function<void(qint64,qint64)> &) override { return qint64{0}; }
+    } http;
+    QTemporaryDir directory; auto context = makeContext(directory); context->aiHttp = &http;
+    AppController controller(context.get());
+    auto *cloud = qobject_cast<CloudSettingsController *>(controller.cloudSettings()); QVERIFY(cloud);
+    cloud->begin(); QVERIFY(!cloud->dirty());
+    const auto id = cloud->addAccount(QStringLiteral("deepseek")); QVERIFY(!id.isEmpty());
+    QVERIFY(cloud->stageKey(id, QStringLiteral("cloud-ui-sentinel")));
+    const auto model = cloud->addModel(id, QStringLiteral("test-model"), QStringLiteral("compatible-text"));
+    cloud->bindModel(QStringLiteral("subtitleWordMapping"), model);
+    QVERIFY(!QJsonDocument::fromVariant(cloud->accounts()).toJson().contains("cloud-ui-sentinel"));
+    cloud->discoverModels(id); QTRY_VERIFY(http.entered.load()); QTRY_VERIFY(!cloud->busy());
+    QCOMPARE(cloud->discovered().size(), 1); QVERIFY(!http.request.followRedirects);
+    QCOMPARE(http.request.url.host(), QStringLiteral("api.deepseek.com"));
+    QVERIFY2(cloud->save(), qPrintable(cloud->status())); QVERIFY(!cloud->dirty());
+    bool saved = false; for (const auto &value : cloud->accounts()) if (value.toMap().value(QStringLiteral("id")).toString() == id) saved = value.toMap().value(QStringLiteral("keyState")).toString() == QStringLiteral("已保存");
+    QVERIFY(saved);
+    cloud->editAccount(id, {{QStringLiteral("region"), QStringLiteral("singapore")}});
+    QVERIFY(!cloud->dirty()); QVERIFY(cloud->status().contains(QStringLiteral("新建账号")));
+    cloud->editAccount(id, {{QStringLiteral("name"), QStringLiteral("暂存名称")}}); QVERIFY(cloud->dirty());
+    cloud->discard(); QVERIFY(!cloud->dirty());
+    http.entered = false; http.hold = true; cloud->discoverModels(id); QTRY_VERIFY(http.entered.load());
+    cloud->discard(); QTRY_VERIFY(http.canceled.load()); QVERIFY(cloud->discovered().isEmpty());
+    cloud->removeModel(model); QVERIFY(cloud->dirty()); cloud->discard();
+    http.entered = false; http.canceled = false;
+    { CloudSettingsController transient(context.get()); transient.begin(); transient.discoverModels(id); QTRY_VERIFY(http.entered.load()); }
+    QVERIFY(http.canceled.load());
+    cloud->removeKey(id); QVERIFY(cloud->save()); QVERIFY(context->cloudConfig->resolveKey(id).isEmpty());
+}
+
+void AppControllerTests::cloudSwitchConflictAndCapability()
+{
+    class ProbeHttp final : public IHttpClient {
+    public:
+        std::atomic<bool> hold{false}, entered{false}, canceled{false};
+        HttpRequest request;
+        std::variant<HttpResponse, AppError> send(const HttpRequest &value, const std::atomic<bool> *cancel) override {
+            request = value; entered = true;
+            while (hold && !cancel->load()) QThread::msleep(2);
+            if (cancel->load()) { canceled = true; return AppError(ErrorDomain::Network, 1, QStringLiteral("cancel")); }
+            return HttpResponse{200, {}, QByteArrayLiteral(R"({"choices":[{"message":{"tool_calls":[{"function":{"name":"submit_connection_test","arguments":"{\"ok\":true}"}}]}}]})")};
+        }
+        std::variant<qint64, AppError> download(const HttpRequest &, QFile *, qint64, const std::atomic<bool> *, const std::function<void(qint64,qint64)> &) override { return qint64{0}; }
+    } http;
+    QTemporaryDir directory; auto context = makeContext(directory); context->aiHttp = &http;
+    CloudSettingsController cloud(context.get());
+    QVERIFY(cloud.switchTask(QStringLiteral("speechRecognition"), QStringLiteral("local:qwen3")));
+    CloudSettingsController other(context.get());
+    QVERIFY(other.switchTask(QStringLiteral("speechRecognition"), QStringLiteral("local:funasr")));
+    QVERIFY(!cloud.switchTask(QStringLiteral("speechRecognition"), QStringLiteral("local:qwen3")));
+    QVERIFY(!cloud.dirty()); // 冲突不覆盖新配置，也不把失败选择留在表单。
+    cloud.begin();
+    const auto account = cloud.addAccount(QStringLiteral("deepseek"));
+    QVERIFY(cloud.stageKey(account, QStringLiteral("probe-secret")));
+    const auto model = cloud.addModel(account, QStringLiteral("unknown-text"), QStringLiteral("compatible-text"));
+    cloud.bindModel(QStringLiteral("subtitleWordMapping"), model);
+    QVERIFY(!cloud.switchTask(QStringLiteral("speechRecognition"), QStringLiteral("local:qwen3"))); QVERIFY(cloud.dirty());
+    cloud.testCapability(model); QTRY_VERIFY(!cloud.busy());
+    QCOMPARE(cloud.tests().value(model).toMap().value(QStringLiteral("state")).toString(), QStringLiteral("passed"));
+    QVERIFY(context->cloudConfig->resolveKey(account).isEmpty()); // 测试不保存账号或密钥。
+    QVERIFY(!http.request.followRedirects); QVERIFY(!http.request.body.contains("input_audio"));
+    QVERIFY(!http.request.body.contains("enable_thinking"));
+    QVERIFY(cloud.save());
+    QString key, error; QVERIFY(!context->cloudConfig->resolveTask(QStringLiteral("subtitleWordMapping"), &key, &error).isEmpty());
+    QCOMPARE(key, QStringLiteral("probe-secret"));
+    CloudSettingsController reopened(context.get());
+    QCOMPARE(reopened.tests().value(model).toMap().value(QStringLiteral("state")).toString(), QStringLiteral("passed"));
+    QVERIFY(cloud.stageKey(account, QStringLiteral("rotated-probe-secret"))); QVERIFY(cloud.save());
+    QVERIFY(context->cloudConfig->resolveTask(QStringLiteral("subtitleWordMapping"), &key, &error).isEmpty());
+    http.hold = true; http.entered = false; cloud.testCapability(model); QTRY_VERIFY(http.entered.load());
+    other.begin(); other.removeKey(account); QVERIFY(other.save());
+    QVERIFY(http.canceled.load()); QVERIFY(!cloud.busy()); QTest::qWait(20);
+    QVERIFY(cloud.tests().value(model).toMap().value(QStringLiteral("state")) != QStringLiteral("passed"));
+    QVERIFY(!QJsonDocument::fromVariant(cloud.tests()).toJson().contains("probe-secret"));
+}
+
+void AppControllerTests::subtitleTimecodeShortcutsKeepDocumentInSync()
+{
+    // 字幕精修快捷键（[ ]、Q/W、Alt+方向、I/O）此前没有任何断言；这里按用户可见结果校验：
+    // 时间码改动必须落到文档、标记为人工确认、可撤销，并且不越过素材范围或 250ms 最短时长。
+    QTemporaryDir dir;
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    controller.loadMedia(QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav"))));
+    QTRY_VERIFY(!controller.busy());
+    QVERIFY(controller.hasMedia());
+    QVERIFY(controller.durationUs() > 900'000);
+    const auto startOf = [&controller](int row) { return controller.document()->subtitles().at(row).start.microseconds(); };
+    const auto endOf = [&controller](int row) { return controller.document()->subtitles().at(row).end.microseconds(); };
+
+    Subtitle first;
+    first.id = QStringLiteral("a"); first.text = QStringLiteral("第一句");
+    first.start = MediaTime::fromMicroseconds(0); first.end = MediaTime::fromMicroseconds(300'000);
+    first.status = QStringLiteral("MATCHED");
+    Subtitle second;
+    second.id = QStringLiteral("b"); second.text = QStringLiteral("第二句");
+    second.start = MediaTime::fromMicroseconds(310'000); second.end = MediaTime::fromMicroseconds(620'000);
+    second.status = QStringLiteral("MATCHED");
+    Subtitle third;
+    third.id = QStringLiteral("c"); third.text = QStringLiteral("第三句");
+    third.start = MediaTime::fromMicroseconds(640'000); third.end = MediaTime::fromMicroseconds(980'000);
+    third.status = QStringLiteral("MATCHED");
+    controller.applySubtitles({first, second, third});
+
+    // 「]」把当前字幕开始设到播放头；手动改过即视为人工确认。
+    controller.selectCue(1, false);
+    controller.seekUs(330'000);
+    controller.setCurrentStart();
+    QCOMPARE(startOf(1), qint64{330'000});
+    QCOMPARE(controller.document()->subtitles().at(1).status, QStringLiteral("MANUAL"));
+    // Alt+方向微调：25fps 下一帧 40ms，起点左移两帧。
+    controller.nudgeCurrentStart(-2);
+    QCOMPARE(startOf(1), qint64{250'000});
+    // 终点右移两帧，且不得超过素材时长。
+    controller.nudgeCurrentEnd(2);
+    QCOMPARE(endOf(1), qint64{700'000});
+    // 「[」把当前字幕结束设到播放头。
+    controller.seekUs(600'000);
+    controller.setCurrentEnd();
+    QCOMPARE(endOf(1), qint64{600'000});
+    // Q：把上一条的结束对齐到播放头。
+    controller.seekUs(630'000);
+    controller.setPreviousEnd();
+    QCOMPARE(endOf(1), qint64{630'000});
+    // W：把下一条的开始对齐到播放头。
+    controller.seekUs(635'000);
+    controller.setFollowingStart();
+    QCOMPARE(startOf(2), qint64{635'000});
+    QVERIFY(controller.modified());
+
+    // 入点/出点：设置读取播放头，清除回到无入出点。
+    controller.seekUs(200'000);
+    controller.setInPoint();
+    controller.setOutPoint();
+    QCOMPARE(controller.inPoint(), qint64{200});
+    QCOMPARE(controller.outPoint(), qint64{200});
+    controller.clearInPoint();
+    controller.clearOutPoint();
+    QCOMPARE(controller.inPoint(), qint64{-1});
+    QCOMPARE(controller.outPoint(), qint64{-1});
+
+    // 空白文本必须被拒绝，且不改变文档。
+    const QString textBefore = controller.document()->subtitles().at(0).text;
+    QVERIFY(!controller.applyCueEdit(QStringLiteral("a"), QStringLiteral("   "), -1, -1));
+    QVERIFY(controller.statusText().contains(QStringLiteral("不能为空")));
+    QCOMPARE(controller.document()->subtitles().at(0).text, textBefore);
+
+    // Delete 删除当前字幕，撤销可以恢复。
+    const int countBefore = controller.document()->count();
+    controller.selectCue(2, false);
+    controller.deleteCue();
+    QCOMPARE(controller.document()->count(), countBefore - 1);
+    controller.undo();
+    QCOMPARE(controller.document()->count(), countBefore);
+}
+
+void AppControllerTests::relinkMediaRejectsDifferentContent()
+{
+    // 「重新定位素材…」只在内容指纹一致时接管新路径；内容不同的文件必须被拒绝并保留原素材。
+    QTemporaryDir dir;
+    auto context = makeContext(dir);
+    AppController controller(context.get());
+    const QString media = mediaPath(QStringLiteral("audio.wav"));
+    controller.loadMedia(QUrl::fromLocalFile(media));
+    QTRY_VERIFY(!controller.busy() && controller.hasMedia());
+    QSignalSpy saved(&controller, &AppController::projectSaveFinished);
+    const QString projectPath = dir.filePath(QStringLiteral("素材身份.subcue"));
+    QVERIFY(controller.saveProject(QUrl::fromLocalFile(projectPath)));
+    QTRY_COMPARE(saved.count(), 1);
+    QVERIFY2(saved.first().first().toBool(), qPrintable(controller.statusText()));
+
+    const QString copy = dir.filePath(QStringLiteral("同内容副本.wav"));
+    QVERIFY(QFile::copy(media, copy));
+    controller.relinkMedia(QUrl::fromLocalFile(copy));
+    QTRY_VERIFY(!controller.busy());
+    QCOMPARE(QFileInfo(controller.mediaPath()).fileName(), QStringLiteral("同内容副本.wav"));
+    QVERIFY(controller.modified());
+
+    const QString different = dir.filePath(QStringLiteral("不同内容.wav"));
+    QFile other(different);
+    QVERIFY(other.open(QIODevice::WriteOnly));
+    other.write("not-the-same-content");
+    other.close();
+    const QString kept = controller.mediaPath();
+    controller.relinkMedia(QUrl::fromLocalFile(different));
+    QTRY_VERIFY(!controller.busy());
+    QCOMPARE(controller.mediaPath(), kept);
+    QVERIFY(controller.statusText().contains(QStringLiteral("不同")));
 }
 
 QTEST_MAIN(AppControllerTests)

@@ -7,8 +7,26 @@ set(SUBCUE_TEST_PATH_MODIFICATION
 set(SUBCUE_APP_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/app/app_controller.cpp
     ${CMAKE_SOURCE_DIR}/src/app/app_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/cloud_settings_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/cloud_settings_controller.h
     ${CMAKE_SOURCE_DIR}/src/app/application_context.cpp
     ${CMAKE_SOURCE_DIR}/src/app/application_context.h
+    ${CMAKE_SOURCE_DIR}/src/app/project_session.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/project_session.h
+    ${CMAKE_SOURCE_DIR}/src/app/tts_task_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/tts_task_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/voice_library_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/voice_library_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/voice_studio_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/voice_studio_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/voice_audio_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/voice_audio_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/audio_preview_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/audio_preview_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_controller.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_controller.h
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/rough_cut_result_model.h
 )
 set(SUBCUE_APP_TEST_ITEM_SOURCES
     ${CMAKE_SOURCE_DIR}/src/app/timeline_scene_item.cpp
@@ -56,6 +74,16 @@ subcue_register_test(SubCueMediaTimeTests)
 qt_add_executable(SubCueSubtitleProjectTests cpp/test_subtitle_project.cpp)
 target_link_libraries(SubCueSubtitleProjectTests PRIVATE SubCue::Core Qt6::Test)
 subcue_register_test(SubCueSubtitleProjectTests)
+
+qt_add_executable(SubCueProjectStoreTests cpp/test_project_store.cpp)
+qt_add_executable(SubCueAudioQualityTests cpp/test_audio_quality.cpp)
+target_link_libraries(SubCueAudioQualityTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueAudioQualityTests)
+qt_add_executable(SubCueVoiceDocumentTests cpp/test_voice_document.cpp)
+target_link_libraries(SubCueVoiceDocumentTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueVoiceDocumentTests)
+target_link_libraries(SubCueProjectStoreTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueProjectStoreTests)
 
 qt_add_executable(SubCueMediaTests cpp/test_media.cpp)
 target_compile_definitions(SubCueMediaTests PRIVATE
@@ -267,3 +295,7 @@ if(SUBCUE_BUILD_APP)
         TIMEOUT 10
     )
 endif()
+
+qt_add_executable(SubCueCloudConfigTests cpp/test_cloud_config.cpp)
+target_link_libraries(SubCueCloudConfigTests PRIVATE SubCue::Core Qt6::Test)
+subcue_register_test(SubCueCloudConfigTests)

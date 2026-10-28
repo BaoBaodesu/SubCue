@@ -3,15 +3,40 @@
 #include "media/ffmpeg_error.h"
 
 #include <QtCore/QFile>
+#include <QtCore/QFileInfo>
 
 namespace subcue {
 
 bool Demuxer::open(const QString &path, AppError *error)
 {
+    return openInput(path, nullptr, false, error);
+}
+
+bool Demuxer::openLocal(const QString &path, const std::atomic<bool> *cancel, AppError *error)
+{
+    return openInput(path, cancel, true, error);
+}
+
+bool Demuxer::openInput(const QString &path, const std::atomic<bool> *cancel, bool localOnly, AppError *error)
+{
     close();
-    AVFormatContext *rawContext = nullptr;
+    if (localOnly && !QFileInfo(path).isFile()) {
+        if (error) *error = AppError(ErrorDomain::Media, AVERROR(EINVAL), QStringLiteral("本地音频文件不存在或不是普通文件"));
+        return false;
+    }
+    AVFormatContext *rawContext = avformat_alloc_context();
+    if (!rawContext) {
+        if (error) *error = AppError(ErrorDomain::Media, AVERROR(ENOMEM), QStringLiteral("无法创建媒体上下文"));
+        return false;
+    }
+    if (cancel) rawContext->interrupt_callback = {[](void *opaque) {
+        return static_cast<const std::atomic<bool> *>(opaque)->load() ? 1 : 0;
+    }, const_cast<std::atomic<bool> *>(cancel)};
+    AVDictionary *options = nullptr;
+    if (localOnly) av_dict_set(&options, "protocol_whitelist", "file", 0);
     const QByteArray nativePath = path.toUtf8();
-    int result = avformat_open_input(&rawContext, nativePath.constData(), nullptr, nullptr);
+    int result = avformat_open_input(&rawContext, nativePath.constData(), nullptr, &options);
+    av_dict_free(&options);
     if (result < 0) {
         if (error) {
             *error = makeFfmpegError(ErrorDomain::Media, result, QStringLiteral("无法打开媒体文件"), path);

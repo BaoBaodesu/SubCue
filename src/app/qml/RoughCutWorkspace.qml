@@ -8,6 +8,8 @@ Item {
     id: window
     objectName: "roughCutWorkspace"
     property bool auxiliaryCollapsed: false
+    onWidthChanged: if (width > 0 && width < 1280) auxiliaryCollapsed = true
+    property bool resultDetailsExpanded: false
     readonly property var commandActions: [roughCommand0, roughCommand1, roughCommand2, roughCommand3, roughCommand4, roughCommand5, roughCommand6, roughCommand7, roughCommand8, roughCommand9, roughCommand10, roughCommand11, roughCommand12, roughCommand13, roughCommand14, roughCommand15, roughCommand16, roughCommand17, roughCommand18, roughCommand19, roughCommand20, roughCommand21]
     readonly property bool textEditing: window.Window.window && window.Window.window.activeFocusItem
         && typeof window.Window.window.activeFocusItem.inputMethodComposing !== "undefined"
@@ -63,8 +65,11 @@ Item {
     }
     function adjacentResult(delta) {
         if (!resultList.count) return
-        resultList.currentIndex = Math.max(0, Math.min(resultList.count - 1, resultList.currentIndex + delta))
+        hiddenTimelineSelection = -1
+        resultList.currentIndex = resultList.currentIndex < 0 ? (delta > 0 ? 0 : resultList.count - 1)
+            : Math.max(0, Math.min(resultList.count - 1, resultList.currentIndex + delta))
         resultList.positionViewAtIndex(resultList.currentIndex, ListView.Contain)
+        window.activateMonitor(1)
         roughCut.locateResult(currentRecordingIndex())
     }
     function requestAnalysis() {
@@ -82,6 +87,7 @@ Item {
     }
     FileDialog { id: relinkDialog; title: qsTr("重新定位原素材"); parentWindow: window.Window.window; onAccepted: roughCut.relinkMedia(selectedFile) }
     property int selectedMonitor: 0
+    property int hiddenTimelineSelection: -1
     function frameStep(count) {
         const rate = window.selectedMonitor === 1 ? roughCut.sequenceFrameRate.split("/") : null
         const fps = rate ? Number(rate[0]) / Number(rate[1]) : roughCut.sourceFrameRate
@@ -96,14 +102,9 @@ Item {
         }
         (index === 0 ? sourceWaveform : roughTimeline).forceActiveFocus(Qt.MouseFocusReason)
     }
-    Component {
-        id: settingsWindowComponent
-        SettingsWindow { controller: editor }
-    }
-    property var settingsWindow: null
+    readonly property var settingsWindow: window.Window.window ? window.Window.window.settingsWindow : null
     function openSettings() {
-        if (!settingsWindow) settingsWindow = settingsWindowComponent.createObject(window)
-        settingsWindow.show()
+        if (window.Window.window) window.Window.window.openSettings()
     }
 
     function formatTime(milliseconds) {
@@ -133,15 +134,16 @@ Item {
             action()
     }
     function goToReview(delta) {
-        const current = resultList.currentItem && resultList.currentItem.recordingIndex !== undefined
-            ? resultList.currentItem.recordingIndex : -1
+        const current = hiddenTimelineSelection >= 0 && roughCut.filterRowForSource(hiddenTimelineSelection) < 0
+            ? hiddenTimelineSelection : currentRecordingIndex()
         const next = delta > 0 ? roughCut.nextReviewRow(current) : roughCut.previousReviewRow(current)
         if (next < 0) return
-        roughCut.statusFilter = "REVIEW"
         const filterRow = roughCut.filterRowForSource(next)
-        if (filterRow < 0) return
-        resultList.currentIndex = filterRow
-        resultList.positionViewAtIndex(filterRow, ListView.Contain)
+        hiddenTimelineSelection = filterRow < 0 ? next : -1
+        if (filterRow >= 0) {
+            resultList.currentIndex = filterRow
+            resultList.positionViewAtIndex(filterRow, ListView.Contain)
+        }
         window.activateMonitor(1)
         roughCut.locateResult(next)
     }
@@ -159,6 +161,7 @@ Item {
     function auditionCurrent() {
         const row = window.currentRecordingIndex()
         if (row < 0 || roughCut.busy) return
+        window.activateMonitor(0)
         roughCut.audition(row)
     }
     function restoreCurrent() {
@@ -218,34 +221,37 @@ Item {
         Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: Theme.divider }
         RowLayout {
             anchors.fill: parent; anchors.leftMargin: 8; anchors.rightMargin: 8; spacing: 4
-            MenuButton { action: window.Window.window.importAction }
-            MenuButton { action: window.Window.window.scriptAction }
-            MenuButton { text: qsTr("设置模型…"); visible: window.width >= 1280; enabled: !roughCut.busy; onClicked: window.openSettings() }
-            Rectangle { width: 1; height: 24; color: Theme.divider }
-            MenuButton { action: window.Window.window.openAction }
-            MenuButton { action: window.Window.window.saveAction }
-            Rectangle { width: 1; height: 24; color: Theme.divider }
-            MenuButton { action: roughCommand5; visible: window.width >= 1280; enabled: roughCut.canUndo && !roughCut.busy }
-            MenuButton { action: roughCommand6; visible: window.width >= 1280; enabled: roughCut.canRedo && !roughCut.busy }
             MenuButton {
-                id: moreButton; text: qsTr("更多"); onClicked: moreMenu.popup(moreButton, 0, moreButton.height)
+                id: moreButton; text: qsTr("文件"); onClicked: moreMenu.popup(moreButton, 0, moreButton.height)
                 SubMenu {
                     id: moreMenu
-                    MenuItem { text: qsTr("重置布局"); onTriggered: window.resetLayout() }
                     MenuItem { action: window.Window.window.newAction; text: action.text + "    " + action.keySequence }
+                    MenuItem { action: window.Window.window.openAction; text: action.text + "    " + action.keySequence }
+                    MenuItem { action: window.Window.window.saveAction; text: action.text + "    " + action.keySequence }
                     MenuItem { action: window.Window.window.saveAsAction; text: action.text + "    " + action.keySequence }
-                    MenuItem { text: qsTr("重新定位素材"); enabled: !roughCut.busy && roughCut.mediaPath !== ""; onTriggered: relinkDialog.open() }
+                    MenuItem { text: qsTr("重新定位素材…"); enabled: !roughCut.busy && roughCut.mediaPath !== ""; onTriggered: relinkDialog.open() }
+                    MenuSeparator { }
+                    MenuItem { action: window.Window.window.importAction; text: action.text + "    " + action.keySequence }
+                    MenuItem { action: window.Window.window.scriptAction; text: action.text + "    " + action.keySequence }
+                    MenuSeparator { }
+                    MenuItem { action: window.Window.window.exportAction; text: action.text + "    " + action.keySequence; enabled: roughCut.canExport }
+                    MenuItem { text: qsTr("导出 WAV…"); enabled: roughCut.canExport; onTriggered: exportWavDialog.open() }
                     MenuItem { text: window.auxiliaryCollapsed ? qsTr("展开辅助栏") : qsTr("折叠辅助栏"); onTriggered: { window.auxiliaryCollapsed = !window.auxiliaryCollapsed; roughCut.setSessionState(Object.assign({}, roughCut.sessionState, { auxiliaryCollapsed: window.auxiliaryCollapsed })) } }
-                    MenuItem { text: qsTr("设置模型"); onTriggered: window.openSettings() }
-                    MenuItem { text: qsTr("撤销"); enabled: roughCut.canUndo; onTriggered: roughCut.undo() }
-                    MenuItem { text: qsTr("重做"); enabled: roughCut.canRedo; onTriggered: roughCut.redo() }
+                    MenuSeparator { }
+                    MenuItem { action: roughCommand5; enabled: roughCut.canUndo && !roughCut.busy }
+                    MenuItem { action: roughCommand6; enabled: roughCut.canRedo && !roughCut.busy }
                     MenuItem { text: qsTr("AI 复核"); enabled: roughCut.canAiReview; onTriggered: roughCut.startAiReview() }
                     MenuItem { text: qsTr("辅助识别"); enabled: roughCut.resultCount > 0 && !roughCut.busy; onTriggered: roughCut.startAuxiliaryRecognition() }
-                    MenuItem { text: qsTr("导出 WAV"); enabled: roughCut.canExport; onTriggered: exportWavDialog.open() }
+                    MenuItem { text: qsTr("设置…"); onTriggered: window.openSettings() }
+                    MenuItem { text: qsTr("重置布局"); onTriggered: window.resetLayout() }
                 }
             }
-            Item { Layout.fillWidth: true }
-            MenuButton { text: qsTr("开始分析"); enabled: roughCut.mediaAvailable && !roughCut.busy; onClicked: window.requestAnalysis() }
+            MenuButton { action: window.Window.window.importAction }
+            MenuButton { action: window.Window.window.scriptAction }
+            MenuButton { action: window.Window.window.saveAction }
+            Rectangle { implicitWidth: 1; implicitHeight: 24; color: Theme.divider }
+            MenuButton { action: roughCommand5; visible: window.width >= 1280; enabled: roughCut.canUndo && !roughCut.busy }
+            MenuButton { action: roughCommand6; visible: window.width >= 1280; enabled: roughCut.canRedo && !roughCut.busy }
             MenuButton {
                 objectName: "roughCutAiReviewButton"
                 text: qsTr("AI 复核")
@@ -254,9 +260,10 @@ Item {
                 onClicked: roughCut.startAiReview()
             }
             MenuButton { text: qsTr("辅助识别"); visible: window.width >= 1280; enabled: roughCut.resultCount > 0 && !roughCut.busy; onClicked: roughCut.startAuxiliaryRecognition() }
-            MenuButton { text: qsTr("取消"); enabled: roughCut.busy && !roughCut.cancelling; onClicked: roughCut.cancelAnalysis() }
-            MenuButton { text: qsTr("导出 WAV"); visible: window.width >= 1280; enabled: roughCut.canExport; onClicked: exportWavDialog.open() }
-            PrimaryButton { text: qsTr("导出 XML"); enabled: roughCut.canExport; onClicked: window.requestExport() }
+            Item { Layout.fillWidth: true }
+            CloudTaskMenu { cloud: editor.cloudSettings; tasks: [{id: "speechRecognition", name: "语音识别"}, {id: "roughcutAudioReview", name: "粗剪听音复核"}] }
+            PrimaryButton { text: qsTr("开始分析"); enabled: roughCut.mediaAvailable && !roughCut.busy; onClicked: window.requestAnalysis() }
+            SubButton { text: qsTr("导出…"); shortcutHint: "Ctrl+E"; enabled: roughCut.canExport; onClicked: window.requestExport() }
         }
     }
 
@@ -512,7 +519,7 @@ Item {
                 color: Theme.panel; border.color: Theme.border
                 id: roughResultPanel
                 SplitView.preferredWidth: Math.max(300, workspaceSplit.width * Math.max(0.25, Math.min(0.4, roughCut.sessionState.resultRatio || 0.3)))
-                SplitView.minimumWidth: 280; SplitView.maximumWidth: 440
+                SplitView.minimumWidth: 300; SplitView.maximumWidth: 540
                 ColumnLayout {
                     anchors.fill: parent; spacing: 0
                     Rectangle { Layout.fillWidth: true; height: 34; color: Theme.panelHeader; Label { anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: qsTr("分析结果"); color: Theme.text; font.bold: true } }
@@ -526,17 +533,27 @@ Item {
                             onActivated: roughCut.statusFilter = ["ALL", "KEEP", "REVIEW", "CUT"][currentIndex]
                         }
                     }
+                    SubButton {
+                        visible: { roughCut.statusFilter; return window.hiddenTimelineSelection >= 0 && roughCut.filterRowForSource(window.hiddenTimelineSelection) < 0 }
+                        text: qsTr("显示已定位片段（清除筛选）"); Layout.fillWidth: true
+                        onClicked: {
+                            roughCut.statusFilter = "ALL"
+                            resultList.currentIndex = roughCut.filterRowForSource(window.hiddenTimelineSelection)
+                            resultList.positionViewAtIndex(resultList.currentIndex, ListView.Contain)
+                            window.hiddenTimelineSelection = -1
+                        }
+                    }
                     RowLayout {
                         Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.bottomMargin: 4; spacing: 4
                         SubButton {
-                            text: qsTr("上一条待复核")
-                            shortcutHint: "Up"
+                            text: qsTr("上一待复核")
+                            shortcutHint: "Shift+Up"
                             enabled: !roughCut.busy && roughCut.resultModel.reviewCount > 0
                             onClicked: window.goToReview(-1)
                         }
                         SubButton {
-                            text: qsTr("下一条待复核")
-                            shortcutHint: "Down"
+                            text: qsTr("下一待复核")
+                            shortcutHint: "Shift+Down"
                             enabled: !roughCut.busy && roughCut.resultModel.reviewCount > 0
                             onClicked: window.goToReview(1)
                         }
@@ -561,79 +578,77 @@ Item {
                             required property string failureLabel
                             required property string evidenceText
                             required property string technicalDetails
-                            property bool expanded: false
                             width: resultList.width
                             height: Math.max(74, resultColumn.implicitHeight + 20)
                             color: ListView.isCurrentItem ? Theme.selection : index % 2 ? Theme.panelSecondary : Theme.panel
                             border.color: ListView.isCurrentItem ? Theme.accent : Theme.divider
                             border.width: ListView.isCurrentItem ? 2 : 1
                             Rectangle { width: 3; height: parent.height; color: resultRow.status === "CUT" ? Theme.error : resultRow.status === "KEEP" ? Theme.success : Theme.warning }
-                            Label { x: 8; y: 12; width: 24; text: resultRow.recordingIndex + 1; color: Theme.muted; font.pixelSize: 12 }
-                            Column {
-                                x: 36; y: 12; spacing: 5
-                                Label { text: window.formatTime(resultRow.startMs); font.family: "Consolas"; font.pixelSize: 12; color: Theme.secondaryText }
-                                Label { text: window.formatTime(resultRow.endMs); font.family: "Consolas"; font.pixelSize: 12; color: Theme.secondaryText }
-                            }
                             ColumnLayout {
                                 id: resultColumn
                                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
-                                anchors.leftMargin: 144; anchors.rightMargin: 8 + Theme.scrollBarSize; anchors.topMargin: 10
-                                spacing: 4
-                                Label {
-                                    text: resultRow.text; color: Theme.text
-                                    wrapMode: Text.Wrap; maximumLineCount: resultRow.expanded ? 1000 : 2
-                                    elide: resultRow.expanded ? Text.ElideNone : Text.ElideRight; Layout.fillWidth: true
+                                anchors.leftMargin: 10; anchors.rightMargin: 10 + Theme.scrollBarSize; anchors.topMargin: 10
+                                spacing: 6
+                                RowLayout {
+                                    Layout.fillWidth: true; spacing: 6
+                                    Label { text: resultRow.recordingIndex + 1; color: Theme.muted; font.pixelSize: Theme.fontSizeTiny; Layout.minimumWidth: 18 }
+                                    Label { text: window.formatTime(resultRow.startMs) + " → " + window.formatTime(resultRow.endMs); font.family: "Consolas"; font.pixelSize: Theme.fontSizeTiny; color: Theme.secondaryText; Layout.fillWidth: true; elide: Text.ElideMiddle }
+                                    Label { text: resultRow.statusLabel; color: resultRow.status === "CUT" ? Theme.error : resultRow.status === "KEEP" ? Theme.success : Theme.warning; font.pixelSize: Theme.fontSizeTiny }
                                 }
                                 Label {
-                                    text: resultRow.statusLabel + (resultRow.takeGroup >= 0 ? qsTr(" · 第 %1 组").arg(resultRow.takeGroup + 1) : "") + (resultRow.bestTake ? qsTr(" · 最佳 Take") : "")
-                                    color: Theme.secondaryText; font.pixelSize: 12; Layout.fillWidth: true; elide: Text.ElideRight
+                                    text: resultRow.text; color: Theme.text
+                                    wrapMode: Text.Wrap; maximumLineCount: 2
+                                    elide: Text.ElideRight; Layout.fillWidth: true
                                 }
                                 Label {
                                     text: (resultRow.failureLabel !== "" ? resultRow.failureLabel + " · " : "")
-                                          + (resultRow.expanded ? resultRow.reason : resultRow.shortReason)
-                                          + " · " + resultRow.scriptRange
-                                          + (resultRow.replacement !== "" ? " · " + resultRow.replacement : "")
+                                          + resultRow.shortReason
                                     color: Theme.secondaryText
-                                    wrapMode: resultRow.expanded ? Text.Wrap : Text.NoWrap
-                                    elide: resultRow.expanded ? Text.ElideNone : Text.ElideRight
+                                    font.pixelSize: Theme.fontSizeTiny; elide: Text.ElideRight
                                     Layout.fillWidth: true
-                                }
-                                Label {
-                                    visible: resultRow.expanded
-                                    text: qsTr("证据：") + resultRow.evidenceText
-                                    color: Theme.muted
-                                    wrapMode: Text.Wrap
-                                    Layout.fillWidth: true
-                                }
-                                Label {
-                                    visible: resultRow.expanded && resultRow.technicalDetails !== ""
-                                    text: resultRow.technicalDetails
-                                    color: Theme.muted
-                                    wrapMode: Text.Wrap
-                                    Layout.fillWidth: true
-                                }
-                                Flow {
-                                    visible: resultRow.ListView.isCurrentItem
-                                    Layout.fillWidth: true; spacing: 4
-                                    SubButton { text: qsTr("试听"); shortcutHint: "Return"; enabled: !roughCut.busy; onClicked: roughCut.audition(resultRow.recordingIndex) }
-                                    SubButton { text: resultRow.expanded ? qsTr("收起") : qsTr("详情"); onClicked: resultRow.expanded = !resultRow.expanded }
-                                    SubButton { text: qsTr("保留"); shortcutHint: "1"; enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.recordingIndex, "KEEP") }
-                                    SubButton { text: qsTr("复核"); shortcutHint: "2"; enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.recordingIndex, "REVIEW") }
-                                    SubButton { text: qsTr("剪除"); shortcutHint: "3"; enabled: !roughCut.busy; onClicked: roughCut.setDecision(resultRow.recordingIndex, "CUT") }
-                                    SubToolButton { visible: resultRow.userOverride; enabled: !roughCut.busy; text: qsTr("恢复自动判断"); shortcutHint: "0"; icon.source: "icons/step-back.svg"; onClicked: roughCut.restoreAutoDecision(resultRow.recordingIndex) }
                                 }
                             }
                             TapHandler {
                                 onTapped: {
+                                    window.hiddenTimelineSelection = -1
                                     resultList.currentIndex = resultRow.index
                                     window.activateMonitor(1)
                                     roughCut.locateResult(resultRow.recordingIndex)
                                     resultList.forceActiveFocus(Qt.MouseFocusReason)
                                 }
-                                onDoubleTapped: roughCut.audition(resultRow.recordingIndex)
+                                onDoubleTapped: { resultList.currentIndex = resultRow.index; window.resultDetailsExpanded = true }
                             }
                         }
-                        Label { anchors.centerIn: parent; visible: resultList.count === 0; text: qsTr("分析后在此复核结果"); color: Theme.secondaryText }
+                        Label { anchors.centerIn: parent; width: parent.width - 32; visible: resultList.count === 0; text: roughCut.resultCount > 0 ? qsTr("没有符合条件的片段\n请切换筛选条件") : qsTr("导入素材后点击“开始分析”\n在此选择片段并复核剪辑结果"); color: Theme.secondaryText; wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter }
+                    }
+                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Theme.divider }
+                    ScrollView {
+                        id: resultDetailsScroll
+                        visible: resultList.currentItem && window.resultDetailsExpanded
+                        Layout.fillWidth: true; Layout.preferredHeight: Math.min(160, Math.max(48, roughResultPanel.height - 280))
+                        clip: true
+                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                        Column {
+                            width: resultDetailsScroll.availableWidth; padding: 10; spacing: 6
+                            Label { width: parent.width - 20; text: resultList.currentItem ? resultList.currentItem.text : ""; color: Theme.text; wrapMode: Text.Wrap }
+                            Label { width: parent.width - 20; text: resultList.currentItem ? resultList.currentItem.reason + " · " + resultList.currentItem.scriptRange + (resultList.currentItem.replacement !== "" ? " · " + resultList.currentItem.replacement : "") : ""; color: Theme.secondaryText; wrapMode: Text.Wrap }
+                            Label { width: parent.width - 20; text: resultList.currentItem ? (resultList.currentItem.takeGroup >= 0 ? qsTr("第 %1 组").arg(resultList.currentItem.takeGroup + 1) : "") + (resultList.currentItem.bestTake ? qsTr(" · 最佳 Take") : "") : ""; visible: text !== ""; color: Theme.secondaryText; wrapMode: Text.Wrap }
+                            Label { width: parent.width - 20; text: resultList.currentItem ? qsTr("证据：") + resultList.currentItem.evidenceText : ""; color: Theme.muted; wrapMode: Text.Wrap }
+                            Label { width: parent.width - 20; text: resultList.currentItem ? resultList.currentItem.technicalDetails : ""; visible: text !== ""; color: Theme.muted; wrapMode: Text.Wrap }
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.margins: 8; spacing: 4
+                        SubButton { text: qsTr("试听"); enabled: !!resultList.currentItem && !roughCut.busy; onClicked: window.auditionCurrent() }
+                        SubButton { text: window.resultDetailsExpanded ? qsTr("收起详情") : qsTr("详情"); shortcutHint: "Enter"; enabled: !!resultList.currentItem; onClicked: window.resultDetailsExpanded = !window.resultDetailsExpanded }
+                        Item { Layout.fillWidth: true }
+                        SubToolButton { enabled: !!resultList.currentItem && resultList.currentItem.userOverride && !roughCut.busy; text: qsTr("恢复自动判断"); shortcutHint: "0"; icon.source: "icons/step-back.svg"; onClicked: window.restoreCurrent() }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.bottomMargin: 8; spacing: 4
+                        SubButton { text: qsTr("保留"); shortcutHint: "1"; Layout.fillWidth: true; enabled: !!resultList.currentItem && !roughCut.busy; onClicked: window.decideCurrent("KEEP") }
+                        SubButton { text: qsTr("待复核"); shortcutHint: "2"; Layout.fillWidth: true; enabled: !!resultList.currentItem && !roughCut.busy; onClicked: window.decideCurrent("REVIEW") }
+                        SubButton { text: qsTr("剪除"); shortcutHint: "3"; Layout.fillWidth: true; enabled: !!resultList.currentItem && !roughCut.busy; onClicked: window.decideCurrent("CUT") }
                     }
                 }
             }
@@ -698,8 +713,10 @@ Item {
                     onSelectedCueIdChanged: {
                         const row = Number(selectedCueId)
                         if (selectedCueId === "" || !Number.isInteger(row) || row < 0) return
-                        roughCut.statusFilter = "ALL"
-                        resultList.currentIndex = roughCut.filterRowForSource(row)
+                        const filteredRow = roughCut.filterRowForSource(row)
+                        if (filteredRow < 0) { window.hiddenTimelineSelection = row; return }
+                        window.hiddenTimelineSelection = -1
+                        resultList.currentIndex = filteredRow
                         resultList.positionViewAtIndex(resultList.currentIndex, ListView.Contain)
                         // 选中块与点击位置独立；onUserSeeked 保留用户落点。
                     }
@@ -812,7 +829,7 @@ Item {
     Action { id: roughCommand5; text: qsTr("撤销"); property string keySequence: "Ctrl+Z"; enabled: !roughCut.busy; onTriggered: roughCut.undo() }
     Shortcut { sequence: roughCommand5.keySequence; enabled: roughCommand5.enabled && (visible && !window.textEditing && !window.modalEditing && !roughCut.busy); onActivated: roughCommand5.trigger() }
     Action { id: roughCommand6; text: qsTr("重做"); property string keySequence: "Ctrl+Y"; enabled: !roughCut.busy; onTriggered: roughCut.redo() }
-    Shortcut { sequence: roughCommand6.keySequence; enabled: roughCommand6.enabled && (visible && !window.textEditing && !window.modalEditing && !roughCut.busy); onActivated: roughCommand6.trigger() }
+    Shortcut { sequences: [roughCommand6.keySequence, "Ctrl+Shift+Z"]; enabled: roughCommand6.enabled && (visible && !window.textEditing && !window.modalEditing && !roughCut.busy); onActivated: roughCommand6.trigger() }
     Action { id: roughCommand7; text: qsTr("停止播放"); property string keySequence: "K"; enabled: true; onTriggered: { if (window.selectedMonitor === 1) roughCut.stopTimeline(); else if (roughCut.playing) roughCut.togglePlay() } }
     Shortcut { sequence: roughCommand7.keySequence; enabled: roughCommand7.enabled && (visible && !window.textEditing && !window.modalEditing); onActivated: roughCommand7.trigger() }
     Action { id: roughCommand8; text: qsTr("后退一帧"); property string keySequence: "Left"; enabled: true; onTriggered: window.frameStep(-1) }
@@ -829,9 +846,9 @@ Item {
     Shortcut { sequence: roughCommand13.keySequence; enabled: roughCommand13.enabled && (visible && !window.textEditing && !window.modalEditing); onActivated: roughCommand13.trigger() }
     Action { id: roughCommand14; text: qsTr("适配当前时间轴"); property string keySequence: "\\"; enabled: true; onTriggered: (window.selectedMonitor === 1 ? roughTimeline : sourceWaveform).fit() }
     Shortcut { sequence: roughCommand14.keySequence; enabled: roughCommand14.enabled && (visible && !window.textEditing && !window.modalEditing); onActivated: roughCommand14.trigger() }
-    Action { id: roughCommand15; text: qsTr("上一条待复核"); property string keySequence: "Up"; enabled: true; onTriggered: window.goToReview(-1) }
+    Action { id: roughCommand15; text: qsTr("上一条结果"); property string keySequence: "Up"; enabled: true; onTriggered: window.adjacentResult(-1) }
     Shortcut { sequence: roughCommand15.keySequence; enabled: roughCommand15.enabled && (visible && !window.textEditing && !window.modalEditing); onActivated: roughCommand15.trigger() }
-    Action { id: roughCommand16; text: qsTr("下一条待复核"); property string keySequence: "Down"; enabled: true; onTriggered: window.goToReview(1) }
+    Action { id: roughCommand16; text: qsTr("下一条结果"); property string keySequence: "Down"; enabled: true; onTriggered: window.adjacentResult(1) }
     Shortcut { sequence: roughCommand16.keySequence; enabled: roughCommand16.enabled && (visible && !window.textEditing && !window.modalEditing); onActivated: roughCommand16.trigger() }
     Action { id: roughCommand17; text: qsTr("保留"); property string keySequence: "1"; enabled: !roughCut.busy; onTriggered: window.decideCurrent("KEEP") }
     Shortcut { sequence: roughCommand17.keySequence; enabled: roughCommand17.enabled && (visible && !window.textEditing && !window.modalEditing && !roughCut.busy); onActivated: roughCommand17.trigger() }
@@ -839,7 +856,7 @@ Item {
     Shortcut { sequence: roughCommand18.keySequence; enabled: roughCommand18.enabled && (visible && !window.textEditing && !window.modalEditing && !roughCut.busy); onActivated: roughCommand18.trigger() }
     Action { id: roughCommand19; text: qsTr("剪除"); property string keySequence: "3"; enabled: !roughCut.busy; onTriggered: window.decideCurrent("CUT") }
     Shortcut { sequence: roughCommand19.keySequence; enabled: roughCommand19.enabled && (visible && !window.textEditing && !window.modalEditing && !roughCut.busy); onActivated: roughCommand19.trigger() }
-    Action { id: roughCommand20; text: qsTr("试听当前结果"); property string keySequence: "Return"; enabled: true; onTriggered: window.auditionCurrent() }
+    Action { id: roughCommand20; text: qsTr("打开当前结果详情"); property string keySequence: "Return"; enabled: true; onTriggered: if (resultList.currentItem) window.resultDetailsExpanded = true }
     Shortcut { sequence: roughCommand20.keySequence; enabled: roughCommand20.enabled && (visible && !window.textEditing && !window.modalEditing); onActivated: roughCommand20.trigger() }
     Shortcut { sequence: "Enter"; enabled: roughCommand20.enabled && window.visible && !window.textEditing && !window.modalEditing; onActivated: roughCommand20.trigger() }
     Action { id: roughCommand21; text: qsTr("恢复自动判断"); property string keySequence: "0"; enabled: !roughCut.busy; onTriggered: window.restoreCurrent() }

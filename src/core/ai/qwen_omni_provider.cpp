@@ -250,7 +250,8 @@ QByteArray QwenOmniProvider::buildPayload(
     }
     messages.append(QJsonObject{
         {QStringLiteral("role"), QStringLiteral("user")},
-        {QStringLiteral("content"), userContent(request)},
+        {QStringLiteral("content"), settings.provider.endsWith(QLatin1String("-text"))
+            ? QJsonValue(request.userText) : QJsonValue(userContent(request))},
     });
     QJsonObject payload{
         {QStringLiteral("model"), settings.model},
@@ -258,10 +259,12 @@ QByteArray QwenOmniProvider::buildPayload(
         {QStringLiteral("modalities"), QJsonArray{QStringLiteral("text")}},
         {QStringLiteral("stream"), false},
     };
-    const bool thinking = settings.reasoningEffort != OmniReasoningEffort::None;
-    payload.insert(QStringLiteral("enable_thinking"), thinking);
-    if (thinking) {
-        payload.insert(QStringLiteral("reasoning_effort"), omniReasoningName(settings.reasoningEffort));
+    if (settings.provider.endsWith(QLatin1String("-text"))) {
+        payload.remove(QStringLiteral("modalities"));
+    } else {
+        const bool thinking = settings.reasoningEffort != OmniReasoningEffort::None;
+        payload.insert(QStringLiteral("enable_thinking"), thinking);
+        if (thinking) payload.insert(QStringLiteral("reasoning_effort"), omniReasoningName(settings.reasoningEffort));
     }
     if (!request.tools.isEmpty()) {
         payload.insert(QStringLiteral("tools"), request.tools);
@@ -316,9 +319,15 @@ OmniCompleteResult QwenOmniProvider::complete(
         return AppError(ErrorDomain::Ai, static_cast<int>(AiErrorCode::InvalidRequest),
             QStringLiteral("未配置 AI API Key"));
     }
+    if (settings_.provider.endsWith(QLatin1String("-text"))
+        && (request.task != OmniTaskType::WordMappingReview || !request.audio.data.isEmpty())) {
+        return AppError(ErrorDomain::Ai, static_cast<int>(AiErrorCode::InvalidRequest),
+            QStringLiteral("文本模型仅用于时间映射复核，不能发送音频。"));
+    }
     HttpRequest http;
     http.url = QUrl(endpoint_);
     http.method = QByteArrayLiteral("POST");
+    http.followRedirects = false;
     http.headers = {
         {QByteArrayLiteral("Authorization"), QByteArrayLiteral("Bearer ") + apiKey_.toUtf8()},
         {QByteArrayLiteral("Content-Type"), QByteArrayLiteral("application/json")},

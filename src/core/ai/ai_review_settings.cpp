@@ -1,4 +1,5 @@
 #include "ai/ai_review_settings.h"
+#include "settings/cloud_config_store.h"
 
 #include <QtCore/QProcessEnvironment>
 #include <algorithm>
@@ -19,6 +20,45 @@ double clampUnit(double value, double fallback)
 }
 
 } // namespace
+
+bool OmniReviewSettingsStore::resolveTask(const CloudConfigStore &store, const QString &taskId,
+    const QJsonObject &defaults, OmniReviewSettings *settings, QString *key, QString *error)
+{
+    if (error) error->clear();
+    if (key) key->clear();
+    if (!settings || !key) return false;
+    const auto snapshot = store.resolveTask(taskId, key, error);
+    if (snapshot.isEmpty()) return false;
+    const auto account = snapshot.value(QStringLiteral("account")).toObject();
+    const auto model = snapshot.value(QStringLiteral("model")).toObject();
+    const auto vendor = account.value(QStringLiteral("vendor")).toString();
+    const bool text = taskId == QLatin1String("subtitleWordMapping");
+    if ((!text && taskId != QLatin1String("subtitleAudioReview") && taskId != QLatin1String("roughcutAudioReview"))
+        || model.value(QStringLiteral("adapter")).toString() != (text ? QLatin1String("compatible-text") : QLatin1String("qwen-omni"))
+        || (!text && vendor != QLatin1String("bailian"))) {
+        key->clear();
+        if (error) *error = QStringLiteral("所选模型不支持当前复核用途，请在 AI 服务中重新绑定。");
+        return false;
+    }
+    auto resolved = fromJson(defaults);
+    resolved.cloudAccountId = account.value(QStringLiteral("id")).toString();
+    resolved.model = model.value(QStringLiteral("remoteId")).toString();
+    resolved.provider = text ? vendor + QStringLiteral("-text") : QString::fromLatin1(kOmniReviewProviderId);
+    if (text) resolved.reasoningEffort = OmniReasoningEffort::None;
+    if (vendor == QLatin1String("deepseek")) resolved.baseUrl = QStringLiteral("https://api.deepseek.com/v1");
+    else if (vendor == QLatin1String("moonshot")) resolved.baseUrl = QStringLiteral("https://api.moonshot.cn/v1");
+    else {
+        const bool singapore = account.value(QStringLiteral("region")).toString() == QLatin1String("singapore");
+        const auto workspace = model.value(QStringLiteral("workspace")).toString();
+        resolved.baseUrl = workspace.isEmpty()
+            ? (singapore ? QStringLiteral("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+                         : QStringLiteral("https://dashscope.aliyuncs.com/compatible-mode/v1"))
+            : QStringLiteral("https://%1.%2.maas.aliyuncs.com/compatible-mode/v1").arg(workspace,
+                singapore ? QStringLiteral("ap-southeast-1") : QStringLiteral("cn-beijing"));
+    }
+    *settings = std::move(resolved);
+    return true;
+}
 
 OmniReviewSettings OmniReviewSettingsStore::fromJson(const QJsonObject &settings)
 {
@@ -77,10 +117,7 @@ QString OmniReviewSettingsStore::resolveApiKey(const QString &uiKey, const ICred
     switch (resolveApiKeySource(uiKey, store)) {
     case AiKeySource::Ui: return uiKey.trimmed();
     case AiKeySource::Saved: return store ? store->load(QString::fromLatin1(kOmniReviewCredentialId)) : QString();
-    case AiKeySource::Environment:
-        return QProcessEnvironment::systemEnvironment()
-            .value(QString::fromLatin1(kOmniReviewEnvKey))
-            .trimmed();
+    case AiKeySource::Environment: return {};
     case AiKeySource::None: return {};
     }
     return {};
@@ -94,10 +131,6 @@ AiKeySource OmniReviewSettingsStore::resolveApiKeySource(
         const QString saved = store->load(QString::fromLatin1(kOmniReviewCredentialId)).trimmed();
         if (!saved.isEmpty()) return AiKeySource::Saved;
     }
-    const QString env = QProcessEnvironment::systemEnvironment()
-        .value(QString::fromLatin1(kOmniReviewEnvKey))
-        .trimmed();
-    if (!env.isEmpty()) return AiKeySource::Environment;
     return AiKeySource::None;
 }
 

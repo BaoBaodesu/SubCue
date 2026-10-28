@@ -4,6 +4,7 @@
 #include <QtCore/QString>
 
 namespace subcue {
+class ICredentialStore;
 
 class SettingsManager final {
 public:
@@ -14,6 +15,8 @@ public:
     [[nodiscard]] QJsonObject load() const;
     [[nodiscard]] bool save(const QJsonObject &settings, QString *errorMessage = nullptr) const;
     [[nodiscard]] const QString &path() const noexcept;
+    [[nodiscard]] QJsonObject legacyCloudPreview(const ICredentialStore &credentials, QString *errorMessage = nullptr) const;
+    [[nodiscard]] bool retireLegacyCloud(const ICredentialStore &credentials, const QJsonObject &preview, QString *errorMessage = nullptr) const;
 
 private:
     QString path_;

@@ -56,7 +56,7 @@ std::variant<qint64, AppError> decodeClip(
 {
     AppError error(ErrorDomain::Media, 0, QString());
     Demuxer demuxer;
-    if (!demuxer.open(path, &error)) return error;
+    if (!demuxer.openLocal(path, cancel, &error)) return error;
     const int streamIndex = demuxer.bestStream(AVMEDIA_TYPE_AUDIO);
     const AVStream *stream = demuxer.stream(streamIndex);
     if (!stream) return AppError(ErrorDomain::Decoder, streamIndex, QStringLiteral("源媒体没有音频流"));
@@ -139,6 +139,18 @@ std::variant<qint64, AppError> decodeClip(
 }
 
 } // namespace
+
+bool RoughCutWavExporter::stream(const QString &sourcePath, qint64 startSample, qint64 endSample,
+    const std::function<bool(QVector<float>, qint64)> &write, const std::atomic<bool> *cancel, QString *errorMessage)
+{
+    if (startSample < 0 || endSample <= startSample) return fail(errorMessage, QStringLiteral("配音裁切范围无效。"));
+    const auto decoded = decodeClip(sourcePath, startSample, endSample, 48000, 1, cancel, write);
+    if (const auto *error = std::get_if<AppError>(&decoded)) return fail(errorMessage, error->userMessage());
+    // 最多容许重采样舍入的一帧，不以静音填充损坏／截断的 Take。
+    const auto frames = std::get<qint64>(decoded);
+    if (frames < endSample - startSample - 1) return fail(errorMessage, QStringLiteral("Take 在裁切结束前截断，未补零掩盖错误。"));
+    return true;
+}
 
 bool RoughCutWavExporter::save(
     const QString &path, const QString &sourcePath,

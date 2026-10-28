@@ -68,6 +68,7 @@ enum class OmniReviewStatus {
 };
 
 struct OmniReviewSettings final {
+    QString cloudAccountId;
     QString provider = QString::fromLatin1(kOmniReviewProviderId);
     QString model = QString::fromLatin1(kOmniReviewDefaultModel);
     QString baseUrl = QString::fromLatin1(kOmniReviewDefaultBaseUrl);

@@ -103,7 +103,7 @@ ProviderTestResult LocalPythonAsrService::testConnection(const std::atomic<bool>
     QStringList arguments;
     const QString program = workerProgram(pythonExecutable_, &arguments);
     const InferenceProcessResult result = InferenceManager::instance().run(
-        program, arguments, request, cancel, 60'000);
+        program, arguments, request, cancel, 60'000, {}, QStringLiteral("本地 ASR 环境检查"));
     if (result.cancelled) return asrCancelledError();
     if (!result.started || result.timedOut || result.exitCode != 0) {
         return workerError(result.standardError + result.standardOutput);
@@ -166,6 +166,7 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
     const QByteArray workerRequest = QJsonDocument(QJsonObject{
         {QStringLiteral("taskId"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
         {QStringLiteral("action"), QStringLiteral("transcribe")},
+        {QStringLiteral("offlineOnly"), request.offlineOnly},
         {QStringLiteral("provider"), providerId_},
         {QStringLiteral("modelDirectory"), modelDirectory_},
         {QStringLiteral("forcedAlignerDirectory"), forcedAlignerDirectory_},
@@ -183,7 +184,7 @@ AsrResult LocalPythonAsrService::transcribe(const AsrRequest &request)
                 request.progress(event.value(QStringLiteral("completed")).toInt(),
                     event.value(QStringLiteral("total")).toInt());
             }
-        });
+        }, QStringLiteral("本地 ASR 识别与对齐"));
     if (result.cancelled) return asrCancelledError();
     if (!result.started || result.exitCode != 0) {
         return workerError(result.standardError + result.standardOutput);

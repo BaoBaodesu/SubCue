@@ -238,6 +238,12 @@ static bool saveDatabase(const QString &path, const RoughCutProject &project,
 bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject &project,
     QString *errorMessage, const std::atomic<bool> *cancel)
 {
+    return save(path, project, errorMessage, cancel, nullptr);
+}
+
+bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject &project,
+    QString *errorMessage, const std::atomic<bool> *cancel, QByteArray *committedSha256)
+{
     if (!safeOutputPath(path, {project.mediaPath, project.scriptPath}, errorMessage)) return false;
     QTemporaryFile candidate(QFileInfo(path).absoluteDir().filePath(QStringLiteral(".subcue-save-XXXXXX")));
     if (!candidate.open()) return setError(errorMessage, candidate.errorString());
@@ -249,14 +255,18 @@ bool RoughCutProjectSerializer::save(const QString &path, const RoughCutProject 
     QSaveFile output(path);
     if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
         return setError(errorMessage, input.isOpen() ? output.errorString() : input.errorString());
+    QCryptographicHash hash(QCryptographicHash::Sha256);
     while (!input.atEnd()) {
         if (cancel && cancel->load()) return setError(errorMessage, QStringLiteral("工程保存已取消。"));
         const QByteArray data = input.read(1024 * 1024);
         if (data.isEmpty() || output.write(data) != data.size())
             return setError(errorMessage, QStringLiteral("工程写入失败，原文件已保留。"));
+        if (committedSha256) hash.addData(data);
     }
     if (cancel && cancel->load()) return setError(errorMessage, QStringLiteral("工程保存已取消。"));
-    return output.commit() || setError(errorMessage, output.errorString());
+    if (!output.commit()) return setError(errorMessage, output.errorString());
+    if (committedSha256) *committedSha256 = hash.result();
+    return true;
 }
 
 QByteArray RoughCutProjectSerializer::fingerprint(const RoughCutProject &project)

@@ -35,12 +35,6 @@ QString DpapiCredentialStore::defaultPath()
         ? QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation)
         : QDir(appData).filePath(QStringLiteral("SubCue"));
     const QString destination = QDir(base).filePath(QStringLiteral("credentials.dat"));
-    if (!appData.isEmpty() && !QFileInfo::exists(destination)) {
-        const QString source = QDir(appData).filePath(QStringLiteral("AutoSubtitleAligner/credentials.dat"));
-        if (QFileInfo::exists(source) && QDir().mkpath(QFileInfo(destination).absolutePath())) {
-            QFile::copy(source, destination);
-        }
-    }
     return destination;
 }
 
@@ -131,7 +125,50 @@ bool DpapiCredentialStore::remove(const QString &credentialId, QString *errorMes
 
 bool DpapiCredentialStore::exists(const QString &credentialId) const
 {
-    return !load(credentialId).isEmpty();
+#ifdef Q_OS_WIN
+    PCREDENTIALW credential = nullptr;
+    const auto target = targetName(credentialId).toStdWString();
+    if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &credential)) return false;
+    const bool present = credential->CredentialBlobSize > 0;
+    if (credential->CredentialBlobSize) SecureZeroMemory(credential->CredentialBlob, credential->CredentialBlobSize);
+    CredFree(credential);
+    return present;
+#else
+    Q_UNUSED(credentialId);
+    return false;
+#endif
+}
+
+QStringList DpapiCredentialStore::list(const QString &prefix, QString *errorMessage) const
+{
+    QStringList result;
+#ifdef Q_OS_WIN
+    if (!prefix.startsWith(QStringLiteral("SubCue/Cloud/"))
+        && !QStringList{QStringLiteral("SubCue/ASR/"), QStringLiteral("SubCue/AIReview/"),
+            QStringLiteral("SubCue/AI/"), QStringLiteral("SubCue/VoiceStudio/")}.contains(prefix)) {
+        if (errorMessage) *errorMessage = QStringLiteral("拒绝枚举非云端凭据命名空间");
+        return result;
+    }
+    DWORD count = 0;
+    PCREDENTIALW *credentials = nullptr;
+    const auto filter = (targetName(prefix) + QLatin1Char('*')).toStdWString();
+    if (!CredEnumerateW(filter.c_str(), 0, &count, &credentials)) {
+        if (GetLastError() != ERROR_NOT_FOUND && errorMessage) *errorMessage = QStringLiteral("无法枚举云端凭据");
+        return result;
+    }
+    const auto namespacePrefix = productionTargets_ ? QString() : targetName(QString());
+    for (DWORD index = 0; index < count; ++index) {
+        const auto target = QString::fromWCharArray(credentials[index]->TargetName);
+        if (credentials[index]->Type == CRED_TYPE_GENERIC && target.startsWith(namespacePrefix + prefix))
+            result.append(target.mid(namespacePrefix.size()));
+        if (credentials[index]->CredentialBlobSize) SecureZeroMemory(credentials[index]->CredentialBlob, credentials[index]->CredentialBlobSize);
+    }
+    CredFree(credentials);
+#else
+    Q_UNUSED(prefix);
+    if (errorMessage) *errorMessage = QStringLiteral("Windows Credential Manager 仅支持 Windows");
+#endif
+    return result;
 }
 
 QString DpapiCredentialStore::loadLegacy(QString *errorMessage) const
@@ -163,6 +200,8 @@ QString DpapiCredentialStore::loadLegacy(QString *errorMessage) const
 
 bool DpapiCredentialStore::migrateLegacyDashScope(QString *errorMessage) const
 {
+    // 生产环境不再自动导入旧凭据，防止清除后在重启时恢复。
+    if (productionTargets_) return true;
     if (exists(kDashScopeCredential) || !QFileInfo::exists(path_)) {
         return true;
     }
