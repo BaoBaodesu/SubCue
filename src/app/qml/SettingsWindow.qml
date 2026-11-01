@@ -464,14 +464,14 @@ Window {
                                 SubComboBox {
                                     id: voiceEngine; objectName: "settingsVoiceEngine"; Layout.fillWidth: true
                                     textRole: "name"; valueRole: "id"
-                                    model: [{id: "qwen", name: "Qwen Base"}, {id: "index", name: "IndexTTS 2.5"}, {id: "gpt", name: "GPT-SoVITS"}, {id: "mock", name: "Mock 测试音"}]
+                                    model: [{id: "qwen", name: "Qwen Base"}, {id: "index", name: "IndexTTS 2.5"}, {id: "gpt", name: "GPT-SoVITS"}]
                                     onActivated: settingsWindow.loadVoiceEngine()
                                 }
                                 FieldLabel { text: "Python" }
                                 SubTextField { id: voicePython; objectName: "settingsVoicePython"; Layout.fillWidth: true; selectByMouse: true; onTextEdited: settingsWindow.updateVoiceEngine() }
                                 FieldLabel { text: qsTr("模型／源码目录") }
                                 SubTextField { id: voiceModels; objectName: "settingsVoiceModels"; Layout.fillWidth: true; selectByMouse: true; onTextEdited: settingsWindow.updateVoiceEngine() }
-                                SubButton { text: qsTr("检查当前环境"); enabled: typeof voiceStudio !== "undefined" && voiceStudio && !voiceStudio.busy && voiceEngine.currentValue !== "mock"; onClicked: voiceStudio.checkLocal(voiceEngine.currentValue, voicePython.text, voiceModels.text) }
+                                SubButton { text: qsTr("检查当前环境"); enabled: typeof voiceStudio !== "undefined" && voiceStudio && !voiceStudio.busy && !!voiceEngine.currentValue; onClicked: voiceStudio.checkLocal(voiceEngine.currentValue, voicePython.text, voiceModels.text) }
                                 Label { Layout.fillWidth: true; wrapMode: Text.Wrap; text: typeof voiceStudio !== "undefined" && voiceStudio ? voiceStudio.statusText : ""; color: Theme.secondaryText }
                                 SectionTitle { text: qsTr("云端配音"); Layout.columnSpan: 2 }
                                 Label { Layout.columnSpan: 2; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: qsTr("当前用途：") + cloudPanel.targetName("speechSynthesis") }

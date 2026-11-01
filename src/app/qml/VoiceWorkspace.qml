@@ -44,7 +44,7 @@ Item {
     property string auditionSource: qsTr("当前句 · 已应用音频")
     function voiceRank(version) {
         const metadata = version.metadata || {}
-        const compatible = localEngine.currentIndex === 2 ? !!metadata.providerVoiceId : !metadata.providerVoiceId
+        const compatible = localEngine.currentIndex === 1 ? !!metadata.providerVoiceId : !metadata.providerVoiceId
         const reviewed = !!metadata.providerVoiceId || metadata.qualityState === "approved"
         const language = metadata.referenceLanguage || (metadata.preset ? metadata.preset.language : "")
         return (compatible ? 0 : 8) + (reviewed ? 0 : 4) + (language === targetLanguage.values[targetLanguage.currentIndex] ? 0 : 1)
@@ -87,12 +87,12 @@ Item {
         return ""
     }
     readonly property var suggestedVersions: voices ? voices.versions.filter(function(row) { return showUnavailableLocal.checked || !localVoiceUnavailableReason(row) }).sort(function(a, b) { return voiceRank(a) - voiceRank(b) }) : []
-    readonly property var capabilities: controller ? controller.engineCapabilities(localEngine.currentIndex === 1 ? "mock" : localEngine.currentIndex === 2 ? "cloud" : localEngine.engineKey) : ({languages: ["Chinese"], parameters: []})
+    readonly property var capabilities: controller ? controller.engineCapabilities(localEngine.currentIndex === 1 ? "cloud" : localEngine.engineKey) : ({languages: ["Chinese"], parameters: []})
     readonly property var readiness: {
         if (!controller) return ({text: "", action: ""})
         if (typeof editor !== "undefined" && editor.cloudSettings) { editor.cloudSettings.accounts; editor.cloudSettings.bindings }
         controller.statusText; controller.selectedId; controller.defaultVoiceVersionId; generating; storageBusy
-        return controller.generationReadiness(localEngine.currentIndex === 1 ? "mock" : localEngine.currentIndex === 2 ? "cloud" : localEngine.engineKey, pythonPath.text, qwenModelPath.text)
+        return controller.generationReadiness(localEngine.currentIndex === 1 ? "cloud" : localEngine.engineKey, pythonPath.text, qwenModelPath.text)
     }
     property real voiceRatio: 0.3
     property real inspectorRatio: 0.3
@@ -115,13 +115,13 @@ Item {
     Component.onCompleted: { restoreSession(); loadDraft(); loadEngineSettings(); if (audio) audio.setActive(visible); if (voices) voices.refresh(voices.selectedProfile) }
     function loadEngineSettings() {
         if (typeof editor === "undefined" || !pythonPath || !qwenModelPath) return
-        const config = (editor.defaultSetting("ttsEngines") || {})[localEngine.currentIndex === 1 ? "mock" : localEngine.engineKey] || {}
+        const config = (editor.defaultSetting("ttsEngines") || {})[localEngine.engineKey] || {}
         pythonPath.text = config.python || ""
         qwenModelPath.text = config.directory || ""
     }
     Connections { target: typeof editor === "undefined" ? null : editor; function onSettingsChanged() { loadEngineSettings() } }
     onVisibleChanged: { if (audio) audio.setActive(visible); if (!visible && previewPlayer) previewPlayer.clear(); if (visible && controller && controller.preview.length > 0) changesDialog.open() }
-    function viewState() { return {layoutVersion: 2, engine: localEngine.currentIndex, voicesCollapsed: voicesCollapsed, inspectorCollapsed: inspectorCollapsed, sequenceCollapsed: sequenceCollapsed, voicesWidth: voicePickerPanel.width, inspectorWidth: voiceInspectorSlot.width, voiceRatio: voiceRatio, inspectorRatio: inspectorRatio, selectedId: controller ? controller.selectedId : "", favorites: favoriteVoiceKeys} }
+    function viewState() { return {layoutVersion: 3, engine: localEngine.currentIndex, voicesCollapsed: voicesCollapsed, inspectorCollapsed: inspectorCollapsed, sequenceCollapsed: sequenceCollapsed, voicesWidth: voicePickerPanel.width, inspectorWidth: voiceInspectorSlot.width, voiceRatio: voiceRatio, inspectorRatio: inspectorRatio, selectedId: controller ? controller.selectedId : "", favorites: favoriteVoiceKeys} }
     Timer { id: viewSaveDelay; interval: 400; onTriggered: if (controller) controller.persistSessionState(viewState()) }
     onVoicesCollapsedChanged: if (viewSaveDelay) viewSaveDelay.restart()
     onSequenceCollapsedChanged: if (viewSaveDelay) viewSaveDelay.restart()
@@ -132,12 +132,16 @@ Item {
         if (!controller) return
         const state = controller.sessionState || {}
         favoriteVoiceKeys = Array.isArray(state.favorites) ? state.favorites.slice(0, 500) : []
-        if (state.engine !== undefined) { localEngine.currentIndex = Math.max(0, Math.min(4, state.engine)); localEngine.acceptedIndex = localEngine.currentIndex; loadEngineSettings() }
+        if (state.engine !== undefined) {
+            // 旧界面含 Mock 项（5 项）；去掉 Mock 后旧索引需要迁移到 4 项列表。
+            const engine = state.layoutVersion === 3 ? state.engine : [0, 0, 1, 2, 3][Math.max(0, Math.min(4, state.engine))]
+            localEngine.currentIndex = Math.max(0, Math.min(3, engine)); localEngine.acceptedIndex = localEngine.currentIndex; loadEngineSettings()
+        }
         if (state.voicesCollapsed !== undefined) voicesCollapsed = state.voicesCollapsed
         if (state.inspectorCollapsed !== undefined) inspectorCollapsed = state.inspectorCollapsed
         if (state.sequenceCollapsed !== undefined) sequenceCollapsed = state.sequenceCollapsed
-        if (state.layoutVersion === 2 && state.voiceRatio > 0) voiceRatio = Math.max(0.2, Math.min(0.4, state.voiceRatio))
-        if (state.layoutVersion === 2 && state.inspectorRatio > 0) inspectorRatio = Math.max(0.2, Math.min(0.4, state.inspectorRatio))
+        if (state.layoutVersion >= 2 && state.voiceRatio > 0) voiceRatio = Math.max(0.2, Math.min(0.4, state.voiceRatio))
+        if (state.layoutVersion >= 2 && state.inspectorRatio > 0) inspectorRatio = Math.max(0.2, Math.min(0.4, state.inspectorRatio))
         if (state.selectedId && controller.segmentIndex(state.selectedId) >= 0) controller.select(state.selectedId)
     }
     function recoveryFields() {
@@ -184,16 +188,15 @@ Item {
     }
     function generate(scope) {
         if (!controller || controller.modifying || storageBusy || generating || !draftId || !commitPending()) return
-        if (localEngine.currentIndex !== 1 && !controller.selected.effectiveVoiceVersionId) {
+        if (!controller.selected.effectiveVoiceVersionId) {
             voicesCollapsed = false
             draftError = qsTr("先选择音色并分配给当前句；旁白可选“全部未绑定句子”一次分配。没有音色时，点击音色分配区的“管理…”创建并审核参考音频。")
             if (voices) voices.refresh(voices.selectedProfile)
             return
         }
         candidatesExpanded = true
-        if (localEngine.currentIndex === 0 || localEngine.currentIndex >= 3) controller.generateLocal(localEngine.engineKey, pythonPath.text, qwenModelPath.text, scope, scope !== "selected")
-        else if (localEngine.currentIndex === 2) controller.prepareFlash(scope, Number(flashBudget.text), flashRegenerate.checked)
-        else controller.generateMock(pythonPath.text, scope, scope !== "selected")
+        if (localEngine.currentIndex === 0 || localEngine.currentIndex >= 2) controller.generateLocal(localEngine.engineKey, pythonPath.text, qwenModelPath.text, scope, scope !== "selected")
+        else if (localEngine.currentIndex === 1) controller.prepareFlash(scope, Number(flashBudget.text), flashRegenerate.checked)
         if (!controller.modifying && !generating) { draftError = controller.statusText; engineExpanded = true; inspectorTabs.currentIndex = 0 }
     }
     function toggleAudition() {
@@ -233,7 +236,7 @@ Item {
         if (bodyEditor.inputMethodComposing || spokenEditor.inputMethodComposing || notesEditor.inputMethodComposing) { draftError = qsTr("请先确认输入法候选，再应用编辑。"); return false }
         if (!draftDirty || !draftId) return true
         if (!gainField.acceptableInput || !pauseField.acceptableInput) { draftError = qsTr("增益须为 0～4，句后停顿须为 0～60000 毫秒。"); inspectorCollapsed = false; inspectorTabs.currentIndex = 1; return false }
-        if (seedField.text.trim() !== "" && !seedField.acceptableInput) { draftError = qsTr("随机种子须为 0～%1 的整数，或留空。").arg(localEngine.currentIndex === 2 ? 65535 : 2147483647); inspectorCollapsed = false; inspectorTabs.currentIndex = 0; return false }
+        if (seedField.text.trim() !== "" && !seedField.acceptableInput) { draftError = qsTr("随机种子须为 0～%1 的整数，或留空。").arg(localEngine.currentIndex === 1 ? 65535 : 2147483647); inspectorCollapsed = false; inspectorTabs.currentIndex = 0; return false }
         if (indexParametersDirty && (!durationField.acceptableInput || (emotionChoice.currentIndex > 0 && (!emotionStrength.acceptableInput || Number(emotionStrength.text) <= 0)))) { draftError = qsTr("时长倍率须为 0.5～2，情绪强度须大于 0 且不超过 1。"); inspectorCollapsed = false; inspectorTabs.currentIndex = 0; return false }
         if (gptParametersDirty && !speedField.acceptableInput) { draftError = qsTr("语速倍率须为 0.5～2，小于 1 更慢。"); inspectorCollapsed = false; inspectorTabs.currentIndex = 0; return false }
         const draft = {id: draftId, text: bodyEditor.text, spoken: spokenEditor.text, manualSpoken: manualSpoken.checked, notes: notesEditor.text,
@@ -371,8 +374,8 @@ Item {
                 SubComboBox {
                     id: localEngine; objectName: "voiceEngineSelector"
                     Layout.preferredWidth: 195; Layout.minimumWidth: 150; Layout.maximumWidth: 240
-                    model: [qsTr("Qwen Base · 本地"), qsTr("Mock · 测试音"), qsTr("通义 Flash · 云端付费"), qsTr("IndexTTS 2.5 · 本地"), qsTr("GPT-SoVITS · 本地")]
-                    readonly property string engineKey: currentIndex === 3 ? "index" : currentIndex === 4 ? "gpt" : "qwen"
+                    model: [qsTr("Qwen Base · 本地"), qsTr("通义 Flash · 云端付费"), qsTr("IndexTTS 2.5 · 本地"), qsTr("GPT-SoVITS · 本地")]
+                    readonly property string engineKey: currentIndex === 2 ? "index" : currentIndex === 3 ? "gpt" : "qwen"
                     property int acceptedIndex: 0
                     onActivated: {
                         const requested = currentIndex
@@ -384,7 +387,7 @@ Item {
                 SubButton {
                     objectName: "voiceEngineSettingsButton"
                     text: engineExpanded ? qsTr("收起配置") : qsTr("配置…")
-                    onClicked: if (workspace.Window.window) workspace.Window.window.openSettings(localEngine.currentIndex === 2 ? "cloud" : "voice", localEngine.currentIndex === 2 ? "" : "settingsVoicePython")
+                    onClicked: if (workspace.Window.window) workspace.Window.window.openSettings(localEngine.currentIndex === 1 ? "cloud" : "voice", localEngine.currentIndex === 1 ? "" : "settingsVoicePython")
                 }
                 Item { Layout.fillWidth: true }
                 Label { visible: workspace.width >= 1000; text: qsTr("范围"); color: Theme.secondaryText }
@@ -393,10 +396,11 @@ Item {
                     objectName: "voiceGenerateButton"
                     text: generating ? (cancelRequested ? qsTr("取消中…") : qsTr("生成中…")) : qsTr("生成%1").arg(workspace.width < 1000 ? qsTr("当前句") : generationScope.currentText)
                     shortcutHint: voiceGenerateAction.keySequence
-                    enabled: controller && !controller.modifying && !storageBusy && !generating && draftId !== "" && (generationScope.currentIndex !== 0 || !controller.selected.locked)
+                    // 与真正能提交的条件一致：缺文本、缺音色、未预检时禁用，由下方 readiness 区说明缺什么并给出动作。
+                    enabled: controller && !controller.modifying && !storageBusy && !generating && draftId !== "" && readiness.state === "ready" && (generationScope.currentIndex !== 0 || !controller.selected.locked)
                     onClicked: generate(workspace.width < 1000 ? "selected" : ["selected", "paragraph", "all", "invalid", "selection"][generationScope.currentIndex])
                 }
-                SubButton { objectName: "voiceGenerateMissingButton"; text: qsTr("补齐缺失 / 失效"); enabled: controller && !controller.modifying && !storageBusy && !generating && manuscript.count > 0; onClicked: generate("invalid") }
+                SubButton { objectName: "voiceGenerateMissingButton"; text: qsTr("补齐缺失 / 失效"); enabled: controller && !controller.modifying && !storageBusy && !generating && manuscript.count > 0 && readiness.state === "ready"; onClicked: generate("invalid") }
                 SubButton { text: cancelRequested ? qsTr("取消中…") : qsTr("取消生成"); visible: generating; enabled: !cancelRequested; onClicked: { cancelRequested = true; ttsTasks.cancel() } }
             }
         }
@@ -410,13 +414,13 @@ Item {
             SubButton {
                 objectName: "voiceReadinessAction"
                 enabled: readiness.action !== "parameters" || (controller && !controller.selected.locked && !controller.modifying && !storageBusy && !generating)
-                text: readiness.action === "text" ? qsTr("添加文稿…") : readiness.action === "voice" ? qsTr("选择音色…") : readiness.action === "check" ? qsTr("检查当前环境") : readiness.action === "parameters" ? qsTr("清除当前句不兼容参数") : localEngine.currentIndex === 2 ? qsTr("连接 AI 服务…") : qsTr("打开引擎设置")
+                text: readiness.action === "text" ? qsTr("添加文稿…") : readiness.action === "voice" ? qsTr("选择音色…") : readiness.action === "check" ? qsTr("检查当前环境") : readiness.action === "parameters" ? qsTr("清除当前句不兼容参数") : localEngine.currentIndex === 1 ? qsTr("连接 AI 服务…") : qsTr("打开引擎设置")
                 onClicked: {
                     if (readiness.action === "text") appendText()
                     else if (readiness.action === "voice") { voicesCollapsed = false; if (voices) voices.refresh(voices.selectedProfile) }
                     else if (readiness.action === "check") controller.checkLocal(localEngine.engineKey, pythonPath.text, qwenModelPath.text)
-                    else if (readiness.action === "parameters") { if (commitPending()) controller.clearUnsupportedParameters(localEngine.currentIndex === 1 ? "mock" : localEngine.currentIndex === 2 ? "cloud" : localEngine.engineKey) }
-                    else if (workspace.Window.window) workspace.Window.window.openSettings(localEngine.currentIndex === 2 ? "cloud" : "voice", localEngine.currentIndex === 2 ? "" : "settingsVoicePython")
+                    else if (readiness.action === "parameters") { if (commitPending()) controller.clearUnsupportedParameters(localEngine.currentIndex === 1 ? "cloud" : localEngine.engineKey) }
+                    else if (workspace.Window.window) workspace.Window.window.openSettings(localEngine.currentIndex === 1 ? "cloud" : "voice", localEngine.currentIndex === 1 ? "" : "settingsVoicePython")
                 }
             }
         }
@@ -458,28 +462,28 @@ Item {
                         Label { text: qsTr("默认旁白用于新句与未覆盖句；局部音色保持独立。"); wrapMode: Text.Wrap; Layout.fillWidth: true; color: Theme.secondaryText }
                         Label { text: qsTr("应用范围"); color: Theme.secondaryText }
                         SubComboBox { id: voiceScope; Layout.fillWidth: true; enabled: !voices || !voices.busy; model: [qsTr("默认旁白"), qsTr("当前句"), qsTr("当前段"), qsTr("全部未绑定句子"), qsTr("选中句")] }
-                        SubTextField { id: cloudVoiceSearch; visible: localEngine.currentIndex === 2; Layout.fillWidth: true; placeholderText: qsTr("搜索音色名称") }
-                        SubComboBox { id: builtinVoice; objectName: "voiceBuiltinSelector"; visible: localEngine.currentIndex === 2; Layout.fillWidth: true; textRole: "name"; model: cloudVoiceChoices
+                        SubTextField { id: cloudVoiceSearch; visible: localEngine.currentIndex === 1; Layout.fillWidth: true; placeholderText: qsTr("搜索音色名称") }
+                        SubComboBox { id: builtinVoice; objectName: "voiceBuiltinSelector"; visible: localEngine.currentIndex === 1; Layout.fillWidth: true; textRole: "name"; model: cloudVoiceChoices
                             displayText: currentIndex < 0 ? qsTr("原选择不可用，请重新选择") : currentText
                             onActivated: { const row = model[currentIndex]; selectedCloudVoiceKey = (row.scope || cloudConnectionKey()) + "/" + row.id }
                             onModelChanged: { const key = cloudConnectionKey(); currentIndex = selectedCloudVoiceKey ? model.findIndex(function(row) { return (row.scope || key) + "/" + row.id === selectedCloudVoiceKey }) : model.length > 0 ? 0 : -1 }
                         }
                         RowLayout {
-                            visible: localEngine.currentIndex === 2; Layout.fillWidth: true
+                            visible: localEngine.currentIndex === 1; Layout.fillWidth: true
                             SubButton { text: qsTr("选用"); enabled: voices && !voices.busy && selectedCloudVoice.compatible && (selectedCloudVoice.builtin || selectedCloudVoice.project || voices.voiceCatalog.state === "success") && draftId !== "" && controller && !controller.modifying; onClicked: if (commitPending()) { requestedVoiceScope = ["default", "selected", "paragraph", "unbound", "selection"][voiceScope.currentIndex]; if (selectedCloudVoice.project) assignVoice(selectedCloudVoice.versionId, requestedVoiceScope, selectedCloudVoice.displayName); else if (selectedCloudVoice.builtin) voices.useBuiltinVoice(selectedCloudVoice.id); else voices.useDiscoveredVoice(selectedCloudVoice.id) } }
                             SubButton { text: qsTr("刷新账号音色"); enabled: voices && !voices.busy; onClicked: voices.discoverVoices(true) }
                         }
-                        SubCheckBox { visible: localEngine.currentIndex === 2 && !!selectedCloudVoice.id; text: qsTr("收藏当前音色"); checked: favoriteVoiceKeys.indexOf((selectedCloudVoice.scope || cloudConnectionKey()) + "/" + selectedCloudVoice.id) >= 0; onToggled: { const key = (selectedCloudVoice.scope || cloudConnectionKey()) + "/" + selectedCloudVoice.id; selectedCloudVoiceKey = key; favoriteVoiceKeys = checked ? favoriteVoiceKeys.concat([key]).slice(-500) : favoriteVoiceKeys.filter(function(value) { return value !== key }); if (controller) controller.persistSessionState(viewState()) } }
-                        SubCheckBox { id: showUnavailableVoices; visible: localEngine.currentIndex === 2; text: qsTr("显示不可用音色") }
-                        SubButton { visible: localEngine.currentIndex === 2 && !!selectedCloudVoice.hasPreview; text: selectedCloudVoice.builtin ? qsTr("试听官方样本") : qsTr("试听参考样本"); enabled: voices && !voices.busy && selectedCloudVoice.compatible; onClicked: { auditionSource = selectedCloudVoice.builtin ? qsTr("官方试听样本 · 不调用合成") : qsTr("音色参考样本 · 非合成效果"); voices.previewCloudVoice(selectedCloudVoice.id) } }
-                        Label { visible: localEngine.currentIndex === 2; Layout.fillWidth: true; wrapMode: Text.Wrap; text: (voices && voices.statusText ? voices.statusText + "\n" : "") + (selectedCloudVoice.description ? selectedCloudVoice.description + qsTr(" · 中文\n") : "") + qsTr("官方目录 v2 · 2026-10-17 · 北京 Flash\n目录不代表权限；无样本时，选用后确认费用生成试听。") + (voices && voices.voiceCatalog.message ? "\n" + voices.voiceCatalog.message : ""); color: Theme.secondaryText; maximumLineCount: 5; elide: Text.ElideRight; ToolTip.visible: voiceCatalogHover.hovered; ToolTip.text: text; HoverHandler { id: voiceCatalogHover } }
-                        SubButton { id: cloudVoiceAdvanced; visible: localEngine.currentIndex === 2; checkable: true; text: qsTr("高级音色详情") }
-                        TextEdit { visible: cloudVoiceAdvanced.checked && localEngine.currentIndex === 2; readOnly: true; selectByMouse: true; Layout.fillWidth: true; wrapMode: TextEdit.WrapAnywhere; color: Theme.secondaryText; text: selectedCloudVoice.id || ""; textFormat: TextEdit.PlainText }
-                        SubCheckBox { id: showUnavailableLocal; visible: localEngine.currentIndex !== 2; text: qsTr("显示不可用音色") }
-                        SubTextField { id: localVoiceSearch; objectName: "localVoiceSearch"; visible: localEngine.currentIndex !== 2; Layout.fillWidth: true; placeholderText: qsTr("筛选本页本地音色"); selectByMouse: true }
+                        SubCheckBox { visible: localEngine.currentIndex === 1 && !!selectedCloudVoice.id; text: qsTr("收藏当前音色"); checked: favoriteVoiceKeys.indexOf((selectedCloudVoice.scope || cloudConnectionKey()) + "/" + selectedCloudVoice.id) >= 0; onToggled: { const key = (selectedCloudVoice.scope || cloudConnectionKey()) + "/" + selectedCloudVoice.id; selectedCloudVoiceKey = key; favoriteVoiceKeys = checked ? favoriteVoiceKeys.concat([key]).slice(-500) : favoriteVoiceKeys.filter(function(value) { return value !== key }); if (controller) controller.persistSessionState(viewState()) } }
+                        SubCheckBox { id: showUnavailableVoices; visible: localEngine.currentIndex === 1; text: qsTr("显示不可用音色") }
+                        SubButton { visible: localEngine.currentIndex === 1 && !!selectedCloudVoice.hasPreview; text: selectedCloudVoice.builtin ? qsTr("试听官方样本") : qsTr("试听参考样本"); enabled: voices && !voices.busy && selectedCloudVoice.compatible; onClicked: { auditionSource = selectedCloudVoice.builtin ? qsTr("官方试听样本 · 不调用合成") : qsTr("音色参考样本 · 非合成效果"); voices.previewCloudVoice(selectedCloudVoice.id) } }
+                        Label { visible: localEngine.currentIndex === 1; Layout.fillWidth: true; wrapMode: Text.Wrap; text: (voices && voices.statusText ? voices.statusText + "\n" : "") + (selectedCloudVoice.description ? selectedCloudVoice.description + qsTr(" · 中文\n") : "") + qsTr("官方目录 v2 · 2026-10-17 · 北京 Flash\n目录不代表权限；无样本时，选用后确认费用生成试听。") + (voices && voices.voiceCatalog.message ? "\n" + voices.voiceCatalog.message : ""); color: Theme.secondaryText; maximumLineCount: 5; elide: Text.ElideRight; ToolTip.visible: voiceCatalogHover.hovered; ToolTip.text: text; HoverHandler { id: voiceCatalogHover } }
+                        SubButton { id: cloudVoiceAdvanced; visible: localEngine.currentIndex === 1; checkable: true; text: qsTr("高级音色详情") }
+                        TextEdit { visible: cloudVoiceAdvanced.checked && localEngine.currentIndex === 1; readOnly: true; selectByMouse: true; Layout.fillWidth: true; wrapMode: TextEdit.WrapAnywhere; color: Theme.secondaryText; text: selectedCloudVoice.id || ""; textFormat: TextEdit.PlainText }
+                        SubCheckBox { id: showUnavailableLocal; visible: localEngine.currentIndex !== 1; text: qsTr("显示不可用音色") }
+                        SubTextField { id: localVoiceSearch; objectName: "localVoiceSearch"; visible: localEngine.currentIndex !== 1; Layout.fillWidth: true; placeholderText: qsTr("筛选本页本地音色"); selectByMouse: true }
                         ListView {
                             id: voiceProfiles
-                            visible: localEngine.currentIndex !== 2
+                            visible: localEngine.currentIndex !== 1
                             Layout.fillWidth: true; Layout.preferredHeight: Math.max(40, contentHeight); interactive: false; clip: true
                             model: voices ? voices.profiles.filter(function(row) { return row.name.toLowerCase().indexOf(localVoiceSearch.text.toLowerCase()) >= 0 }) : []
                             ScrollBar.vertical: SubScrollBar {}
@@ -495,13 +499,13 @@ Item {
                             Label { anchors.centerIn: parent; visible: voiceProfiles.count === 0; text: localVoiceSearch.text ? qsTr("本页没有匹配音色") : qsTr("先在音色库添加声音"); color: Theme.secondaryText }
                         }
                         RowLayout {
-                            visible: localEngine.currentIndex !== 2
+                            visible: localEngine.currentIndex !== 1
                             SubButton { text: qsTr("上一页"); enabled: voices && !voices.busy && voices.profileOffset > 0; onClicked: voices.refresh(voices.selectedProfile, false, Math.max(0, voices.profileOffset - 50), 0) }
                             SubButton { text: qsTr("下一页"); enabled: voices && !voices.busy && voices.profiles.length === 50; onClicked: voices.refresh(voices.selectedProfile, false, voices.profileOffset + 50, 0) }
                         }
                         ListView {
                             id: voiceVersions
-                            visible: localEngine.currentIndex !== 2
+                            visible: localEngine.currentIndex !== 1
                             Layout.fillWidth: true; Layout.preferredHeight: Math.max(40, contentHeight); interactive: false; clip: true; spacing: 8
                             model: workspace.suggestedVersions
                             ScrollBar.vertical: SubScrollBar {}
@@ -515,7 +519,7 @@ Item {
                             }
                         }
                         RowLayout {
-                            visible: localEngine.currentIndex !== 2
+                            visible: localEngine.currentIndex !== 1
                             SubButton { text: qsTr("较新版本"); enabled: voices && !voices.busy && voices.versionOffset > 0; onClicked: voices.refresh(voices.selectedProfile, false, voices.profileOffset, Math.max(0, voices.versionOffset - 50)) }
                             SubButton { text: qsTr("较旧版本"); enabled: voices && !voices.busy && voiceVersions.count === 50; onClicked: voices.refresh(voices.selectedProfile, false, voices.profileOffset, voices.versionOffset + 50) }
                         }
@@ -681,7 +685,7 @@ Item {
                                         Label { text: qsTr("范围 0.5～2，1 为原速；可先用 0.85。重新生成才会生效。"); Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; font.pixelSize: 12 }
                                     }
                                     Label { visible: engineExpanded; text: qsTr("随机种子（可选）"); color: Theme.secondaryText }
-                                    TextField { id: seedField; visible: engineExpanded; objectName: "voiceSeedField"; Layout.fillWidth: true; enabled: draftId !== ""; placeholderText: qsTr("留空随机，0～%1").arg(localEngine.currentIndex === 2 ? 65535 : 2147483647); validator: IntValidator { bottom: 0; top: localEngine.currentIndex === 2 ? 65535 : 2147483647 } onTextChanged: if (!loadingDraft) draftDirty = true }
+                                    TextField { id: seedField; visible: engineExpanded; objectName: "voiceSeedField"; Layout.fillWidth: true; enabled: draftId !== ""; placeholderText: qsTr("留空随机，0～%1").arg(localEngine.currentIndex === 1 ? 65535 : 2147483647); validator: IntValidator { bottom: 0; top: localEngine.currentIndex === 1 ? 65535 : 2147483647 } onTextChanged: if (!loadingDraft) draftDirty = true }
                                     TextArea { textFormat: TextEdit.PlainText; id: notesEditor; objectName: "voiceNotesEditor"; Layout.fillWidth: true; Layout.preferredHeight: 58; selectByMouse: true; wrapMode: TextEdit.Wrap; placeholderText: qsTr("表演备注 · 仅保存，不发送给引擎"); enabled: draftId !== ""; onTextChanged: if (!loadingDraft) draftDirty = true; Keys.onPressed: function(event) { workspace.editKey(event, notesEditor) } }
                                     Label { text: qsTr("只显示当前引擎已接入的语言与参数；切换引擎不会改写已有句子或音频。"); Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; font.pixelSize: 12 }
                                     SubButton { text: engineExpanded ? qsTr("▾ 引擎配置") : qsTr("▸ 引擎配置"); checkable: true; checked: engineExpanded; Layout.fillWidth: true; onClicked: engineExpanded = !engineExpanded }
@@ -690,20 +694,20 @@ Item {
                                         visible: engineExpanded; Layout.fillWidth: true; spacing: 8
                                         onVisibleChanged: if (visible) Qt.callLater(function() { readingScroll.contentItem.contentY = Math.max(0, engineConfiguration.y - 8) })
                                         Label { text: localEngine.currentText; font.bold: true; color: Theme.text; wrapMode: Text.Wrap; Layout.fillWidth: true }
-                                        TextField { id: pythonPath; readOnly: true; visible: localEngine.currentIndex !== 2; Layout.fillWidth: true; placeholderText: qsTr("在设置 → AI 配音配置 Python"); selectByMouse: true }
-                                        Label { visible: localEngine.currentIndex === 2; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: qsTr("使用 AI 服务的语音合成账号与 Workspace；音色需明确关联相同账号。") }
-                                        SubButton { visible: localEngine.currentIndex === 2; text: qsTr("管理 AI 服务"); onClicked: if (workspace.Window.window) workspace.Window.window.openSettings("cloud", "") }
+                                        TextField { id: pythonPath; readOnly: true; visible: localEngine.currentIndex !== 1; Layout.fillWidth: true; placeholderText: qsTr("在设置 → AI 配音配置 Python"); selectByMouse: true }
+                                        Label { visible: localEngine.currentIndex === 1; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: qsTr("使用 AI 服务的语音合成账号与 Workspace；音色需明确关联相同账号。") }
+                                        SubButton { visible: localEngine.currentIndex === 1; text: qsTr("管理 AI 服务"); onClicked: if (workspace.Window.window) workspace.Window.window.openSettings("cloud", "") }
                                         RowLayout {
-                                            visible: localEngine.currentIndex === 2; Layout.fillWidth: true
+                                            visible: localEngine.currentIndex === 1; Layout.fillWidth: true
                                             Label { text: qsTr("软预算 ¥"); color: Theme.secondaryText }
                                             TextField { id: flashBudget; Layout.fillWidth: true; text: "1.00"; placeholderText: qsTr("当前范围预算，如 1.00") }
                                         }
-                                        SubCheckBox { id: flashRegenerate; visible: localEngine.currentIndex === 2; text: qsTr("已有候选也重新付费生成"); checked: false }
-                                        TextField { id: qwenModelPath; readOnly: true; Layout.fillWidth: true; visible: localEngine.currentIndex === 0 || localEngine.currentIndex >= 3; placeholderText: localEngine.currentIndex === 0 ? qsTr("Qwen Base 模型完整目录") : qsTr("引擎源码根目录，包含本地权重"); selectByMouse: true }
-                                        SubButton { text: qsTr("预检环境与模型"); visible: localEngine.currentIndex === 0 || localEngine.currentIndex >= 3; enabled: controller && !controller.modifying && !generating; onClicked: if (commitPending()) controller.checkLocal(localEngine.engineKey, pythonPath.text, qwenModelPath.text) }
-                                        Label { textFormat: Text.PlainText; visible: localEngine.currentIndex === 0 || localEngine.currentIndex >= 3; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: controller && controller.qwenStatus.device ? qsTr("预检：%1 · %2 GiB · %3\n切换引擎或路径后需重新预检。").arg(controller.qwenStatus.device).arg((Number(controller.qwenStatus.deviceBytes) / 1073741824).toFixed(1)).arg(controller.qwenStatus.provider) : qsTr("首次使用请配置环境并预检；缺少依赖会明确提示。") }
-                                        Label { visible: localEngine.currentIndex === 4 && controller && !!controller.qwenStatus.auxiliaryProviders; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: controller && controller.qwenStatus.auxiliaryProviders ? qsTr("G2PW：%1；主配音使用 CUDA。").arg(controller.qwenStatus.auxiliaryProviders.join(" / ")) : "" }
-                                        Label { textFormat: Text.PlainText; text: localEngine.currentIndex === 0 ? qsTr("Base 使用已审核参考与转写，不执行自由表演指令。") : localEngine.currentIndex === 3 ? qsTr("Index 支持 seed、时长倍率、单类情绪和发音标注；不发送备注。") : localEngine.currentIndex === 4 ? qsTr("GPT 使用已审核参考与转写，支持 seed 和语速倍率；专属权重控制待接入。") : localEngine.currentIndex === 2 ? qsTr("Flash 使用北京云声音版本。发送前确认文本与费用；不会上传本地参考，也不会自动重发。") : qsTr("Mock 仅产生测试音，不代表真实配音质量。"); Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; font.pixelSize: 12 }
+                                        SubCheckBox { id: flashRegenerate; visible: localEngine.currentIndex === 1; text: qsTr("已有候选也重新付费生成"); checked: false }
+                                        TextField { id: qwenModelPath; readOnly: true; Layout.fillWidth: true; visible: localEngine.currentIndex === 0 || localEngine.currentIndex >= 2; placeholderText: localEngine.currentIndex === 0 ? qsTr("Qwen Base 模型完整目录") : qsTr("引擎源码根目录，包含本地权重"); selectByMouse: true }
+                                        SubButton { text: qsTr("预检环境与模型"); visible: localEngine.currentIndex === 0 || localEngine.currentIndex >= 2; enabled: controller && !controller.modifying && !generating; onClicked: if (commitPending()) controller.checkLocal(localEngine.engineKey, pythonPath.text, qwenModelPath.text) }
+                                        Label { textFormat: Text.PlainText; visible: localEngine.currentIndex === 0 || localEngine.currentIndex >= 2; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: controller && controller.qwenStatus.device ? qsTr("预检：%1 · %2 GiB · %3\n切换引擎或路径后需重新预检。").arg(controller.qwenStatus.device).arg((Number(controller.qwenStatus.deviceBytes) / 1073741824).toFixed(1)).arg(controller.qwenStatus.provider) : qsTr("首次使用请配置环境并预检；缺少依赖会明确提示。") }
+                                        Label { visible: localEngine.currentIndex === 3 && controller && !!controller.qwenStatus.auxiliaryProviders; Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: controller && controller.qwenStatus.auxiliaryProviders ? qsTr("G2PW：%1；主配音使用 CUDA。").arg(controller.qwenStatus.auxiliaryProviders.join(" / ")) : "" }
+                                        Label { textFormat: Text.PlainText; text: localEngine.currentIndex === 0 ? qsTr("Base 使用已审核参考与转写，不执行自由表演指令。") : localEngine.currentIndex === 2 ? qsTr("Index 支持 seed、时长倍率、单类情绪和发音标注；不发送备注。") : localEngine.currentIndex === 3 ? qsTr("GPT 支持中／日参考音频合成中文；参考转写保持原文，不翻译。") : qsTr("Flash 使用北京云声音版本。发送前确认文本与费用；不会上传本地参考，也不会自动重发。"); Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; font.pixelSize: 12 }
                                     }
                                 }
                             }
@@ -897,7 +901,7 @@ Item {
         contentItem: TextArea { textFormat: TextEdit.PlainText; id: pastedText; selectByMouse: true; wrapMode: TextEdit.Wrap }
         onAccepted: {
             Qt.inputMethod.commit()
-            if (textOperation === "append") controller.previewText(pastedText.text, localEngine.currentIndex === 1 ? "mock" : localEngine.currentIndex === 2 ? "cloud" : localEngine.engineKey)
+            if (textOperation === "append") controller.previewText(pastedText.text, localEngine.currentIndex === 1 ? "cloud" : localEngine.engineKey)
             else if (textOperation === "resegment") controller.previewResegment(pastedText.text)
             else { const rules = []; for (const line of pastedText.text.split("\n")) { if (line.trim() === "") continue; const at = line.indexOf("="); rules.push({from: at > 0 ? line.substring(0, at) : "", to: at > 0 ? line.substring(at + 1) : ""}) } controller.previewReplacements(rules) }
         }
@@ -994,7 +998,7 @@ Item {
                                     SubButton { text: qsTr("较新"); enabled: controller && !controller.modifying && controller.candidateOffset > 0; onClicked: controller.loadCandidates(Math.max(0, controller.candidateOffset - 50)) }
                                     SubButton { text: qsTr("较旧"); enabled: controller && !controller.modifying && controller.candidates.length === 50; onClicked: controller.loadCandidates(controller.candidateOffset + 50) }
                                 }
-                                SubButton { visible: localEngine.currentIndex === 2 && controller && Number(controller.flashPreview.reused || 0) > 0 && controller.flashPreview.rows && controller.flashPreview.rows.length === 0; text: qsTr("复用已有云端候选，不再次收费"); Layout.fillWidth: true; onClicked: if (commitPending()) controller.confirmFlash() }
+                                SubButton { visible: localEngine.currentIndex === 1 && controller && Number(controller.flashPreview.reused || 0) > 0 && controller.flashPreview.rows && controller.flashPreview.rows.length === 0; text: qsTr("复用已有云端候选，不再次收费"); Layout.fillWidth: true; onClicked: if (commitPending()) controller.confirmFlash() }
                                 SubButton { text: qsTr("补齐未应用句的有效候选"); Layout.fillWidth: true; enabled: controller && !controller.modifying && manuscript.count > 0; onClicked: if (commitPending()) controller.applySafeCandidates() }
                                 Label { text: qsTr("批量应用保留人工裁切，跳过过期输入。"); Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; font.pixelSize: 12 }
                             }

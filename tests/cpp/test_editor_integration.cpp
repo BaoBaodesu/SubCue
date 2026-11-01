@@ -48,6 +48,7 @@
 #include <QtGui/QDropEvent>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QFont>
+#include <QtGui/QFontDatabase>
 #include <QtGui/QScreen>
 #include <QtGui/QInputMethodEvent>
 #include <QtGui/QWheelEvent>
@@ -62,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <limits>
 #include <QtCore/QDate>
 #include <QtCore/QLockFile>
@@ -422,6 +424,14 @@ private:
 
 void EditorIntegrationTests::initTestCase()
 {
+#ifdef Q_OS_WIN
+    // offscreen 平台不扫描系统字体；显式注册，否则测试截图里的中文全是方块，无法作为人工验收证据。
+    qputenv("QT_QPA_FONTDIR", QDir(qEnvironmentVariable("WINDIR")).filePath(QStringLiteral("Fonts")).toUtf8());
+    for (const auto &name : {QStringLiteral("msyh.ttc"), QStringLiteral("msyhbd.ttc"), QStringLiteral("simhei.ttf")}) {
+        const auto path = QDir(qEnvironmentVariable("WINDIR")).filePath(QStringLiteral("Fonts/") + name);
+        if (QFileInfo::exists(path)) QFontDatabase::addApplicationFont(path);
+    }
+#endif
     // 原生截图与正式程序使用相同的中文字体和像素字号。
     QFont font(QStringLiteral("Microsoft YaHei UI")); font.setPixelSize(13); QGuiApplication::setFont(font);
     qInfo() << "native_screen_dpr=" << QGuiApplication::primaryScreen()->devicePixelRatio()
@@ -513,34 +523,63 @@ void EditorIntegrationTests::voiceCreationDraftIsReviewedAtomicAndCancellable()
     QTemporaryDir directory; auto context = makeContext(directory); AppController editor(context.get()); RoughCutController rough(context.get());
     ProjectSession session(context.get(), &editor, &rough); session.newProject();
     const auto path = directory.filePath(QStringLiteral("creation.sqlite"));
+    context->settings.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope")); // 此用例不加载真实本地模型。
     VoiceLibraryController voices(context.get(), &session, path); voices.refresh(); QTRY_VERIFY(!voices.busy());
     QVERIFY(!voices.creationCapabilities().value(QStringLiteral("training")).toBool());
     QVERIFY(!voices.creationCapabilities().value(QStringLiteral("modelImport")).toBool());
     voices.beginCreation(); QVERIFY(voices.creating());
     voices.prepareSamples({QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav")))}, false); QTRY_VERIFY(!voices.busy());
     QCOMPARE(voices.samples().size(), 1); QVERIFY(voices.profiles().isEmpty());
-    voices.editSample(0, QStringLiteral("人工核对的参考文字"), true);
-    voices.createFromSamples(QStringLiteral("未经确认")); QVERIFY(!voices.busy()); QVERIFY(voices.profiles().isEmpty());
-    voices.confirmCreationSample(0, true, QStringLiteral("Chinese"));
-    voices.prepareSamples({QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav")))}, false); QTRY_VERIFY(!voices.busy());
-    QCOMPARE(voices.samples().size(), 1); QVERIFY(voices.samples().first().toMap().value(QStringLiteral("confirmed")).toBool());
-    voices.editSample(0, QStringLiteral("修改后必须重新确认"), true);
-    voices.createFromSamples(QStringLiteral("仍未确认")); QVERIFY(!voices.busy()); QVERIFY(voices.profiles().isEmpty());
-    voices.confirmCreationSample(0, true, QStringLiteral("Chinese"));
-    voices.createFromSamples(QStringLiteral("我的音色")); QTRY_VERIFY(!voices.busy());
+    // 未分析前不能创建，且给出明确原因。
+    QVERIFY(!voices.creationDraft().value(QStringLiteral("analyzed")).toBool());
+    QVERIFY(!voices.creationDraft().value(QStringLiteral("ready")).toBool());
+    voices.createFromSamples(QStringLiteral("未分析")); QVERIFY(!voices.busy()); QVERIFY(voices.profiles().isEmpty());
+    QVERIFY(voices.statusIsWarning());
+    // 分析：测试环境没有本地 ASR，应完成质检并保留手工填写参考转写的路径。
+    voices.analyzeCreationSamples(); QTRY_VERIFY(!voices.busy());
+    QVERIFY(voices.creationDraft().value(QStringLiteral("analyzed")).toBool());
+    QCOMPARE(voices.creationDraft().value(QStringLiteral("promptIndex")).toInt(), 0);
+    QVERIFY(!voices.creationDraft().value(QStringLiteral("ready")).toBool());
+    QVERIFY(voices.creationDraft().value(QStringLiteral("blockReason")).toString().contains(QStringLiteral("转写")));
+    voices.createFromSamples(QStringLiteral("空转写")); QVERIFY(!voices.busy()); QVERIFY(voices.profiles().isEmpty());
+    QVERIFY(voices.statusIsWarning());
+    // 只编辑参考 prompt 那条的转写即可创建，不再要求逐条确认。
+    voices.editCreationTranscript(0, QStringLiteral("人工核对的参考文字"));
+    QVERIFY(voices.creationDraft().value(QStringLiteral("ready")).toBool());
+    QVERIFY(!voices.samples().first().toMap().value(QStringLiteral("confirmed")).toBool());
+    voices.createFromSamples(QStringLiteral("未确认但通过")); QTRY_VERIFY(!voices.busy());
     QVERIFY2(!voices.creating(), qPrintable(voices.statusText())); QCOMPARE(voices.profiles().size(), 1);
     QCOMPARE(voices.versions().size(), 1);
-    QCOMPARE(voices.versions().first().toMap().value(QStringLiteral("metadata")).toMap().value(QStringLiteral("qualityState")).toString(), QStringLiteral("approved"));
+    const auto createdVersionId = voices.versions().first().toMap().value(QStringLiteral("id")).toString();
     VoiceLibrary library(path); QString error;
-    QCOMPARE(library.defaultVersion(voices.selectedProfile(), &error), voices.versions().first().toMap().value(QStringLiteral("id")).toString());
+    QCOMPARE(library.defaultVersion(voices.selectedProfile(), &error), createdVersionId);
     const auto assets = QDir(path + QStringLiteral(".assets")).entryList(QDir::Files);
-    const auto version = library.version(voices.versions().first().toMap().value(QStringLiteral("id")).toString()); QVERIFY(version);
-    const QJsonObject valid{{QStringLiteral("referencePath"), version->value(QStringLiteral("referencePath"))}, {QStringLiteral("metadata"), version->value(QStringLiteral("metadata"))}};
+    const auto createdVersion = library.version(createdVersionId); QVERIFY(createdVersion);
+    const auto metadata = createdVersion->value(QStringLiteral("metadata")).toObject();
+    QCOMPARE(metadata.value(QStringLiteral("qualityState")).toString(), QStringLiteral("approved"));
+    QCOMPARE(metadata.value(QStringLiteral("referenceText")).toString(), QStringLiteral("人工核对的参考文字"));
+    QVERIFY(metadata.value(QStringLiteral("promptSelected")).toBool());
+    const QJsonObject valid{{QStringLiteral("referencePath"), createdVersion->value(QStringLiteral("referencePath"))}, {QStringLiteral("metadata"), metadata}};
     QVERIFY(!library.createWithVersions(QStringLiteral("故障不留空档案"), {valid, QJsonObject{}}, &error));
     QCOMPARE(library.profiles().size(), 1); QCOMPARE(QDir(path + QStringLiteral(".assets")).entryList(QDir::Files), assets);
     voices.beginCreation(); voices.prepareSamples({QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav")))}, false);
     voices.cancelCreation(); QVERIFY(!voices.creating()); QVERIFY(!voices.busy()); QVERIFY(voices.samples().isEmpty());
     QCOMPARE(library.profiles().size(), 1);
+    // 语言回填：空语言或未知语言回退到已选参考语言，而不是静默拒绝确认。
+    voices.beginCreation(); QTRY_VERIFY(!voices.busy());
+    voices.prepareSamples({QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav")))}, false); QTRY_VERIFY(!voices.busy());
+    voices.analyzeCreationSamples(); QTRY_VERIFY(!voices.busy());
+    voices.editCreationTranscript(0, QStringLiteral("日语参考转写"));
+    voices.confirmCreationSample(0, true, QStringLiteral("Japanese"));
+    QCOMPARE(voices.samples().first().toMap().value(QStringLiteral("referenceLanguage")).toString(), QStringLiteral("Japanese"));
+    QVERIFY(voices.samples().first().toMap().value(QStringLiteral("confirmed")).toBool());
+    voices.confirmCreationSample(0, true, QString());
+    QCOMPARE(voices.samples().first().toMap().value(QStringLiteral("referenceLanguage")).toString(), QStringLiteral("Japanese"));
+    voices.confirmCreationSample(0, false, QStringLiteral("Korean"));
+    QVERIFY(!voices.samples().first().toMap().value(QStringLiteral("confirmed")).toBool());
+    QCOMPARE(voices.samples().first().toMap().value(QStringLiteral("referenceLanguage")).toString(), QStringLiteral("Japanese"));
+    voices.setCreationPrompt(0); QCOMPARE(voices.creationDraft().value(QStringLiteral("promptIndex")).toInt(), 0);
+    voices.cancelCreation();
 }
 
 void EditorIntegrationTests::referencePreviewTransfersPlaybackAndCloses()
@@ -2616,6 +2655,10 @@ void EditorIntegrationTests::sharedLegacyLifecycle()
 
 void EditorIntegrationTests::qmlSharedProjectWindow()
 {
+#ifdef Q_OS_WIN
+    // offscreen 测试默认找不到系统字体，截图里的中文会变成方块，无法作为人工验收证据。
+    qputenv("QT_QPA_FONTDIR", QDir(qEnvironmentVariable("WINDIR")).filePath(QStringLiteral("Fonts")).toUtf8());
+#endif
     QTemporaryDir directory;
     const QString modulePath = directory.filePath(QStringLiteral("SubCue"));
     QVERIFY(QDir().mkpath(modulePath));
@@ -2879,11 +2922,34 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
     context->settings.insert(QStringLiteral("asrProvider"), QStringLiteral("dashscope")); // 此 UI 回归不启动真实本地模型。
     auto *referenceButton = window->findChild<QObject *>(QStringLiteral("addReferenceVoice")); QVERIFY(referenceButton);
     QVERIFY(QMetaObject::invokeMethod(referenceButton, "clicked"));
-    auto *creationPage = window->findChild<QQuickItem *>(QStringLiteral("referenceCreationPage")); QVERIFY(creationPage); QTRY_VERIFY(creationPage->isVisible());
-    auto *creationName = window->findChild<QObject *>(QStringLiteral("creationVoiceName")); QVERIFY(creationName); creationName->setProperty("text", QStringLiteral("我的参考音色"));
-    voiceDialog->setProperty("creationStep", 1);
-    voices.prepareSamples({QUrl::fromLocalFile(mediaPath(QStringLiteral("audio.wav")))}, false); QTRY_VERIFY(!voices.busy());
+    auto *collectPage = window->findChild<QQuickItem *>(QStringLiteral("creationCollectPage")); QVERIFY(collectPage); QTRY_VERIFY(collectPage->isVisible());
+    // 准备 15 秒非静音素材，满足「10 秒起可分析」；长素材按静音或时长切开。
+    const auto longAudioPath = directory.filePath(QStringLiteral("creation-15s.wav"));
+    {
+        QFile longAudio(longAudioPath); QVERIFY(longAudio.open(QIODevice::WriteOnly));
+        QDataStream wav(&longAudio); wav.setByteOrder(QDataStream::LittleEndian);
+        wav.writeRawData("RIFF", 4); wav << quint32(36 + 16000 * 15 * 2);
+        wav.writeRawData("WAVEfmt ", 8); wav << quint32(16) << quint16(1) << quint16(1) << quint32(16000) << quint32(32000) << quint16(2) << quint16(16);
+        wav.writeRawData("data", 4); wav << quint32(16000 * 15 * 2);
+        for (int i = 0; i < 16000 * 15; ++i) wav << static_cast<qint16>(6000.0 * std::sin(2.0 * 3.14159265358979323846 * 220.0 * i / 16000.0));
+    }
+    voices.prepareSamples({QUrl::fromLocalFile(longAudioPath)}, true); QTRY_VERIFY(!voices.busy());
     QVERIFY(!voices.samples().isEmpty());
+    QVERIFY(voices.creationDraft().value(QStringLiteral("usableSeconds")).toDouble() >= 10);
+    QTest::qWait(50);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-create-collect.png"))));
+    auto *analyzeButton = window->findChild<QQuickItem *>(QStringLiteral("creationAnalyzeButton")); QVERIFY(analyzeButton);
+    QTRY_VERIFY(analyzeButton->isEnabled());
+    QVERIFY(QMetaObject::invokeMethod(analyzeButton, "clicked"));
+    auto *analyzePage = window->findChild<QQuickItem *>(QStringLiteral("creationAnalyzePage")); QVERIFY(analyzePage); QTRY_VERIFY(analyzePage->isVisible());
+    QTRY_VERIFY(voices.creationDraft().value(QStringLiteral("analyzed")).toBool());
+    QTest::qWait(50);
+    QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-create-analyze.png"))));
+    auto *continueButton = window->findChild<QQuickItem *>(QStringLiteral("creationContinueButton")); QVERIFY(continueButton);
+    QTRY_VERIFY(continueButton->isEnabled());
+    QVERIFY(QMetaObject::invokeMethod(continueButton, "clicked"));
+    auto *profilePage = window->findChild<QQuickItem *>(QStringLiteral("creationProfilePage")); QVERIFY(profilePage); QTRY_VERIFY(profilePage->isVisible());
+    auto *creationName = window->findChild<QObject *>(QStringLiteral("creationVoiceName")); QVERIFY(creationName); creationName->setProperty("text", QStringLiteral("我的参考音色"));
     window->setMinimumHeight(440);
     for (const auto &size : {QSize(900, 440), QSize(1366, 768), QSize(1920, 1080)}) {
         window->resize(size); QTest::qWait(100);
@@ -2898,21 +2964,24 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
         for (auto *child : item->childItems()) if (auto *found = creationItem(child, name)) return found;
         return nullptr;
     };
-    auto *creationText = creationItem(window->contentItem(), QStringLiteral("creationTranscript")); QVERIFY(creationText);
-    creationText->setProperty("text", QStringLiteral("已试听并核对的参考原话"));
+    auto *createVoiceButton = window->findChild<QObject *>(QStringLiteral("createReferenceVoice")); QVERIFY(createVoiceButton);
+    QTRY_VERIFY(!createVoiceButton->property("enabled").toBool());
+    // 没有转写时创建按钮直接禁用，并在页脚说明缺什么；不再点完才冒出一行灰字。
+    auto *blockReason = window->findChild<QObject *>(QStringLiteral("creationBlockReason")); QVERIFY(blockReason);
+    QTRY_VERIFY(blockReason->property("visible").toBool());
+    QVERIFY(blockReason->property("text").toString().contains(QStringLiteral("转写")));
     auto *creationLanguage = creationItem(window->contentItem(), QStringLiteral("creationReferenceLanguage")); QVERIFY(creationLanguage);
+    QCOMPARE(creationLanguage->property("currentIndex").toInt(), 0);
     creationLanguage->setProperty("currentIndex", 1); QVERIFY(QMetaObject::invokeMethod(creationLanguage, "activated", Q_ARG(int, 1)));
     QTest::qWait(50);
-    creationLanguage = creationItem(window->contentItem(), QStringLiteral("creationReferenceLanguage")); QVERIFY(creationLanguage);
-    QCOMPARE(creationLanguage->property("currentIndex").toInt(), 1);
-    auto *confirmedSample = creationItem(window->contentItem(), QStringLiteral("confirmCreationSample")); QVERIFY(confirmedSample);
-    confirmedSample->setProperty("checked", true); QVERIFY(QMetaObject::invokeMethod(confirmedSample, "toggled"));
-    QVERIFY(voices.samples().first().toMap().value(QStringLiteral("confirmed")).toBool());
-    QCOMPARE(voices.samples().first().toMap().value(QStringLiteral("referenceLanguage")).toString(), QStringLiteral("English"));
-    auto *createVoiceButton = window->findChild<QObject *>(QStringLiteral("createReferenceVoice")); QVERIFY(createVoiceButton);
-    QVERIFY(QMetaObject::invokeMethod(createVoiceButton, "clicked")); QCOMPARE(voiceDialog->property("creationStep").toInt(), 2);
+    const auto promptIndex = voices.creationDraft().value(QStringLiteral("promptIndex")).toInt();
+    QVERIFY(promptIndex >= 0);
+    QCOMPARE(voices.samples().value(promptIndex).toMap().value(QStringLiteral("referenceLanguage")).toString(), QStringLiteral("English"));
+    auto *creationText = creationItem(window->contentItem(), QStringLiteral("creationTranscript")); QVERIFY(creationText);
+    creationText->setProperty("text", QStringLiteral("已试听并核对的参考原话"));
+    QTRY_VERIFY(createVoiceButton->property("enabled").toBool());
     QVERIFY(QMetaObject::invokeMethod(createVoiceButton, "clicked")); QTRY_VERIFY(!voices.busy());
-    QVERIFY2(!voices.creating(), qPrintable(voices.statusText())); QTRY_VERIFY(!creationPage->isVisible()); QVERIFY(voices.samples().isEmpty());
+    QVERIFY2(!voices.creating(), qPrintable(voices.statusText())); QTRY_VERIFY(!profilePage->isVisible()); QVERIFY(voices.samples().isEmpty());
     QCOMPARE(voiceDocument.defaultVoiceVersionId(), originalDefaultVoice);
     QVERIFY(QMetaObject::invokeMethod(voiceDialog, "close"));
     QTest::qWait(100);
@@ -2995,7 +3064,7 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
         }
     }
     QTest::qWait(50); QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-qwen-controls.png"))));
-    auto *engineSelector = voiceWorkspace->findChild<QObject *>(QStringLiteral("voiceEngineSelector")); QVERIFY(engineSelector); engineSelector->setProperty("currentIndex", 2);
+    auto *engineSelector = voiceWorkspace->findChild<QObject *>(QStringLiteral("voiceEngineSelector")); QVERIFY(engineSelector); engineSelector->setProperty("currentIndex", 1);
     QTest::qWait(50);
     for (auto *item : voiceWorkspace->findChildren<QQuickItem *>()) if (item->inherits("QQuickFlickable") && item->height() > 300 && item->mapToScene(QPointF{}).x() > window->width() * 0.65) item->setProperty("contentY", std::max(0.0, item->property("contentHeight").toDouble() - item->height()));
     QTest::qWait(50); QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-flash-controls.png"))));
@@ -3007,7 +3076,7 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
         QVERIFY(QMetaObject::invokeMethod(flashDialog, "reject"));
     }
     window->resize(flashWindowSize); QTest::qWait(100);
-    QCOMPARE(engineSelector->property("count").toInt(), 5); engineSelector->setProperty("currentIndex", 3);
+    QCOMPARE(engineSelector->property("count").toInt(), 4); engineSelector->setProperty("currentIndex", 2);
     auto *duration = voiceWorkspace->findChild<QObject *>(QStringLiteral("indexDurationField"));
     auto *emotion = voiceWorkspace->findChild<QObject *>(QStringLiteral("indexEmotionChoice")); QVERIFY(duration); QVERIFY(emotion);
     QCOMPARE(emotion->property("count").toInt(), 9); duration->setProperty("text", QStringLiteral("0.49")); QVERIFY(!duration->property("acceptableInput").toBool());
@@ -3016,7 +3085,7 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
     for (auto *item : voiceWorkspace->findChildren<QQuickItem *>()) if (item->inherits("QQuickFlickable") && item->height() > 300 && item->mapToScene(QPointF{}).x() > window->width() * 0.65) item->setProperty("contentY", 0);
     QTest::qWait(50); QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-index-controls.png"))));
     voiceWorkspace->setProperty("draftDirty", true); voiceWorkspace->setProperty("indexParametersDirty", true);
-    engineSelector->setProperty("currentIndex", 4); QTest::qWait(50);
+    engineSelector->setProperty("currentIndex", 3); QTest::qWait(50);
     QVariant committedDraft; QVERIFY(QMetaObject::invokeMethod(voiceWorkspace, "commitPending", Q_RETURN_ARG(QVariant, committedDraft))); QVERIFY(committedDraft.toBool());
     QCOMPARE(voiceDocument.selected().value(QStringLiteral("parameters")).toMap().value(QStringLiteral("durationFactor")).toDouble(), 1.15);
     QCOMPARE(voiceDocument.selected().value(QStringLiteral("parameters")).toMap().value(QStringLiteral("emotion")).toString(), QStringLiteral("happy"));
@@ -3043,7 +3112,7 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
         QTest::qWait(100); QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-gpt-speed-%1.png").arg(size.width()))));
     }
     window->resize(speedWindowSize); QTest::qWait(100);
-    engineSelector->setProperty("currentIndex", 2); QTest::qWait(50); QVERIFY(gptSpeed->isVisible());
+    engineSelector->setProperty("currentIndex", 1); QTest::qWait(50); QVERIFY(gptSpeed->isVisible());
     auto *seedInput = voiceWorkspace->findChild<QQuickItem *>(QStringLiteral("voiceSeedField")); QVERIFY(seedInput);
     const auto beforeCloudSeed = voiceDocument.snapshot();
     for (const auto &seed : {QStringLiteral("-1"), QStringLiteral("65536")}) {
@@ -3067,14 +3136,15 @@ void EditorIntegrationTests::qmlSharedProjectWindow()
     QVERIFY(QMetaObject::invokeMethod(voiceWorkspace, "commitPending", Q_RETURN_ARG(QVariant, committedDraft))); QVERIFY(committedDraft.toBool());
     QVERIFY(!voiceDocument.selected().value(QStringLiteral("parameters")).toMap().contains(QStringLiteral("speedFactor"))); voiceDocument.undo();
     QTest::qWait(50); QVERIFY(window->grabWindow().save(sourcePath(QStringLiteral(".test_tmp/voice-cloud-speed.png"))));
-    engineSelector->setProperty("currentIndex", 4); QTest::qWait(50);
+    engineSelector->setProperty("currentIndex", 3); QTest::qWait(50);
     seedInput->setProperty("text", QStringLiteral("2147483647")); voiceWorkspace->setProperty("draftDirty", true);
     QVERIFY(QMetaObject::invokeMethod(voiceWorkspace, "commitPending", Q_RETURN_ARG(QVariant, committedDraft))); QVERIFY(committedDraft.toBool());
     QCOMPARE(voiceDocument.selected().value(QStringLiteral("parameters")).toMap().value(QStringLiteral("seed")).toLongLong(), 2147483647LL);
     seedInput->setProperty("text", QString()); voiceWorkspace->setProperty("draftDirty", true);
     QVERIFY(QMetaObject::invokeMethod(voiceWorkspace, "commitPending", Q_RETURN_ARG(QVariant, committedDraft))); QVERIFY(committedDraft.toBool());
     auto *languageChoice = voiceWorkspace->findChild<QObject *>(QStringLiteral("voiceTargetLanguage")); QVERIFY(languageChoice);
-    QCOMPARE(languageChoice->property("count").toInt(), 1);
+    // GPT-SoVITS 的参考语言和目标语言已分开，目标语言支持中英日。
+    QCOMPARE(languageChoice->property("count").toInt(), 3);
     engineSelector->setProperty("currentIndex", 0); QTest::qWait(30);
     QCOMPARE(languageChoice->property("count").toInt(), 3); languageChoice->setProperty("currentIndex", 1); QVERIFY(QMetaObject::invokeMethod(languageChoice, "activated", Q_ARG(int, 1)));
     QVERIFY(QMetaObject::invokeMethod(voiceWorkspace, "commitPending", Q_RETURN_ARG(QVariant, committedDraft))); QVERIFY(committedDraft.toBool());
@@ -3327,7 +3397,8 @@ void EditorIntegrationTests::voiceEditorCapabilitiesAndBuiltinCatalog()
     QTemporaryDir directory; auto context = makeContext(directory); RecordingHttpClient http; context->aiHttp = &http;
     AppController editor(context.get()); RoughCutController rough(context.get()); ProjectSession session(context.get(), &editor, &rough);
     VoiceStudioController voice(context.get(), &session); session.newProject();
-    QCOMPARE(voice.engineCapabilities(QStringLiteral("gpt")).value(QStringLiteral("languages")).toStringList(), QStringList{QStringLiteral("Chinese")});
+    QCOMPARE(voice.engineCapabilities(QStringLiteral("gpt")).value(QStringLiteral("languages")).toStringList(),
+        (QStringList{QStringLiteral("Chinese"), QStringLiteral("English"), QStringLiteral("Japanese")}));
     QVERIFY(voice.engineCapabilities(QStringLiteral("index")).value(QStringLiteral("parameters")).toStringList().contains(QStringLiteral("emotion")));
     QVERIFY(!voice.engineCapabilities(QStringLiteral("qwen")).value(QStringLiteral("parameters")).toStringList().contains(QStringLiteral("emotion")));
     VoiceLibraryController voices(context.get(), &session);

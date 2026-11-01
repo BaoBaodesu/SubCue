@@ -15,7 +15,7 @@ LocalTtsProvider::LocalTtsProvider(Kind kind, QString python, QString worker, QS
 TtsCapabilities LocalTtsProvider::capabilities() const
 {
     if (kind_ == Kind::Index25) return {QStringLiteral("index-local"), QStringLiteral("IndexTTS-2.5"), {QStringLiteral("Chinese"), QStringLiteral("English"), QStringLiteral("Japanese")}, {QStringLiteral("seed"), QStringLiteral("durationFactor"), QStringLiteral("emotion"), QStringLiteral("emotionStrength")}, false, true, false, false};
-    if (kind_ == Kind::GptProPlus) return {QStringLiteral("gpt-local"), QStringLiteral("GPT-SoVITS-v2ProPlus"), {QStringLiteral("Chinese")}, {QStringLiteral("seed"), QStringLiteral("speedFactor")}, false, true, true, false};
+    if (kind_ == Kind::GptProPlus) return {QStringLiteral("gpt-local"), QStringLiteral("GPT-SoVITS-v2ProPlus"), {QStringLiteral("Chinese"), QStringLiteral("English"), QStringLiteral("Japanese")}, {QStringLiteral("seed"), QStringLiteral("speedFactor")}, false, true, true, false, {QStringLiteral("Chinese"), QStringLiteral("English"), QStringLiteral("Japanese")}};
     const bool mock = kind_ == Kind::Mock;
     return {mock ? QStringLiteral("mock") : QStringLiteral("qwen-local"),
         mock ? QStringLiteral("mock-tone") : QStringLiteral("Qwen3-TTS-12Hz-0.6B-Base"),

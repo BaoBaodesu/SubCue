@@ -12,20 +12,26 @@ import traceback
 from tts_engine_preflight import inspect
 
 
-def check(provider, repository):
+# GPT-SoVITS 的 text_lang／prompt_lang 取值；参考语言与目标语言分别映射，参考转写保持原语言。
+GPT_LANGUAGE_CODES = {'Chinese': 'zh', 'English': 'en', 'Japanese': 'ja'}
+
+
+def check(provider, repository, languages=None):
     from tts_python_worker import digest
     engine = {'index-local': 'index', 'gpt-local': 'gpt'}[provider]
-    report = inspect(engine, repository)
+    # 未指定语言时按中文基线预检，保持既有中文安装的通过条件；指定语言时只要求这些语言的前端资源。
+    report = inspect(engine, repository) if languages is None else inspect(engine, repository, languages=languages)
     if not report['filesAndPackagesPresent']:
         raise ValueError('离线预检不通过：' + json.dumps({'missing': report['missingFiles'], 'configuration': report['configurationErrors'], 'packages': report['packages']}, ensure_ascii=False))
     if report['missingGenerationResources']:
-        raise ValueError('中文生成所需离线资源缺失：' + json.dumps(report['missingGenerationResources'], ensure_ascii=False))
+        raise ValueError('所选目标／参考语言所需的离线生成资源缺失：' + json.dumps({'languages': report.get('requestedLanguages', []), 'missing': report['missingGenerationResources']}, ensure_ascii=False))
     for value in report['manifest'].values():
         value['sha256'] = digest(value['path'])
     report['profile'] = {'provider': provider, 'precision': 'bf16' if engine == 'index' else 'fp16',
                          'emotionText': False, 'acceleration': False, 'adapterVersion': 2}
     if engine == 'gpt':
-        report['profile'].update(languageDetector='full-local', adapterVersion=3, cudaGraph=False, flashAttention=False)
+        report['profile'].update(languageDetector='full-local', adapterVersion=3, cudaGraph=False, flashAttention=False,
+                                 supportedTextLanguages=report.get('supportedTextLanguages', []))
         import onnxruntime
         report['auxiliaryProviders'] = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in onnxruntime.get_available_providers() else ['CPUExecutionProvider']
         report['profile'].update(g2pwProviders=report['auxiliaryProviders'], onnxRuntimeVersion=onnxruntime.__version__)
@@ -87,13 +93,17 @@ def batch(request):
     import numpy as np
     import soundfile as sf
     provider = request['provider']
+    # GPT 现在允许中英日目标与参考语言；Index 保持原有的中英日目标语言。
     validate_jobs(request.get('jobs'), False, transcript_required=provider != 'index-local', index_controls=provider == 'index-local',
-                  languages=('Chinese', 'English', 'Japanese') if provider == 'index-local' else ('Chinese',), gpt_controls=provider == 'gpt-local')
+                  languages=('Chinese', 'English', 'Japanese'), gpt_controls=provider == 'gpt-local')
     output = Path(request['outputDirectory'])
     if not output.is_absolute() or not output.is_dir():
         raise ValueError('输出目录必须由任务所有者创建。')
     root = Path(request['modelDirectory'])
-    checked = check(provider, root)
+    # 预检只要求本批实际用到的目标／参考语言资源；模型身份不受语言选择影响。
+    requested_languages = tuple(sorted({job['language'] for job in request['jobs']} |
+                                       {job.get('referenceLanguage', 'Chinese') for job in request['jobs']}))
+    checked = check(provider, root, requested_languages) if provider == 'gpt-local' else check(provider, root)
     if any(job['modelVersion'] != checked['modelVersion'] for job in request['jobs']):
         raise ValueError('模型或环境版本变化，请重新预检。')
     os.chdir(output)
@@ -124,8 +134,11 @@ def batch(request):
                                                 lang={'Chinese': 'zh', 'English': 'en', 'Japanese': 'ja'}[job['language']], interval_silence=0, stream_return=False, emo_vector=vector,
                                                 use_random=False, duration_factor=parameters.get('durationFactor', 1.0))
                     else:
-                        generated = list(model.run({'text': job['spokenText'], 'text_lang': 'all_zh', 'ref_audio_path': job['referencePath'],
-                            'prompt_text': job['referenceText'], 'prompt_lang': 'all_zh', 'text_split_method': 'cut0', 'batch_size': 1,
+                        # 目标语言与参考语言分别映射；参考转写必须保持参考音频原语言，不翻译。
+                        text_lang = GPT_LANGUAGE_CODES[job['language']]
+                        prompt_lang = GPT_LANGUAGE_CODES[job.get('referenceLanguage', 'Chinese')]
+                        generated = list(model.run({'text': job['spokenText'], 'text_lang': text_lang, 'ref_audio_path': job['referencePath'],
+                            'prompt_text': job['referenceText'], 'prompt_lang': prompt_lang, 'text_split_method': 'cut0', 'batch_size': 1,
                             'parallel_infer': False, 'use_cuda_graph': False, 'use_flash_attention': False,
                             'speed_factor': job.get('parameters', {}).get('speedFactor', 1.0),
                             'split_bucket': False, 'fragment_interval': 0, 'seed': job.get('parameters', {}).get('seed', -1)}))
@@ -151,7 +164,8 @@ def batch(request):
                 if provider == 'gpt-local':
                     import text.chinese2 as chinese
                     import fast_langdetect
-                    auxiliary = {'g2pwProviders': chinese.g2pw._converter._g2pw.session_g2pw.get_providers(),
+                    auxiliary = {'textLang': text_lang, 'promptLang': prompt_lang,
+                                 'g2pwProviders': chinese.g2pw._converter._g2pw.session_g2pw.get_providers(),
                                  'languageDetectorProfiles': list(fast_langdetect.infer._default_detector._models),
                                  'loadedVersion': model.configs.version,
                                  'accelerationActive': getattr(model, 't2s_accel', None) is not None,

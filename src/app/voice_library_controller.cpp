@@ -51,7 +51,7 @@ void VoiceLibraryController::cancelAndWait()
         creating_ = false; committingCreation_ = false; samples_.clear(); sampleDirectory_.reset(); derivedDirectory_.reset();
     }
     if (catalog_.value(QStringLiteral("state")) == QStringLiteral("loading")) { catalog_.insert(QStringLiteral("state"), QStringLiteral("cancelled")); catalog_.insert(QStringLiteral("message"), QStringLiteral("查询已取消，当前声音绑定保留。")); }
-    if (busy_) { busy_ = false; status_ = QStringLiteral("操作已停止；已提交的声音版本保留。"); }
+    if (busy_) { busy_ = false; status_ = QStringLiteral("操作已停止；已提交的声音版本保留。"); statusIsWarning_ = true; }
     emit changed();
 }
 void VoiceLibraryController::submit(std::function<bool(VoiceLibrary &, QString &, QString &)> operation, const QString &successText,
@@ -95,6 +95,7 @@ void VoiceLibraryController::submit(std::function<bool(VoiceLibrary &, QString &
                 self->profileOffset_ = profileOffset; self->versionOffset_ = versionOffset; self->includeArchived_ = includeArchived != 0;
             }
             self->busy_ = false; self->status_ = error.isEmpty() ? successText : error;
+            self->statusIsWarning_ = !error.isEmpty();
             if (self->committingCreation_) {
                 self->committingCreation_ = false;
                 if (error.isEmpty()) { self->creating_ = false; self->samples_.clear(); self->sampleDirectory_.reset(); }
@@ -118,26 +119,96 @@ QVariantMap VoiceLibraryController::creationCapabilities() const
     return {{QStringLiteral("localAsrReady"), ready}, {QStringLiteral("reference"), true}, {QStringLiteral("training"), false},
         {QStringLiteral("modelImport"), false}, {QStringLiteral("cloud"), true}};
 }
+QVariantMap VoiceLibraryController::creationDraft() const
+{
+    // 创建条件是「有一条能当参考 prompt 的素材」，不再是「每条都人工确认过」。
+    int selected = 0, eligible = 0, promptCandidates = 0;
+    double totalSeconds = 0, usableSeconds = 0;
+    QVariantList issues;
+    for (int index = 0; index < samples_.size(); ++index) {
+        const auto sample = samples_[index].toMap();
+        const double duration = sample.value(QStringLiteral("endSeconds")).toDouble() - sample.value(QStringLiteral("startSeconds")).toDouble();
+        if (duration > 0) totalSeconds += duration;
+        if (!sample.value(QStringLiteral("selected")).toBool()) continue;
+        ++selected;
+        const auto file = QFileInfo(sample.value(QStringLiteral("sourcePath")).toString()).fileName();
+        const auto addIssue = [&issues, index](const QString &name, const QString &reason) {
+            issues.append(QVariantMap{{QStringLiteral("index"), index + 1}, {QStringLiteral("name"), name}, {QStringLiteral("reason"), reason}});
+        };
+        if (sample.contains(QStringLiteral("error"))) { addIssue(file, sample.value(QStringLiteral("error")).toString()); continue; }
+        const auto quality = sample.value(QStringLiteral("quality")).toMap();
+        if (quality.isEmpty() || quality.value(QStringLiteral("peak")).toDouble() <= 0) { addIssue(file, QStringLiteral("音频全为静音或未能解码")); continue; }
+        ++eligible;
+        if (duration > 0) usableSeconds += duration;
+        if (creationTranscriptRequired_ && sample.value(QStringLiteral("transcript")).toString().trimmed().isEmpty()) {
+            addIssue(file, QStringLiteral("转写为空，不能作为参考 prompt"));
+            continue;
+        }
+        ++promptCandidates;
+    }
+    QString promptTranscript, promptLanguage;
+    if (creationPromptIndex_ >= 0 && creationPromptIndex_ < samples_.size()) {
+        const auto prompt = samples_[creationPromptIndex_].toMap();
+        promptTranscript = prompt.value(QStringLiteral("transcript")).toString();
+        promptLanguage = prompt.value(QStringLiteral("referenceLanguage"), QStringLiteral("Chinese")).toString();
+    }
+    QString analyzeBlockReason;
+    if (samples_.isEmpty()) analyzeBlockReason = QStringLiteral("先添加参考音频");
+    else if (usableSeconds < 10) analyzeBlockReason = QStringLiteral("还差 %1 秒可分析（不足 10 秒）").arg(QString::number(10 - usableSeconds, 'f', 1));
+    QString blockReason;
+    if (samples_.isEmpty()) blockReason = QStringLiteral("先添加参考音频");
+    else if (!creationAnalyzed_) blockReason = QStringLiteral("先分析音频");
+    else if (creationPromptIndex_ < 0) blockReason = QStringLiteral("没有可用作参考 prompt 的素材");
+    else if (creationTranscriptRequired_ && promptTranscript.trimmed().isEmpty()) blockReason = QStringLiteral("请填写参考 prompt 的转写");
+    return {{QStringLiteral("total"), samples_.size()}, {QStringLiteral("selected"), selected}, {QStringLiteral("eligible"), eligible},
+        {QStringLiteral("totalSeconds"), totalSeconds}, {QStringLiteral("usableSeconds"), usableSeconds},
+        {QStringLiteral("minSeconds"), 10.0}, {QStringLiteral("comfortableSeconds"), 30.0}, {QStringLiteral("betterSeconds"), 90.0},
+        {QStringLiteral("canAnalyze"), !samples_.isEmpty() && usableSeconds >= 10}, {QStringLiteral("analyzeBlockReason"), analyzeBlockReason},
+        {QStringLiteral("analyzed"), creationAnalyzed_}, {QStringLiteral("promptIndex"), creationPromptIndex_},
+        {QStringLiteral("promptTranscript"), promptTranscript}, {QStringLiteral("promptLanguage"), promptLanguage},
+        {QStringLiteral("promptCandidates"), promptCandidates},
+        {QStringLiteral("ready"), creationPromptIndex_ >= 0 && (!creationTranscriptRequired_ || !promptTranscript.trimmed().isEmpty())},
+        {QStringLiteral("issues"), issues}, {QStringLiteral("blockReason"), blockReason}};
+}
 void VoiceLibraryController::beginCreation()
 {
     if (busy_) return;
-    sampleDirectory_.reset(); samples_.clear(); creating_ = true; committingCreation_ = false;
-    status_ = QStringLiteral("添加参考音频，检查并确认后创建音色。"); emit changed();
+    sampleDirectory_.reset(); samples_.clear(); creating_ = true; committingCreation_ = false; statusIsWarning_ = false;
+    creationAnalyzed_ = false; creationPromptIndex_ = -1;
+    status_ = QStringLiteral("添加参考音频；分析后挑出参考 prompt，再填音色资料。"); emit changed();
 }
 void VoiceLibraryController::cancelCreation()
 {
     if (!creating_) return;
     cancelAndWait(); samples_.clear(); sampleDirectory_.reset(); derivedDirectory_.reset();
-    creating_ = false; committingCreation_ = false; status_ = QStringLiteral("添加已取消，已有音色保留。"); emit changed();
+    creating_ = false; committingCreation_ = false; statusIsWarning_ = false; creationAnalyzed_ = false; creationPromptIndex_ = -1;
+    status_ = QStringLiteral("添加已取消，已有音色保留。"); emit changed();
+}
+void VoiceLibraryController::setCreationTranscriptRequired(bool required)
+{
+    if (creationTranscriptRequired_ == required) return;
+    creationTranscriptRequired_ = required; emit changed();
+}
+void VoiceLibraryController::setCreationSampleSelected(int index, bool selected)
+{
+    if (busy_ || index < 0 || index >= samples_.size()) return;
+    auto sample = samples_[index].toMap();
+    if (sample.value(QStringLiteral("selected")).toBool() == selected) return;
+    sample.insert(QStringLiteral("selected"), selected); samples_[index] = sample; emit changed();
 }
 void VoiceLibraryController::confirmCreationSample(int index, bool confirmed, const QString &language)
 {
-    if (!creating_ || busy_ || index < 0 || index >= samples_.size()
-        || !QStringList{QStringLiteral("Chinese"), QStringLiteral("English"), QStringLiteral("Japanese")}.contains(language)) return;
+    if (!creating_ || busy_ || index < 0 || index >= samples_.size()) return;
+    const QStringList languages{QStringLiteral("Chinese"), QStringLiteral("English"), QStringLiteral("Japanese")};
     auto sample = samples_[index].toMap();
-    if (sample.contains(QStringLiteral("error"))) return;
-    sample.insert(QStringLiteral("confirmed"), confirmed); sample.insert(QStringLiteral("referenceLanguage"), language);
-    samples_[index] = sample; emit changed();
+    // 组合框尚未回填时语言可能为空；回退到样本已有语言，避免勾选静默失效。
+    auto target = languages.contains(language) ? language : sample.value(QStringLiteral("referenceLanguage")).toString();
+    if (!languages.contains(target)) target = QStringLiteral("Chinese");
+    if (sample.contains(QStringLiteral("error"))) {
+        statusIsWarning_ = true; status_ = QStringLiteral("该素材质检未通过，不能用作参考。"); emit changed(); return;
+    }
+    sample.insert(QStringLiteral("confirmed"), confirmed); sample.insert(QStringLiteral("referenceLanguage"), target);
+    samples_[index] = sample; statusIsWarning_ = false; emit changed();
 }
 void VoiceLibraryController::cropCreationSample(int index, double startSeconds, double endSeconds)
 {
@@ -165,36 +236,214 @@ void VoiceLibraryController::cropCreationSample(int index, double startSeconds, 
                 updated.insert(QStringLiteral("endSeconds"), sample.value(QStringLiteral("startSeconds")).toDouble() + endSeconds);
                 updated.insert(QStringLiteral("transcript"), QString()); updated.insert(QStringLiteral("confirmed"), false); self->samples_[index] = updated;
                 QFile::remove(sample.value(QStringLiteral("referencePath")).toString());
-                self->status_ = QStringLiteral("裁切已完成，请重新核对转写并确认。");
-            } else { QFile::remove(path); self->status_ = cancel->load() ? QStringLiteral("裁切已取消，原样本保留。") : error; }
+                self->statusIsWarning_ = false;
+                self->status_ = QStringLiteral("裁切已完成，请重新核对转写；裁切样本需要重新识别或填写转写才能当参考 prompt。");
+            } else { QFile::remove(path); self->statusIsWarning_ = true; self->status_ = cancel->load() ? QStringLiteral("裁切已取消，原样本保留。") : error; }
             emit self->changed(); emit self->operationFinished(quality.has_value() && error.isEmpty() && !cancel->load());
         }, Qt::QueuedConnection);
     });
     emit changed();
 }
+namespace {
+// 仅按转写字符粗判参考语言，不是语言检测模型；最终以用户选择为准。
+QString creationLanguageHint(const QString &transcript)
+{
+    for (const auto &ch : transcript) {
+        const auto code = ch.unicode();
+        if (code >= 0x3040 && code <= 0x30FF) return QStringLiteral("Japanese");
+    }
+    bool latin = false, cjk = false;
+    for (const auto &ch : transcript) {
+        const auto code = ch.unicode();
+        if (code >= 0x4E00 && code <= 0x9FFF) cjk = true;
+        else if ((code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z')) latin = true;
+    }
+    if (cjk) return QStringLiteral("Chinese");
+    if (latin) return QStringLiteral("English");
+    return {};
+}
+}
+void VoiceLibraryController::analyzeCreationSamples()
+{
+    if (QGuiApplication::inputMethod()) QGuiApplication::inputMethod()->commit();
+    if (busy_ || samples_.isEmpty()) return;
+    creationAnalyzed_ = false; creationPromptIndex_ = -1;
+    for (int i = 0; i < samples_.size(); ++i) {
+        auto sample = samples_[i].toMap();
+        sample.insert(QStringLiteral("analysisState"), sample.contains(QStringLiteral("error")) ? QStringLiteral("failed") : QStringLiteral("queued"));
+        sample.insert(QStringLiteral("analysisMessage"), sample.value(QStringLiteral("error")).toString());
+        samples_[i] = sample;
+    }
+    busy_ = true; cancel_ = false; statusIsWarning_ = false; status_ = QStringLiteral("正在分析音频…"); emit changed();
+    const auto settings = context_->settings;
+    const bool asrReady = creationCapabilities().value(QStringLiteral("localAsrReady")).toBool();
+    const auto inputs = samples_;
+    const QPointer<VoiceLibraryController> self(this); const auto epoch = ++epoch_; auto *cancel = &cancel_;
+    audioTask_ = context_->submitAudioProcessing([self, epoch, inputs, settings, asrReady, cancel] {
+        QVariantList updated = inputs; QString error;
+        const auto report = [self, epoch](int index, const QString &state, const QString &message) {
+            if (!self) return;
+            QMetaObject::invokeMethod(self.data(), [self, epoch, index, state, message] {
+                if (!self || self->epoch_ != epoch || index < 0 || index >= self->samples_.size()) return;
+                auto sample = self->samples_[index].toMap();
+                sample.insert(QStringLiteral("analysisState"), state); sample.insert(QStringLiteral("analysisMessage"), message);
+                self->samples_[index] = sample; emit self->changed();
+            }, Qt::QueuedConnection);
+        };
+        try {
+            std::unique_ptr<IAsrService> service;
+            std::optional<InferenceManager::Lease> lease;
+            if (asrReady) {
+                lease = InferenceManager::instance().acquire(cancel, -1, QStringLiteral("声音样本分析批次"));
+                if (lease) service = AsrProviderFactory(nullptr).create(settings, {});
+            }
+            for (int i = 0; i < updated.size(); ++i) {
+                if (cancel->load()) break;
+                auto sample = updated[i].toMap();
+                if (sample.contains(QStringLiteral("error"))) { report(i, QStringLiteral("failed"), sample.value(QStringLiteral("error")).toString()); continue; }
+                report(i, QStringLiteral("analyzing"), QString());
+                const auto path = sample.value(QStringLiteral("referencePath")).toString();
+                QString qualityError;
+                const auto quality = AudioQuality::inspect(path, &qualityError, cancel);
+                if (!quality || quality->peak == 0) {
+                    const auto message = qualityError.isEmpty() ? QStringLiteral("音频全为静音或无法解码") : qualityError;
+                    sample.insert(QStringLiteral("analysisState"), QStringLiteral("failed")); sample.insert(QStringLiteral("analysisMessage"), message);
+                    updated[i] = sample; report(i, QStringLiteral("failed"), message); continue;
+                }
+                const auto review = quality->referenceReview();
+                sample.insert(QStringLiteral("quality"), review.toVariantMap());
+                QStringList warnings;
+                for (const auto &value : review.value(QStringLiteral("warnings")).toArray()) warnings.append(value.toString());
+                auto transcript = sample.value(QStringLiteral("transcript")).toString().trimmed();
+                if (transcript.isEmpty() && service) {
+                    const auto result = service->transcribe({path, cancel, {}, true});
+                    if (const auto *failure = std::get_if<AppError>(&result)) warnings.append(failure->userMessage());
+                    else {
+                        transcript.clear();
+                        for (const auto &word : std::get<Transcript>(result).words) transcript += word.text;
+                        transcript = transcript.trimmed();
+                        if (transcript.isEmpty()) warnings.append(QStringLiteral("未识别到有效语音，请手工填写参考原话。"));
+                        sample.insert(QStringLiteral("transcript"), transcript);
+                        sample.insert(QStringLiteral("transcriptOrigin"), QStringLiteral("local-asr"));
+                    }
+                } else if (transcript.isEmpty()) warnings.append(QStringLiteral("未配置本地 ASR，无法自动转写；请在下一步手工填写参考转写。"));
+                const auto hint = creationLanguageHint(transcript);
+                sample.insert(QStringLiteral("detectedLanguage"), hint);
+                if (!sample.value(QStringLiteral("languageConfirmed")).toBool() && !hint.isEmpty()) sample.insert(QStringLiteral("referenceLanguage"), hint);
+                const bool passed = warnings.isEmpty() && !transcript.isEmpty();
+                sample.insert(QStringLiteral("analysisState"), passed ? QStringLiteral("passed") : QStringLiteral("warning"));
+                sample.insert(QStringLiteral("analysisMessage"), warnings.join(QStringLiteral("；")));
+                updated[i] = sample;
+                report(i, passed ? QStringLiteral("passed") : QStringLiteral("warning"), warnings.join(QStringLiteral("；")));
+            }
+        } catch (...) { error = QStringLiteral("分析音频时发生异常，已完成的结果保留。"); }
+        // 选参考 prompt：优先有转写、质检通过、时长接近 10 秒的素材。
+        int best = -1; double bestScore = -1e9;
+        for (int i = 0; i < updated.size(); ++i) {
+            const auto sample = updated[i].toMap();
+            if (sample.contains(QStringLiteral("error")) || sample.value(QStringLiteral("analysisState")).toString() == QLatin1String("failed")) continue;
+            const double duration = sample.value(QStringLiteral("endSeconds")).toDouble() - sample.value(QStringLiteral("startSeconds")).toDouble();
+            double score = 0;
+            if (!sample.value(QStringLiteral("transcript")).toString().trimmed().isEmpty()) score += 100;
+            if (sample.value(QStringLiteral("analysisState")).toString() == QLatin1String("passed")) score += 30;
+            if (duration >= 6 && duration <= 12) score += 20; else if (duration >= 3 && duration <= 20) score += 10;
+            if (score > bestScore) { bestScore = score; best = i; }
+        }
+        if (!self) return;
+        QMetaObject::invokeMethod(self.data(), [self, epoch, updated, error, best, cancel] {
+            if (!self || self->epoch_ != epoch) return;
+            self->busy_ = false; self->samples_ = updated;
+            if (!error.isEmpty() || cancel->load()) {
+                self->statusIsWarning_ = true;
+                self->status_ = cancel->load() ? QStringLiteral("分析已取消，已完成的质检结果保留。") : error;
+                emit self->changed(); emit self->operationFinished(false); return;
+            }
+            self->creationAnalyzed_ = true; self->creationPromptIndex_ = best;
+            int passed = 0, warning = 0, failed = 0;
+            for (const auto &value : updated) {
+                const auto state = value.toMap().value(QStringLiteral("analysisState")).toString();
+                if (state == QLatin1String("failed")) ++failed; else if (state == QLatin1String("passed")) ++passed; else ++warning;
+            }
+            self->statusIsWarning_ = passed == 0 || failed > 0;
+            self->status_ = QStringLiteral("分析完成：%1 条通过，%2 条警告，%3 条失败。%4").arg(passed).arg(warning).arg(failed)
+                .arg(best >= 0 ? QStringLiteral("已自动选择参考 prompt，可继续。") : QStringLiteral("没有可用作参考 prompt 的素材，请检查警告原因。"));
+            emit self->changed(); emit self->operationFinished(true);
+        }, Qt::QueuedConnection);
+    });
+}
+void VoiceLibraryController::setCreationPrompt(int index)
+{
+    if (busy_ || index < 0 || index >= samples_.size()) return;
+    if (samples_[index].toMap().contains(QStringLiteral("error"))) return;
+    creationPromptIndex_ = index; statusIsWarning_ = false; emit changed();
+}
+void VoiceLibraryController::removeCreationSample(int index)
+{
+    if (busy_ || index < 0 || index >= samples_.size()) return;
+    const auto path = samples_[index].toMap().value(QStringLiteral("referencePath")).toString();
+    samples_.removeAt(index);
+    if (sampleDirectory_ && !path.isEmpty() && QDir(sampleDirectory_->path()).absoluteFilePath(QFileInfo(path).fileName()) == QFileInfo(path).absoluteFilePath()) QFile::remove(path);
+    if (creationPromptIndex_ == index) creationPromptIndex_ = -1; else if (creationPromptIndex_ > index) --creationPromptIndex_;
+    creationAnalyzed_ = false; statusIsWarning_ = false; emit changed();
+}
+void VoiceLibraryController::editCreationTranscript(int index, const QString &transcript)
+{
+    if (busy_ || index < 0 || index >= samples_.size() || transcript.size() > 65536) return;
+    auto sample = samples_[index].toMap();
+    if (sample.value(QStringLiteral("transcript")).toString() == transcript) return;
+    sample.insert(QStringLiteral("transcript"), transcript);
+    sample.insert(QStringLiteral("transcriptOrigin"), QStringLiteral("manual"));
+    sample.insert(QStringLiteral("confirmed"), false);
+    samples_[index] = sample;
+    // 不广播 changed：屏幕 C 的文本框逐字符编辑会打断输入法；创建条件由 QML 主动刷新。
+}
 void VoiceLibraryController::createFromSamples(const QString &name, bool transcriptRequired)
 {
     if (!creating_ || busy_) return;
-    QJsonArray entries;
-    for (const auto &value : samples_) {
-        const auto sample = value.toMap();
-        if (!sample.value(QStringLiteral("selected")).toBool()) continue;
-        if (!sample.value(QStringLiteral("confirmed")).toBool() || sample.contains(QStringLiteral("error"))
-            || (transcriptRequired && sample.value(QStringLiteral("transcript")).toString().trimmed().isEmpty())) {
-            status_ = QStringLiteral("请逐项试听并确认勾选的素材及转写；未确认的素材不能创建音色。"); emit changed(); return;
-        }
-        entries.append(QJsonObject{{QStringLiteral("referencePath"), sample.value(QStringLiteral("referencePath")).toString()},
+    creationTranscriptRequired_ = transcriptRequired;
+    if (name.trimmed().isEmpty()) { statusIsWarning_ = true; status_ = QStringLiteral("请填写音色名称。"); emit changed(); return; }
+    if (creationPromptIndex_ < 0 || creationPromptIndex_ >= samples_.size()) {
+        statusIsWarning_ = true; status_ = QStringLiteral("请先分析音频并选择参考 prompt。"); emit changed(); return;
+    }
+    const auto promptSample = samples_[creationPromptIndex_].toMap();
+    if (promptSample.contains(QStringLiteral("error")) || promptSample.value(QStringLiteral("analysisState")).toString() == QLatin1String("failed")) {
+        statusIsWarning_ = true; status_ = QStringLiteral("参考 prompt 质检未通过，请换一条通过的素材。"); emit changed(); return;
+    }
+    if (transcriptRequired && promptSample.value(QStringLiteral("transcript")).toString().trimmed().isEmpty()) {
+        statusIsWarning_ = true; status_ = QStringLiteral("请填写参考 prompt 的转写；其它素材的转写不影响创建。"); emit changed(); return;
+    }
+    QVector<QPair<int, QJsonObject>> drafts; QVariantList skipped;
+    for (int index = 0; index < samples_.size(); ++index) {
+        const auto sample = samples_[index].toMap();
+        const auto file = QFileInfo(sample.value(QStringLiteral("sourcePath")).toString()).fileName();
+        if (sample.contains(QStringLiteral("error"))) { skipped.append(QVariantMap{{QStringLiteral("index"), index + 1}, {QStringLiteral("name"), file}, {QStringLiteral("reason"), sample.value(QStringLiteral("error")).toString()}}); continue; }
+        const auto quality = sample.value(QStringLiteral("quality")).toMap();
+        if (quality.isEmpty() || quality.value(QStringLiteral("peak")).toDouble() <= 0) { skipped.append(QVariantMap{{QStringLiteral("index"), index + 1}, {QStringLiteral("name"), file}, {QStringLiteral("reason"), QStringLiteral("音频全为静音或未能解码")}}); continue; }
+        drafts.append({index, QJsonObject{{QStringLiteral("referencePath"), sample.value(QStringLiteral("referencePath")).toString()},
             {QStringLiteral("metadata"), QJsonObject{{QStringLiteral("referenceText"), sample.value(QStringLiteral("transcript")).toString().trimmed()},
                 {QStringLiteral("referenceLanguage"), sample.value(QStringLiteral("referenceLanguage"), QStringLiteral("Chinese")).toString()},
                 {QStringLiteral("qualityState"), QStringLiteral("approved")}, {QStringLiteral("qualityWarningsAccepted"), true},
-                {QStringLiteral("quality"), QJsonObject::fromVariantMap(sample.value(QStringLiteral("quality")).toMap())}}}});
+                {QStringLiteral("quality"), QJsonObject::fromVariantMap(sample.value(QStringLiteral("quality")).toMap())},
+                {QStringLiteral("analysisState"), sample.value(QStringLiteral("analysisState")).toString()},
+                {QStringLiteral("detectedLanguage"), sample.value(QStringLiteral("detectedLanguage")).toString()},
+                {QStringLiteral("promptSelected"), index == creationPromptIndex_}}}}});
     }
-    if (entries.isEmpty() || name.trimmed().isEmpty()) { status_ = QStringLiteral("请填写音色名称，并至少确认一项素材。"); emit changed(); return; }
+    if (drafts.isEmpty()) {
+        statusIsWarning_ = true;
+        status_ = skipped.isEmpty() ? QStringLiteral("请至少添加一条参考素材。") : QStringLiteral("没有可入库的素材：选中样本未通过音频质检，原因见列表。");
+        emit changed(); return;
+    }
+    // 第一个版本会成为档案默认参考，因此把选中的 prompt 排在前面。
+    QJsonArray entries;
+    for (const auto &draft : drafts) if (draft.first == creationPromptIndex_) entries.append(draft.second);
+    for (const auto &draft : drafts) if (draft.first != creationPromptIndex_) entries.append(draft.second);
+    QString successText = QStringLiteral("音色已创建，可选择参考版本用于配音。");
+    if (!skipped.isEmpty()) successText += QStringLiteral("%1 条素材质检未通过，未入库。").arg(skipped.size());
     committingCreation_ = true; const auto directory = sampleDirectory_; auto *cancel = &cancel_;
     submit([name, entries, directory, cancel](VoiceLibrary &library, QString &selected, QString &error) {
         const auto id = library.createWithVersions(name, entries, &error, cancel);
         if (!id) return false; selected = *id; return true;
-    }, QStringLiteral("音色已创建，可选择已确认的参考版本用于配音。"));
+    }, successText);
 }
 void VoiceLibraryController::createProfile(const QString &name)
 {
@@ -1041,13 +1290,13 @@ void VoiceLibraryController::prepareSamples(const QList<QUrl> &files, bool split
     if (busy_ || (!creating_ && selected_.isEmpty())) return;
     QStringList paths;
     for (const auto &file : files) {
-        if (!file.isLocalFile()) { status_ = QStringLiteral("仅支持用户选择的本地素材。"); emit changed(); return; }
+        if (!file.isLocalFile()) { statusIsWarning_ = true; status_ = QStringLiteral("仅支持用户选择的本地素材。"); emit changed(); return; }
         paths.append(file.toLocalFile());
     }
     const auto previous = creating_ ? samples_ : QVariantList{};
     auto directory = creating_ && sampleDirectory_ ? sampleDirectory_ : std::make_shared<QTemporaryDir>();
-    if (!directory->isValid()) { status_ = QStringLiteral("无法创建样本整理目录。"); emit changed(); return; }
-    sampleDirectory_ = directory; samplesProfile_ = selected_; if (!creating_) samples_.clear(); busy_ = true; cancel_ = false;
+    if (!directory->isValid()) { statusIsWarning_ = true; status_ = QStringLiteral("无法创建样本整理目录。"); emit changed(); return; }
+    sampleDirectory_ = directory; samplesProfile_ = selected_; if (!creating_) samples_.clear(); busy_ = true; cancel_ = false; statusIsWarning_ = false;
     status_ = QStringLiteral("正在切分同一说话人的素材；不会识别或分离说话人。"); emit changed();
     const QPointer<VoiceLibraryController> self(this); const auto epoch = ++epoch_; auto *cancel = &cancel_;
     audioTask_ = context_->submitAudioProcessing([self, epoch, paths, directory, cancel, split, previous] {
@@ -1082,8 +1331,11 @@ void VoiceLibraryController::prepareSamples(const QList<QUrl> &files, bool split
             // 目录只包含本次草稿派生文件，保留正在使用的参考；不触碰用户原件。
             for (const auto &file : QDir(directory->path()).entryInfoList(QDir::Files)) if (!retained.contains(file.absoluteFilePath())) QFile::remove(file.absoluteFilePath());
             if (self->samples_.isEmpty() && (cancel->load() || !error.isEmpty())) self->sampleDirectory_.reset();
+            // 素材集合变化后旧的 prompt 选择与分析结论不再成立。
+            if (self->creating_) { self->creationAnalyzed_ = false; self->creationPromptIndex_ = -1; }
+            self->statusIsWarning_ = overflow || cancel->load() || !error.isEmpty();
             self->status_ = overflow ? QStringLiteral("参考草稿超过 512MiB 或 2000 段，请减少素材后重试。") : cancel->load() ? QStringLiteral("样本整理已取消。") : error.isEmpty()
-                ? (self->creating_ ? QStringLiteral("素材已添加；逐项试听、核对转写并确认后创建音色。重复参考已跳过。") : QStringLiteral("整理完成；填写或识别转写，保存后逐个审核。重复内容已跳过，短片段和质量疑点需人工复核。")) : error;
+                ? (self->creating_ ? QStringLiteral("素材已添加；分析后挑选参考 prompt。重复参考已跳过。") : QStringLiteral("整理完成；填写或识别转写，保存后逐个审核。重复内容已跳过，短片段和质量疑点需人工复核。")) : error;
             emit self->changed(); emit self->operationFinished(error.isEmpty() && !cancel->load() && !overflow);
         }, Qt::QueuedConnection);
     });
@@ -1092,9 +1344,13 @@ void VoiceLibraryController::prepareSamples(const QList<QUrl> &files, bool split
 void VoiceLibraryController::editSample(int index, const QString &transcript, bool selected)
 {
     if (busy_ || index < 0 || index >= samples_.size() || transcript.size() > 65536) return;
-    auto sample = samples_[index].toMap(); if (sample.value(QStringLiteral("transcript")).toString() != transcript) sample.insert(QStringLiteral("confirmed"), false);
+    auto sample = samples_[index].toMap();
+    const bool selectionChanged = sample.value(QStringLiteral("selected")).toBool() != selected;
+    if (sample.value(QStringLiteral("transcript")).toString() != transcript) sample.insert(QStringLiteral("confirmed"), false);
     sample.insert(QStringLiteral("transcript"), transcript); sample.insert(QStringLiteral("selected"), selected);
-    samples_[index] = sample; // 不重置列表和输入法草稿；提交或开始识别前由界面显式提交。
+    samples_[index] = sample;
+    // 逐字符编辑不广播 changed：重建列表委托会打断输入法和光标；勾选显示与创建条件由委托自行求值。
+    if (selectionChanged) emit changed();
 }
 
 void VoiceLibraryController::transcribeSamples()
@@ -1104,9 +1360,9 @@ void VoiceLibraryController::transcribeSamples()
     const auto settings = context_->settings;
     const auto provider = AsrProviderFactory::providerIdFromSettings(settings);
     if (provider != QLatin1String("qwen3") && provider != QLatin1String("funasr")) {
-        status_ = QStringLiteral("请在现有 ASR 设置中选择可用的本地 Qwen／FunASR；样本不会发送云端，可手工填写转写。"); emit changed(); return;
+        statusIsWarning_ = true; status_ = QStringLiteral("请在现有 ASR 设置中选择可用的本地 Qwen／FunASR；样本不会发送云端，可手工填写转写。"); emit changed(); return;
     }
-    busy_ = true; cancel_ = false; status_ = QStringLiteral("等待 GPU 批次，正在进行本地中文转写…"); emit changed();
+    busy_ = true; cancel_ = false; statusIsWarning_ = false; status_ = QStringLiteral("等待 GPU 批次，正在进行本地中文转写…"); emit changed();
     const QPointer<VoiceLibraryController> self(this); const auto epoch = ++epoch_; auto *cancel = &cancel_;
     const auto samples = samples_; const auto directory = sampleDirectory_;
     audioTask_ = context_->submitAudioProcessing([self, epoch, cancel, settings, samples, directory] {
@@ -1162,6 +1418,7 @@ void VoiceLibraryController::transcribeSamples()
         if (self) QMetaObject::invokeMethod(self.data(), [self, epoch, updated, error, cancel] {
             if (!self || self->epoch_ != epoch) return;
             self->busy_ = false; self->samples_ = updated;
+            self->statusIsWarning_ = cancel->load() || !error.isEmpty();
             self->status_ = cancel->load() ? QStringLiteral("转写已取消，已完成转写保留。") : error.isEmpty()
                 ? QStringLiteral("转写完成；重复文本仅提示，请试听判断，不自动删除不同表演。") : error;
             emit self->changed(); emit self->operationFinished(error.isEmpty() && !cancel->load());

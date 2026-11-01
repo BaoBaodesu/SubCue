@@ -13,6 +13,7 @@ Dialog {
 
     property var controller
     property bool transcriptRequired: true
+    onTranscriptRequiredChanged: if (controller) controller.setCreationTranscriptRequired(transcriptRequired)
     property var preview
     signal useVoice(string versionId, string displayName)
     onClosed: { if (preview) preview.clear(); if (controller) { controller.cancelCreation(); controller.cancelPreview(); if (controller.busy) controller.cancel(); } activePage = null }
@@ -493,7 +494,7 @@ Dialog {
             ColumnLayout {
                 width: addVoiceScroll.availableWidth; spacing: 16
                 Label { text: qsTr("选择创建方式"); color: Theme.text; font.bold: true }
-                PrimaryButton { objectName: "addReferenceVoice"; enabled: controller && !controller.busy; text: qsTr("参考音频创建"); onClicked: { controller.beginCreation(); creationName.text = ""; creationStep = 0; referenceCreationPage.open() } }
+                PrimaryButton { objectName: "addReferenceVoice"; enabled: controller && !controller.busy; text: qsTr("参考音频创建"); onClicked: { controller.beginCreation(); controller.setCreationTranscriptRequired(dialog.transcriptRequired); creationCollectPage.open() } }
                 Label { text: qsTr("使用已有录音创建可复用的参考音色，不训练新模型。"); color: Theme.secondaryText; wrapMode: Text.Wrap; Layout.fillWidth: true }
                 SubButton { objectName: "addTrainedVoice"; text: qsTr("训练专属模型"); onClicked: { unavailablePage.training = true; unavailablePage.open() } }
                 Label { text: qsTr("使用数据集微调专属模型 · 训练后端尚未接入"); color: Theme.secondaryText }
@@ -519,78 +520,268 @@ Dialog {
             Item { Layout.fillHeight: true }
         }
     }
-    property bool creationAsrAttempted: false
-    property int creationStep: 0
     FileDialog {
         id: creationFiles
         fileMode: FileDialog.OpenFiles
         nameFilters: referenceDialog.nameFilters
-        onAccepted: { creationStep = 1; creationAsrAttempted = false; controller.prepareSamples(selectedFiles, creationSplit.checked) }
+        onAccepted: if (controller) controller.prepareSamples(selectedFiles, true)
+    }
+    Connections {
+        target: controller
+        function onOperationFinished(success) {
+            // 创建成功后关闭创建流程；分析完成时 creating 仍为 true，不会误关。
+            if (!success || !controller || controller.creating || controller.samples.length > 0) return;
+            if (dialog.activePage === creationCollectPage || dialog.activePage === creationAnalyzePage
+                || dialog.activePage === creationProfilePage) dialog.activePage = null;
+        }
     }
     VoiceLibraryPage {
         host: dialog; controller: dialog.controller; player: dialog.preview
-        id: referenceCreationPage
-        objectName: "referenceCreationPage"
-        title: qsTr("参考音频创建 · %1 / 3").arg(creationStep + 1)
+        id: creationCollectPage
+        objectName: "creationCollectPage"
+        title: qsTr("创建音色 · 收集素材")
         onClosed: { if (preview) preview.stop(); if (controller) controller.cancelCreation() }
         contentItem: ColumnLayout {
             spacing: 10
-            TextField { id: creationName; objectName: "creationVoiceName"; Layout.fillWidth: true; placeholderText: qsTr("音色名称"); maximumLength: 256; selectByMouse: true; enabled: controller && !controller.busy }
-            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: creationStep === 0 ? qsTr("添加同一说话人的录音。单段参考最长 30 秒；较长录音请选择多段整理。") : creationStep === 1 ? qsTr("逐项试听并校对转写。确认仅对当前素材与文字生效；自动识别不会替你确认。") : qsTr("核对名称和参考后创建音色。首个已确认样本作为默认参考，历史版本会完整保留。") }
-            SubCheckBox { id: creationSplit; visible: creationStep === 0; text: qsTr("多段整理（长录音按静音和时长切分）") }
+            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: qsTr("收集同一说话人的短音频。一次可以加入很多条；总时长达到 10 秒即可分析，30 秒够用，90 秒更好。") }
+            RowLayout {
+                Layout.fillWidth: true; spacing: 8
+                PrimaryButton { objectName: "creationUploadButton"; text: qsTr("上传音频"); enabled: controller && !controller.busy; onClicked: creationFiles.open() }
+                SubButton { objectName: "creationRecordButton"; text: qsTr("录制音频"); enabled: false; ToolTip.text: qsTr("录制暂未接入，先用上传音频"); ToolTip.visible: recordButtonHover.hovered; HoverHandler { id: recordButtonHover } }
+                Item { Layout.fillWidth: true }
+                Label {
+                    text: qsTr("已上传 %1 秒").arg(controller ? controller.creationDraft.totalSeconds.toFixed(1) : "0.0")
+                    color: controller && controller.creationDraft.usableSeconds >= 30 ? Theme.success : Theme.secondaryText
+                }
+            }
             ListView {
-                id: creationSamples
+                id: collectSamples
                 objectName: "creationSamples"
-                Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 12
+                Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 8
                 model: controller ? controller.samples : []
                 ScrollBar.vertical: SubScrollBar {}
                 delegate: ColumnLayout {
                     required property var modelData
                     required property int index
-                    width: creationSamples.width - Theme.scrollBarSize - 8
+                    readonly property real sampleDuration: (modelData.endSeconds || 0) - (modelData.startSeconds || 0)
+                    width: collectSamples.width - Theme.scrollBarSize - 8; spacing: 2
                     RowLayout {
                         Layout.fillWidth: true
-                        SubCheckBox { checked: !!modelData.selected; enabled: controller && !controller.busy; onToggled: controller.editSample(index, creationText.text, checked) }
-                        Label { text: modelData.sourcePath.split(/[\\/]/).pop() + (modelData.endSeconds !== undefined ? " · " + (modelData.endSeconds - modelData.startSeconds).toFixed(2) + qsTr(" 秒") : ""); elide: Text.ElideMiddle; Layout.fillWidth: true; color: Theme.text; ToolTip.text: modelData.sourcePath; ToolTip.visible: sampleHover.hovered; HoverHandler { id: sampleHover } }
-                        SubButton { text: qsTr("试听"); enabled: !!modelData.referencePath && !controller.busy; onClicked: preview.play(modelData.referencePath, modelData.referenceSha256) }
+                        Label { text: modelData.sourcePath.split(/[\\/]/).pop(); elide: Text.ElideMiddle; Layout.fillWidth: true; color: Theme.text }
+                        Label { text: sampleDuration.toFixed(2) + qsTr(" 秒"); color: Theme.secondaryText }
+                        SubButton { text: qsTr("删除"); enabled: controller && !controller.busy; onClicked: controller.removeCreationSample(index) }
                     }
-                    Label { text: modelData.error || (modelData.quality ? modelData.quality.warnings.join("；") : ""); Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.warning }
-                    TextArea { id: creationText; objectName: "creationTranscript"; text: modelData.transcript || ""; Layout.fillWidth: true; Layout.preferredHeight: 72; wrapMode: TextEdit.Wrap; selectByMouse: true; placeholderText: qsTr("参考录音中的原话（识别草稿需人工确认）"); enabled: controller && !controller.busy && creationStep === 1; onTextChanged: if (text !== (modelData.transcript || "")) controller.editSample(index, text, !!modelData.selected) }
-                    Flow {
-                        Layout.fillWidth: true; spacing: 6; visible: creationStep === 1
-                        TextField { id: creationCropStart; width: 85; text: "0"; placeholderText: qsTr("开始秒"); validator: DoubleValidator { bottom: 0; locale: "C" } }
-                        TextField { id: creationCropEnd; width: 85; text: (modelData.endSeconds - modelData.startSeconds).toFixed(3); placeholderText: qsTr("结束秒"); validator: DoubleValidator { bottom: 0; locale: "C" } }
-                        SubButton { text: qsTr("裁切参考"); enabled: controller && !controller.busy && creationCropStart.acceptableInput && creationCropEnd.acceptableInput; onClicked: { if (preview) preview.stop(); controller.cropCreationSample(index, Number(creationCropStart.text), Number(creationCropEnd.text)) } }
-                    }
-                    SubComboBox { id: creationLanguage; objectName: "creationReferenceLanguage"; model: [qsTr("中文"), qsTr("英语"), qsTr("日语")]; enabled: controller && !controller.busy && creationStep === 1; onActivated: controller.confirmCreationSample(index, false, ["Chinese", "English", "Japanese"][currentIndex]) }
-                    SubCheckBox { objectName: "confirmCreationSample"; text: qsTr("已试听、核对转写并接受质量提示"); checked: !!modelData.confirmed && creationText.text === (modelData.transcript || ""); enabled: controller && !controller.busy && !modelData.error && creationStep === 1; onToggled: controller.confirmCreationSample(index, checked, ["Chinese", "English", "Japanese"][creationLanguage.currentIndex]) }
+                    Label { visible: !!modelData.error; text: modelData.error || ""; color: Theme.warning; wrapMode: Text.Wrap; Layout.fillWidth: true }
                 }
             }
-            Label { text: controller ? controller.statusText : ""; color: Theme.secondaryText; wrapMode: Text.Wrap; Layout.fillWidth: true }
-        }
-        DropArea {
-            parent: referenceCreationPage
-            anchors.fill: parent
-            onDropped: function(drop) {
-                if (!drop.hasUrls || !controller || controller.busy) return;
-                creationStep = 1; creationAsrAttempted = false;
-                controller.prepareSamples(drop.urls, creationSplit.checked); drop.acceptProposedAction();
+            Rectangle {
+                Layout.fillWidth: true; height: 8; radius: 4; color: Theme.input
+                Rectangle {
+                    width: parent.width * Math.min(1, (controller ? controller.creationDraft.totalSeconds : 0) / 90)
+                    height: parent.height; radius: 4; color: Theme.accent
+                }
             }
+            Label { text: controller ? controller.statusText : ""; color: controller && controller.statusIsWarning ? Theme.warning : Theme.secondaryText; wrapMode: Text.Wrap; Layout.fillWidth: true }
         }
         footer: ColumnLayout {
             VoicePreviewTransport { sourceTitle: qsTr("声音库 · 当前样本"); player: preview; preparing: controller && controller.previewLoading; onStopRequested: if (controller) controller.cancelPreview() }
             Flow {
                 Layout.fillWidth: true; spacing: 8
-                SubButton { text: qsTr("取消"); onClicked: referenceCreationPage.close() }
-                SubButton { text: qsTr("上一步"); visible: creationStep > 0; enabled: controller && !controller.busy; onClicked: creationStep-- }
-                SubButton { text: qsTr("添加素材"); visible: creationStep < 2; enabled: controller && !controller.busy; onClicked: creationFiles.open() }
-                SubButton { text: qsTr("识别空白转写"); visible: creationStep === 1; enabled: controller && !controller.busy && creationSamples.count > 0; onClicked: controller.transcribeSamples() }
-                PrimaryButton { objectName: "createReferenceVoice"; text: creationStep === 2 ? qsTr("创建音色") : qsTr("下一步"); enabled: controller && !controller.busy && creationName.text.trim().length > 0 && creationSamples.count > 0; onClicked: { if (creationStep < 2) creationStep++; else controller.createFromSamples(creationName.text, dialog.transcriptRequired) } }
+                SubButton { text: qsTr("取消"); onClicked: { if (controller) controller.cancelCreation(); dialog.activePage = null } }
+                PrimaryButton {
+                    objectName: "creationAnalyzeButton"
+                    text: qsTr("分析音频")
+                    enabled: controller && !controller.busy && controller.creationDraft.canAnalyze === true
+                    onClicked: { controller.analyzeCreationSamples(); creationAnalyzePage.open() }
+                }
+            }
+            Label {
+                objectName: "creationAnalyzeBlockReason"
+                visible: !!controller && controller.creationDraft.canAnalyze !== true
+                text: controller ? (controller.creationDraft.analyzeBlockReason || "") : ""
+                color: Theme.warning; wrapMode: Text.Wrap; Layout.fillWidth: true
             }
         }
-        Connections { target: controller; function onOperationFinished(success) { if (dialog.activePage !== referenceCreationPage) return;
-            if (success && !controller.creating) dialog.activePage = null;
-            else if (success && creationStep === 1 && !creationAsrAttempted && controller.creationCapabilities.localAsrReady) { creationAsrAttempted = true; controller.transcribeSamples() } } }
+    }
+    VoiceLibraryPage {
+        host: dialog; controller: dialog.controller; player: dialog.preview
+        id: creationAnalyzePage
+        objectName: "creationAnalyzePage"
+        title: qsTr("创建音色 · 分析音频")
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; color: controller && controller.statusIsWarning ? Theme.warning : Theme.secondaryText; text: controller ? controller.statusText : "" }
+            ListView {
+                id: analyzedSamples
+                objectName: "creationAnalyzedSamples"
+                Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 8
+                model: controller ? controller.samples : []
+                ScrollBar.vertical: SubScrollBar {}
+                delegate: ColumnLayout {
+                    required property var modelData
+                    readonly property string analyzeState: modelData.analysisState || "queued"
+                    width: analyzedSamples.width - Theme.scrollBarSize - 8; spacing: 2
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: modelData.sourcePath.split(/[\\/]/).pop(); elide: Text.ElideMiddle; Layout.fillWidth: true; color: Theme.text }
+                        Label {
+                            text: analyzeState === "queued" ? qsTr("排队") : analyzeState === "analyzing" ? qsTr("分析中…") : analyzeState === "passed" ? qsTr("通过") : analyzeState === "warning" ? qsTr("警告") : qsTr("失败")
+                            color: analyzeState === "passed" ? Theme.success : analyzeState === "failed" ? Theme.error : analyzeState === "warning" ? Theme.warning : Theme.secondaryText
+                        }
+                        Label {
+                            visible: !!modelData.detectedLanguage
+                            text: modelData.detectedLanguage === "Chinese" ? qsTr("中文") : modelData.detectedLanguage === "English" ? qsTr("英语") : modelData.detectedLanguage === "Japanese" ? qsTr("日语") : ""
+                            color: Theme.secondaryText
+                        }
+                    }
+                    Label { visible: !!modelData.analysisMessage; text: modelData.analysisMessage || ""; color: Theme.warning; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                }
+            }
+        }
+        footer: Flow {
+            Layout.fillWidth: true; spacing: 8
+            SubButton { text: qsTr("上一步"); onClicked: creationCollectPage.open() }
+            PrimaryButton {
+                objectName: "creationContinueButton"
+                text: qsTr("继续")
+                enabled: controller && !controller.busy && controller.creationDraft.analyzed === true
+                onClicked: creationProfilePage.open()
+            }
+        }
+    }
+    VoiceLibraryPage {
+        host: dialog; controller: dialog.controller; player: dialog.preview
+        id: creationProfilePage
+        objectName: "creationProfilePage"
+        // QML 对 var 属性 + Q_PROPERTY 的依赖追踪在逐字符编辑下不可靠，改为显式刷新创建条件。
+        property var draftState: controller ? controller.creationDraft : ({})
+        function refreshDraftState() { draftState = controller ? controller.creationDraft : ({}) }
+        Connections {
+            target: controller
+            function onChanged() { creationProfilePage.refreshDraftState() }
+        }
+        title: qsTr("创建音色 · 音色资料")
+        onOpened: {
+            refreshDraftState()
+            if (controller && creationTranscript) {
+                const index = controller.creationDraft.promptIndex
+                const rows = controller.samples
+                creationTranscript.text = index >= 0 && index < rows.length ? (rows[index].transcript || "") : ""
+            }
+        }
+        contentItem: ColumnLayout {
+            spacing: 10
+            TextField { id: profileName; objectName: "creationVoiceName"; Layout.fillWidth: true; placeholderText: qsTr("音色名称（必填）"); maximumLength: 256; selectByMouse: true; enabled: controller && !controller.busy }
+            RowLayout {
+                Layout.fillWidth: true; spacing: 8
+                Label { text: qsTr("参考语言"); color: Theme.text }
+                SubComboBox {
+                    id: profileLanguage
+                    objectName: "creationReferenceLanguage"
+                    Layout.fillWidth: true
+                    model: [qsTr("中文"), qsTr("英语"), qsTr("日语")]
+                    currentIndex: creationProfilePage.draftState.promptLanguage === "Japanese" ? 2 : creationProfilePage.draftState.promptLanguage === "English" ? 1 : 0
+                    enabled: controller && !controller.busy
+                    onActivated: function(activatedIndex) {
+                        if (!controller) return
+                        const index = creationProfilePage.draftState.promptIndex
+                        if (index >= 0) controller.confirmCreationSample(index, true, activatedIndex >= 0 ? ["Chinese", "English", "Japanese"][activatedIndex] : "")
+                        creationProfilePage.refreshDraftState()
+                    }
+                }
+            }
+            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: qsTr("参考语言是素材本身的语言；配音目标语言在配音工作区选择。") }
+            Label {
+                Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.text
+                text: {
+                    const draft = creationProfilePage.draftState
+                    const rows = controller ? controller.samples : []
+                    if (draft.promptIndex === undefined || draft.promptIndex < 0 || draft.promptIndex >= rows.length) return qsTr("当前 prompt：未选择")
+                    const row = rows[draft.promptIndex]
+                    const duration = (row.endSeconds || 0) - (row.startSeconds || 0)
+                    return qsTr("当前 prompt：第 %1 条 · %2 · %3 秒").arg(draft.promptIndex + 1).arg(row.sourcePath.split(/[\\/]/).pop()).arg(duration.toFixed(2))
+                }
+            }
+            ListView {
+                id: promptChoices
+                objectName: "creationPromptChoices"
+                Layout.fillWidth: true; Layout.preferredHeight: 120; clip: true; spacing: 4
+                model: controller ? controller.samples : []
+                ScrollBar.vertical: SubScrollBar {}
+                delegate: RowLayout {
+                    required property var modelData
+                    required property int index
+                    readonly property bool usable: !modelData.error && modelData.analysisState !== "failed"
+                    visible: usable
+                    height: usable ? implicitHeight : 0
+                    width: promptChoices.width - Theme.scrollBarSize - 8
+                    Label { text: qsTr("第 %1 条 · %2").arg(index + 1).arg(modelData.sourcePath.split(/[\\/]/).pop()); elide: Text.ElideMiddle; Layout.fillWidth: true; color: Theme.text }
+                    SubButton { text: qsTr("试听"); enabled: !!modelData.referencePath && !controller.busy; onClicked: preview.play(modelData.referencePath, modelData.referenceSha256) }
+                    SubButton {
+                        objectName: "creationPromptButton"
+                        text: controller && controller.creationDraft.promptIndex === index ? qsTr("当前 prompt") : qsTr("设为 prompt")
+                        enabled: controller && !controller.busy
+                        onClicked: {
+                            if (!controller) return
+                            controller.setCreationPrompt(index)
+                            creationProfilePage.refreshDraftState()
+                            if (creationTranscript) creationTranscript.text = modelData.transcript || ""
+                        }
+                    }
+                }
+            }
+            TextArea {
+                id: creationTranscript
+                objectName: "creationTranscript"
+                Layout.fillWidth: true; Layout.preferredHeight: 80
+                wrapMode: TextEdit.Wrap; selectByMouse: true
+                placeholderText: qsTr("参考音频里的原话（识别草稿需人工确认）")
+                enabled: controller && !controller.busy
+                onTextChanged: {
+                    if (!controller) return
+                    const index = controller.creationDraft.promptIndex
+                    if (index >= 0) controller.editCreationTranscript(index, text)
+                    creationProfilePage.refreshDraftState()
+                }
+            }
+            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.secondaryText; text: qsTr("只编辑当前 prompt 这条的转写；这是参考音频里的原话，日语参考就保持日语。") }
+            ColumnLayout {
+                objectName: "creationIssues"
+                visible: !!controller && (creationProfilePage.draftState.issues || []).length > 0
+                Layout.fillWidth: true; spacing: 2
+                Repeater {
+                    model: controller ? (creationProfilePage.draftState.issues || []) : []
+                    delegate: Label {
+                        required property var modelData
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.warning
+                        text: qsTr("第 %1 条 · %2：%3").arg(modelData.index).arg(modelData.name).arg(modelData.reason)
+                    }
+                }
+            }
+            Label { text: controller ? controller.statusText : ""; color: controller && controller.statusIsWarning ? Theme.warning : Theme.secondaryText; wrapMode: Text.Wrap; Layout.fillWidth: true }
+            Item { Layout.fillHeight: true }
+        }
+        footer: ColumnLayout {
+            VoicePreviewTransport { sourceTitle: qsTr("声音库 · 当前 prompt"); player: preview; preparing: controller && controller.previewLoading; onStopRequested: if (controller) controller.cancelPreview() }
+            Flow {
+                Layout.fillWidth: true; spacing: 8
+                SubButton { text: qsTr("取消"); onClicked: { if (controller) controller.cancelCreation(); dialog.activePage = null } }
+                SubButton { text: qsTr("上一步"); onClicked: creationAnalyzePage.open() }
+                PrimaryButton {
+                    id: createVoiceButton
+                    objectName: "createReferenceVoice"
+                    text: qsTr("创建音色")
+                    enabled: controller && !controller.busy && profileName.text.trim().length > 0 && creationProfilePage.draftState.ready === true
+                    onClicked: controller.createFromSamples(profileName.text, dialog.transcriptRequired)
+                }
+            }
+            Label {
+                objectName: "creationBlockReason"
+                visible: !createVoiceButton.enabled && !!controller
+                Layout.fillWidth: true; wrapMode: Text.Wrap; color: Theme.warning
+                text: profileName.text.trim().length === 0 ? qsTr("请填写音色名称") : (creationProfilePage.draftState.blockReason || "")
+            }
+        }
     }
     Dialog {
         id: archiveDialog

@@ -19,6 +19,8 @@ class VoiceLibraryController final : public QObject {
     Q_PROPERTY(bool previewLoading READ previewLoading NOTIFY changed)
     Q_PROPERTY(bool creating READ creating NOTIFY changed)
     Q_PROPERTY(QVariantMap creationCapabilities READ creationCapabilities NOTIFY changed)
+    Q_PROPERTY(QVariantMap creationDraft READ creationDraft NOTIFY changed)
+    Q_PROPERTY(bool statusIsWarning READ statusIsWarning NOTIFY changed)
     Q_PROPERTY(qint64 previewCacheBytes READ previewCacheBytes NOTIFY changed)
     Q_PROPERTY(QVariantMap voiceCatalog READ voiceCatalog NOTIFY changed)
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
@@ -39,10 +41,18 @@ public:
     bool previewLoading() const { return previewLoading_; }
     bool creating() const { return creating_; }
     QVariantMap creationCapabilities() const;
+    QVariantMap creationDraft() const;
+    bool statusIsWarning() const { return statusIsWarning_; }
     Q_INVOKABLE void beginCreation();
     Q_INVOKABLE void cancelCreation();
+    Q_INVOKABLE void setCreationTranscriptRequired(bool required);
+    Q_INVOKABLE void setCreationSampleSelected(int index, bool selected);
     Q_INVOKABLE void confirmCreationSample(int index, bool confirmed, const QString &language);
     Q_INVOKABLE void cropCreationSample(int index, double startSeconds, double endSeconds);
+    Q_INVOKABLE void analyzeCreationSamples();
+    Q_INVOKABLE void setCreationPrompt(int index);
+    Q_INVOKABLE void removeCreationSample(int index);
+    Q_INVOKABLE void editCreationTranscript(int index, const QString &transcript);
     Q_INVOKABLE void createFromSamples(const QString &name, bool transcriptRequired = true);
     qint64 previewCacheBytes() const;
     QVariantMap voiceCatalog() const { return catalog_.toVariantMap(); }
@@ -134,6 +144,10 @@ private:
     bool previewLoading_ = false;
     bool creating_ = false;
     bool committingCreation_ = false;
+    bool creationTranscriptRequired_ = true;
+    bool creationAnalyzed_ = false;
+    int creationPromptIndex_ = -1;
+    bool statusIsWarning_ = false;
     bool cloudVoiceMutation_ = false;
     bool includeArchived_ = false;
     int profileOffset_ = 0;

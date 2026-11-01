@@ -38,6 +38,8 @@ struct TtsCapabilities {
     bool referenceRequired = false;
     bool transcriptRequired = false;
     bool voiceIdRequired = false;
+    // 参考音频语言与合成目标语言是两件事；留空表示沿用 languages。
+    QStringList referenceLanguages;
 };
 
 // 只保存不可变生成输入；路径由资产层解析，凭据由 Provider 在调用时取得。
@@ -111,7 +113,9 @@ struct TtsRequest {
             return reject(QStringLiteral("克隆需要已保存的参考资产及内容指纹。"));
         if (capabilities.transcriptRequired && referenceText.trimmed().isEmpty())
             return reject(QStringLiteral("当前克隆型号需要参考转写。"));
-        if (capabilities.referenceRequired && !capabilities.languages.contains(referenceLanguage))
+        // 参考语言可以是日语而目标语言是中文；只有未单独声明参考语言的引擎才回退到目标语言列表。
+        const auto referenceLanguages = capabilities.referenceLanguages.isEmpty() ? capabilities.languages : capabilities.referenceLanguages;
+        if (capabilities.referenceRequired && !referenceLanguages.contains(referenceLanguage))
             return reject(QStringLiteral("当前引擎尚未接入此参考语言，请选择已验收的引擎或参考版本。"));
         if (capabilities.voiceIdRequired && providerVoiceId.trimmed().isEmpty())
             return reject(QStringLiteral("云端合成需要系统音色或已有 Voice ID。"));

@@ -31,6 +31,7 @@ private slots:
     void cacheKeyIncludesCanonicalPathSizeMtimeStreamAndChunkHashes();
     void cacheKeyChangesWhenContentOrStreamChanges();
     void analysisCacheHashesCompleteMediaAndStoresResult();
+    void analysisCacheEvictsOldestBeyondLimit();
     void lruEvictsLeastRecentlyUsedAcrossKinds();
     void pyramidLevelsAreSixteenTimesFour();
     void pyramidPeaksMatchSourceMinMax();
@@ -148,6 +149,27 @@ void CacheWaveformTests::analysisCacheHashesCompleteMediaAndStoresResult()
     QVERIFY(cache.load(std::get<QString>(firstKey)).has_value());
     QCOMPARE(cache.load(std::get<QString>(firstKey))->value(QStringLiteral("text")).toString(),
         QStringLiteral("测试"));
+}
+
+void CacheWaveformTests::analysisCacheEvictsOldestBeyondLimit()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto cacheDir = dir.filePath(QStringLiteral("cache"));
+    // 每个结果约 8KB，上限 20KB：写第三个时应淘汰最旧的结果，且不删刚写入的那个。
+    AnalysisCache cache(cacheDir, 20 * 1024);
+    const QString payload(8000, QLatin1Char('x'));
+    for (int i = 0; i < 3; ++i) {
+        QVERIFY(cache.store(QStringLiteral("key%1").arg(i), QJsonObject{{QStringLiteral("text"), payload + QString::number(i)}}));
+        QTest::qWait(5);
+    }
+    QVERIFY(!QFileInfo::exists(QDir(cacheDir).filePath(QStringLiteral("key0.json"))));
+    QVERIFY(QFileInfo::exists(QDir(cacheDir).filePath(QStringLiteral("key1.json"))));
+    QVERIFY(QFileInfo::exists(QDir(cacheDir).filePath(QStringLiteral("key2.json"))));
+    QVERIFY(cache.load(QStringLiteral("key2")).has_value());
+    qint64 total = 0;
+    for (const auto &info : QDir(cacheDir).entryInfoList({QStringLiteral("*.json")}, QDir::Files)) total += info.size();
+    QVERIFY(total <= 20 * 1024);
 }
 
 void CacheWaveformTests::lruEvictsLeastRecentlyUsedAcrossKinds()

@@ -9,6 +9,18 @@ import sys
 import zipfile
 
 
+# 引擎源码接受的目标／参考语言代码；与 tts_external_engines 的 text_lang／prompt_lang 映射一致。
+LANGUAGE_CODES = {'Chinese': 'zh', 'English': 'en', 'Japanese': 'ja'}
+
+
+def _package_present(name):
+    try:
+        importlib.metadata.version(name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
 def inspect_gpt_language_resources(nltk_roots=None, japanese_directory=None):
     # 只读文件预检，不导入会自动下载／生成词典的文本模块，也不扩大语言能力。
     if nltk_roots is None:
@@ -45,16 +57,24 @@ def inspect_gpt_language_resources(nltk_roots=None, japanese_directory=None):
                 importlib.metadata.distribution('pyopenjtalk').locate_file('pyopenjtalk/open_jtalk_dic_utf_8-1.11'))
         except importlib.metadata.PackageNotFoundError:
             japanese_directory = str(Path(sys.prefix) / 'Lib/site-packages/pyopenjtalk/open_jtalk_dic_utf_8-1.11')
-    japanese_missing = [name for name in ('sys.dic', 'unk.dic', 'char.bin', 'matrix.bin', 'left-id.def',
-        'right-id.def', 'rewrite.def', 'pos-id.def')
-        if not (Path(japanese_directory) / name).is_file() or not (Path(japanese_directory) / name).stat().st_size]
-    return {'English': {'filesPresent': not missing, 'missing': missing, 'paths': found},
-            'Japanese': {'filesPresent': not japanese_missing, 'missing': japanese_missing, 'directory': str(japanese_directory)},
+    japanese_files, japanese_missing = {}, []
+    for name in ('sys.dic', 'unk.dic', 'char.bin', 'matrix.bin', 'left-id.def',
+        'right-id.def', 'rewrite.def', 'pos-id.def'):
+        path = Path(japanese_directory) / name
+        if path.is_file() and path.stat().st_size:
+            japanese_files[name] = str(path)
+        else:
+            japanese_missing.append(name)
+    return {'English': {'filesPresent': not missing, 'missing': missing, 'paths': found,
+                        'packagePresent': _package_present('nltk')},
+            'Japanese': {'filesPresent': not japanese_missing, 'missing': japanese_missing,
+                         'directory': str(japanese_directory), 'files': japanese_files,
+                         'packagePresent': _package_present('pyopenjtalk')},
             'runtimeVerified': False, 'qualityVerified': False,
-            'notes': '可选英日资源文件检查；不影响现有中文就绪状态，不代表文本加载／生成／音质通过。'}
+            'notes': '可选英日资源文件检查；是否必需由请求的目标／参考语言决定，不代表文本加载／生成／音质通过。'}
 
 
-def inspect(engine, repository, auxiliary=None):
+def inspect(engine, repository, auxiliary=None, languages=None):
     root = Path(repository)
     if not root.is_absolute() or not root.is_dir():
         raise ValueError('引擎仓库必须是存在的本地绝对目录。')
@@ -138,28 +158,59 @@ def inspect(engine, repository, auxiliary=None):
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
+    language_resources, language_capabilities, requested_languages = {}, {}, []
     generation_missing = []
     if engine == 'gpt':
-        # v2ProPlus 的中文 cleaner 动态加载 chinese2，模型加载本身不会触发这些文件。
-        generation_files = [aux / 'fast_langdetect/lid.176.bin', root / 'GPT_SoVITS/text/G2PWModel/POLYPHONIC_CHARS.txt',
-                            root / 'GPT_SoVITS/text/G2PWModel/MONOPHONIC_CHARS.txt']
-        g2pw = root / 'GPT_SoVITS/text/G2PWModel/g2pW.onnx'
-        if not g2pw.is_file():
-            g2pw = g2pw.with_name('g2pw.onnx')
-        generation_files.append(g2pw)
-        generation_missing = [str(file) for file in generation_files if not file.is_file() or not file.stat().st_size]
-        for file in generation_files:
+        # v2ProPlus 的中文 cleaner 动态加载 chinese2，模型加载本身不会触发 G2PW；这些文件只在需要中文时才是必需项。
+        language_resources = inspect_gpt_language_resources()
+        g2pw_directory = root / 'GPT_SoVITS/text/G2PWModel'
+        g2pw_files = [g2pw_directory / 'POLYPHONIC_CHARS.txt', g2pw_directory / 'MONOPHONIC_CHARS.txt']
+        g2pw_onnx = g2pw_directory / 'g2pw.onnx'
+        if not g2pw_onnx.is_file():
+            g2pw_onnx = g2pw_onnx.with_name('g2pw.onnx')
+        g2pw_files.append(g2pw_onnx)
+        chinese_missing = [str(file) for file in g2pw_files if not file.is_file() or not file.stat().st_size]
+        language_resources['Chinese'] = {'filesPresent': not chinese_missing, 'missing': chinese_missing,
+            'paths': {file.name: str(file) for file in g2pw_files if file.is_file() and file.stat().st_size}}
+        english, japanese = language_resources['English'], language_resources['Japanese']
+        # BERT／HuBERT 由 TTS_infer_pack 在导入期加载，属于基础文件要求；这里只按语言区分 G2PW、NLTK 与 OpenJTalk 前端。
+        language_capabilities = {
+            'zh': {'ready': not chinese_missing, 'missing': chinese_missing},
+            'en': {'ready': english['filesPresent'] and english['packagePresent'],
+                   'missing': english['missing'] + ([] if english['packagePresent'] else ['nltk（Python 包）'])},
+            'ja': {'ready': japanese['filesPresent'] and japanese['packagePresent'],
+                   'missing': japanese['missing'] + ([] if japanese['packagePresent'] else ['pyopenjtalk（Python 包）'])},
+        }
+        # 未指定语言时保持中文基线，避免改变既有中文安装的通过条件。
+        requested_languages = [LANGUAGE_CODES[name] for name in (languages or ['Chinese'])]
+        language_missing = []
+        if 'zh' in requested_languages:
+            language_missing += language_capabilities['zh']['missing']
+        if 'en' in requested_languages:
+            language_missing += language_capabilities['en']['missing']
+        if 'ja' in requested_languages:
+            language_missing += language_capabilities['ja']['missing']
+        # 语言检测模型在加载阶段固定使用，不随目标语言变化。
+        generation_files = [aux / 'fast_langdetect/lid.176.bin']
+        generation_missing = [str(file) for file in generation_files if not file.is_file() or not file.stat().st_size] + language_missing
+        for file in generation_files + g2pw_files:
             if file.is_file() and file.stat().st_size:
                 manifest['generation/' + file.name] = {'path': str(file), 'size': file.stat().st_size}
+    base_ready = not missing and not errors and all(versions.values())
+    # 基础文件或包不齐时引擎整体不可用，语言能力不能单独成立。
+    supported_languages = [code for code in ('zh', 'en', 'ja') if language_capabilities.get(code, {}).get('ready')] if base_ready else []
     return {'engine': engine, 'variant': variant, 'python': sys.version, 'packages': versions,
-            'languageResources': inspect_gpt_language_resources() if engine == 'gpt' else {},
+            'languageResources': language_resources,
+            'languageCapabilities': language_capabilities,
+            'requestedLanguages': requested_languages,
+            'supportedTextLanguages': supported_languages,
             'missingGenerationResources': generation_missing,
-            'generationReady': not missing and not errors and all(versions.values()) and not generation_missing,
+            'generationReady': base_ready and not generation_missing,
             'missingFiles': missing, 'manifest': manifest, 'auxiliaryPaths': paths,
             'configurationErrors': errors,
-            'filesAndPackagesPresent': not missing and not errors and all(versions.values()),
+            'filesAndPackagesPresent': base_ready,
             'weightsLoaded': False, 'runtimeVerified': False, 'networkUsed': False,
-            'notes': '只核对必要文件与包元数据；文件存在不代表加载成功、音质或取消验收通过。'}
+            'notes': '只核对必要文件与包元数据；中文 G2PW／英日前端资源只在请求对应语言时必需，文件存在不代表加载成功、音质或取消验收通过。'}
 
 
 def main():

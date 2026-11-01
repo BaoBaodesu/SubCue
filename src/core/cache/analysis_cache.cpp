@@ -7,15 +7,17 @@
 #include <QtCore/QSaveFile>
 #include <QtCore/QStandardPaths>
 
+#include <algorithm>
 #include <utility>
 
 namespace subcue {
 
-AnalysisCache::AnalysisCache(QString directory)
+AnalysisCache::AnalysisCache(QString directory, qint64 limitBytes)
     : directory_(directory.isEmpty()
         ? QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation))
               .filePath(QStringLiteral("analysis"))
-        : std::move(directory))
+        : std::move(directory)),
+      limitBytes_(limitBytes > 0 ? limitBytes : kDefaultLimitBytes)
 {
 }
 
@@ -72,6 +74,19 @@ bool AnalysisCache::store(const QString &key, const QJsonObject &result, AppErro
     if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size() || !file.commit()) {
         if (error) *error = AppError(ErrorDomain::Asr, 4, QStringLiteral("无法写入分析缓存"), file.fileName());
         return false;
+    }
+    // 按最近修改时间淘汰最旧的结果，保证缓存总量不超过上限；正在写入的结果不删除。
+    auto files = QDir(directory_).entryInfoList({QStringLiteral("*.json")}, QDir::Files);
+    std::sort(files.begin(), files.end(), [](const QFileInfo &left, const QFileInfo &right) {
+        return left.lastModified() < right.lastModified();
+    });
+    qint64 total = 0;
+    for (const auto &info : files) total += info.size();
+    const QString current = file.fileName();
+    for (const auto &info : files) {
+        if (total <= limitBytes_) break;
+        if (info.absoluteFilePath() == current) continue;
+        if (QFile::remove(info.absoluteFilePath())) total -= info.size();
     }
     return true;
 }
